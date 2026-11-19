@@ -15,13 +15,16 @@ the ADC register map, the GPIO pin map, and now the **source interfaces** in `Se
 **`lib/sim`** (SimBaro, SimCells, LoopModel, ValveModel, CcrControlLaw, SimRunner) are complete and
 regression-anchored: **94 native cases green** across seven suites. `src/` boots on the board:
 safe-state pins first, bounded I2C presence probing, active converter checks, honest boot fault
-report, arming refusal, hot re-probe every 5 s, serial bench commands (`s p r c a d g v`).
-**M0 is DONE, and M1's simulator half is DONE** — bench `v` runs the fixed 26-min profile **headless
-on the board**, closed loop through the real voter/gas/ZHL stack, mole-balanced against hand
-calculations (136 pulses / 20.40 amb L, 2 pulses/min at the 30 m bottom — risk 20), SIM-stamped,
-~30 s wall, worst tick **41.5 ms measured on-target** (risk 19 — this was the "hang" that turned out
-to be cost). Still open at M1: the alternating-mux scheduler (per-cell rate from the measured
-conversion period, not the datasheet's 16 SPS), and the baro/INA219 drivers. **Two ADS1115 modules
+report, arming refusal, hot re-probe every 5 s, two alternating-mux pair walkers running in `loop()`,
+serial bench commands (`s p r c a d t g v`).
+**M0 and M1 are DONE.** Bench `v` runs the fixed 26-min profile **headless on the board**, closed
+loop through the real voter/gas/ZHL stack, mole-balanced against hand calculations (136 pulses /
+20.40 amb L, 2 pulses/min at the 30 m bottom — risk 20), SIM-stamped, ~30 s wall, worst tick
+**41.5 ms measured on-target** (risk 19 — this was the "hang" that turned out to be cost). M1's last
+item, the **alternating-mux scheduler** (`AdcPairWalker` in `src/sensors/Ads1115Bus`), is implemented
+and measured (bench `t`): **7.2 SPS per cell achieved** on the fitted clones, interlock busy duty
+**95-96%** — decision 34: M5's pulse scheduler must carve explicit conversion-free slots, the
+incidental gap is only ~2-3 ms. Baro/INA219 drivers (M3) come next. **Two ADS1115 modules
 (0x48 + 0x49) and one SSD1306 (0x3C) are wired; the baro and the INA219 are not.**
 
 Two decisions were taken with the user on 2026-11-19 and are now binding (AGENTS.md §18): the ppO2
@@ -46,9 +49,8 @@ cd espRebreatherController
 ```
 
 `.pio/` is gitignored (build cache, ~72 MB) — the new machine rebuilds it on first `pio run`.
-Branch `master`. The ADC work is commit `086c917`; the pin-map/pin-measurement work described in §5d
-follows it. **Check `git log --oneline -3` rather than trusting any commit hash written here** — if §1
-or §5 says something the remote does not contain, that is the gap. A fresh clone will not contain the
+Branch `master`. **Check `git log --oneline -3` rather than trusting any commit hash written here** —
+if §1 or §5 says something the remote does not contain, that is the gap. A fresh clone will not contain the
 planned-but-empty directories from AGENTS.md §14 (`docs/`, `data/display/`, `src/dive/`, `src/ui/`,
 `src/web/`): git does not track empty directories.
 
@@ -80,7 +82,7 @@ Commands (all from the project root, venv sourced):
 
 ```
 pio test -e native            # 94 cases, seven suites, ~5 s, no hardware needed
-pio run -e esp32              # links; Flash 486,109 B of 1.5 MB (30.9%), RAM 63,648 B (19.4%)
+pio run -e esp32              # links; Flash 488,497 B of 1.5 MB (31.1%), RAM 63,864 B (19.5%)
 pio run -e esp32 -t upload    # flashes; verify "Hash of data verified"
 pio device monitor            # or the python capture recipe in §4
 pio run -t uploadfs           # LittleFS assets, when data/ exists (web UI, not yet written)
@@ -312,6 +314,36 @@ binary, same profile: worst tick **41,492 us at t=1081 s** (the `NDL=999`/plan-h
 dominate; the physics change did not move cost), whole run ~30 s, and the gas figures are now the
 mole-balanced ones (136 pulses / 20.40 amb L; 2 pulses/min through the 30 m bottom).
 
+### 5f. Pair walkers — achieved ADC rate and the interlock duty, measured (decision 34)
+
+Measured 2026-11-19 on this board with the walkers running in `loop()` (three `t` reads at uptimes
+17 s / 60 s / 26 s). Do not re-derive these; re-read them with `t` after any part or firmware change:
+
+| Figure | Measured |
+|---|---|
+| Boot-timed conversion at the 32 SPS field | 61,870–62,120 us (varies slightly per boot) |
+| **Achieved per-cell rate** | **7.21–7.23 SPS** at both 0x48 and 0x49 |
+| In-walk conversion period | min 65,498 / avg 66,319–66,871 / max ~67,100 us |
+| Interlock **busy duty** | **95–96% of wall time** |
+| 60 s continuous run | ioErr 0, convTimeout 0, lateDetect 0; sample ages < 200 ms |
+
+What the numbers mean: the design asks for 16 SPS per cell; the clones' real sizing figure is 8.05;
+the walker lands at ~7.2 because the OS-poll detection lag (~4.4 ms on average on top of the 62 ms
+conversion) is paid once per conversion. In-walk periods exceed the boot measurement for the same
+reason — with DRDY wired (open item 14) they would converge. Max-period spikes around 105 ms appear
+when a bench print blocks the loop — that is the poll being late, not the part being slow.
+
+**The number that changes M5: busy duty 95–96% means the incidental inter-conversion gap is only
+~2–3 ms — a 20–250 ms coil pulse cannot fit in it.** "Pulses queue into the gap" (AGENTS.md §8)
+therefore requires the pulse scheduler to *carve explicit conversion-free slots* into the walker's
+cycle — decision 34 — not to hunt for gaps that measurement says are not there.
+
+One reporting bug found by running this: `periodMin` printed 0 because `begin()` seeds the EMA from
+the boot measurement, so the first-sample branch that initialises min/max never ran. Fixed; min now
+reads 65,498 us. The counters are cumulative since `begin()` and include traffic stirred by bench
+commands `a`/`d` (they write the config register mid-walk); the report says so rather than
+pretending the run was clean.
+
 ## 6. What is on the bench right now
 
 - ESP32 Doit devkit V3 over USB. **Wired: two ADS1115 modules on I2C1 — 0x48 (ADDR->GND) and 0x49
@@ -328,18 +360,22 @@ CCR dive computer — boot (never fatal), entering BENCH
   I2C0: 1 device(s)  [0x3C]
   I2C1: 2 device(s)  [0x48 0x49]
   ADS @0x48 ID 0x00 — not the documented ADS1115 ID
-  ADS @0x48 converts: 61911 us for the 32 SPS field (DS 31250 us) = 98% off
+  ADS @0x48 converts: 61870 us for the 32 SPS field (DS 31250 us) = 97% off
   ADS @0x49 ID 0x00 — not the documented ADS1115 ID
-  ADS @0x49 converts: 61886 us for the 32 SPS field (DS 31250 us) = 98% off
+  ADS @0x49 converts: 61872 us for the 32 SPS field (DS 31250 us) = 97% off
   ERROR BARO                   x3  no MS5837/BMP085
   ERROR INA219                 x1  0x40 err 2
   WARN  ADC_ID_UNKNOWN         x2  0x49 ID 0x00 not 0x85
-  WARN  ADC_RATE_MISMATCH      x2  0x49 61mS DS31mS 98%
+  WARN  ADC_RATE_MISMATCH      x2  0x49 61mS DS31mS 97%
 [boot] F:0 E:2 W:2 BARO INA219 ADC_ID_UNKNOWN ADC_RATE_MISMATCH
 [arm] REFUSED — see faults above
+[adc] alternating-mux pair walkers running — bench 't' prints the achieved per-cell rate and the coil/ADC interlock window, measured
 [o2] solenoid disabled — GPIO 26 will not be driven
-bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (destructive, bench only)  c=bus recovery  a=ADC self-test  d=ADC rate characterisation  g=pad map + pad test  v=headless sim profile (SIM-stamped, touches no hardware)
+bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (destructive, bench only)  c=bus recovery  a=ADC self-test  d=ADC rate characterisation  t=pair-walker rate + interlock window  g=pad map + pad test  v=headless sim profile (SIM-stamped, touches no hardware)
 ```
+
+  (The conversion microseconds vary slightly boot to boot — 61.8-62.1 ms so far; it is the ~97%
+  offset and the `x2` clone warnings that are the invariant.)
 
   Both fitted modules measure as clones — same ID `0x00`, same ~62 ms conversion — so the two WARN
   codes now carry x2 attempts, and `ADS1115_U2` is no longer FATAL. Decision 31's arrival test is
@@ -356,7 +392,9 @@ bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (dest
   `r` raw four-shape diagnostic (needs `-DBENCH_RAW_PROBE=1`, **writes 0x00** to whatever ACKs — bare
   bus only) · `c` 9-clock bus recovery + port re-init · `a` ADC self-test (ID, config decode,
   write-verify + restore, DRDY line, one timed conversion) · `d` ADC rate characterisation (measured
-  period for all eight RATE fields, plus the poll cost, ~6 s) · `g` pad map + pad test (~48 lines:
+  period for all eight RATE fields, plus the poll cost, ~6 s) · `t` pair-walker report (achieved
+  per-cell SPS, in-walk period stats, interlock busy duty, error counters — the §5f numbers, live) ·
+  `g` pad map + pad test (~48 lines:
   per-pad capability word from `PinMap.h`, the core's periman owner, and measured pull/output behaviour
   on pads with nothing wired — the source of every claim in §5d).
   `a` and `d` write the config register, so they are bench actions, not something the dive loop runs.
@@ -396,24 +434,25 @@ SIM tick cost: worst 41492us at t=1081s (plan search saturating its step budget 
 
 ## 7. Resume point — the next steps, in order
 
-1. **Alternating-mux scheduler** in `src/sensors/Ads1115Bus` — the last open M1 item, and it needs
-   no parts and no decisions. Walk AIN0/1 -> AIN2/3 with single-shot conversions, **sized from the
-   measured conversion period** (bench `d` produces it: ~62 ms on the fitted clones, so ~8 SPS per
-   cell, *not* the datasheet's 16), per-channel `invert`, polled OS bit for now (~350 us/poll
-   measured) with DRDY on 23/4 only once it is actually wired (open item 14). Add a bench command
-   that prints the **achieved per-cell sample rate and the interlock window**, so the number is
-   measured like every other timing figure. Then wire cell 2 into AIN2/3 so the correlated-failure
-   path (cells 1+2 share U1) can be exercised for real. **Do not write it around 32 SPS as though
-   the datasheet field were real.**
-2. **Order known-genuine TI ADS1115 modules** (AGENTS.md decision 31 — decided 2026-11-19, an
+M0 and M1 are **done**: the alternating-mux scheduler (`AdcPairWalker`, bench `t`) is implemented and
+measured — 7.2 SPS/cell achieved, sized from the boot-measured period, interlock duty 95-96%
+(§5f). Next, in order:
+
+1. **Order known-genuine TI ADS1115 modules** (AGENTS.md decision 31 — decided 2026-11-19, an
    outstanding action, not a question; **both** fitted modules measure as clones, so that is two
    parts). On arrival: `d` must measure 8/16/32/64/128/250/475/860 SPS at both addresses and `a`
    must read ID `0x85`, with `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` clearing by themselves (~31 ms
-   conversion, not 62). Until then every timing figure in the firmware is derived from the measured
-   table, so both fitted parts work and neither is trusted from its label.
-3. **`src/sensors` drivers**: `Ms5837` @0x3E, `Bmp085` @0x3B (with the 9 m clamp banner), `Ina219`
-   @0x40, `Depth` with learned `Psurf` — they implement the same `Barometer` interface `SimBaro`
-   already does, so the sim path is the test double.
+   conversion, not 62), and `t` re-derived (expect ~16 SPS/cell, a few ms of OS-poll lag on top).
+   The walker re-begins from each part's own measurement at boot — no code change needed.
+2. **M3 — `src/sensors` drivers**: `Ms5837` @0x3E, `Bmp085` @0x3B (with the 9 m clamp banner),
+   `Ina219` @0x40, `Depth` with learned `Psurf` — they implement the same `Barometer` interface
+   `SimBaro` already does, so the sim path is the test double. M3 gate: fallback verified by
+   physically removing the MS5837. Wire the baro (and the INA219) on I2C0; the cell bias networks
+   (1 MOhm + 10 ohm + RC, risk 6) stay a separate wiring step before any cell reading is believed.
+3. **Before M5, settle the interlock design against decision 34**: the incidental inter-conversion
+   gap is ~2-3 ms (§5f), so the pulse scheduler must carve explicit conversion-free slots into the
+   walker's cycle. DRDY wiring (open item 14) would make the window exact rather than polled —
+   decide it together with the pin budget (open item 15) and the panel choice (item 6).
 
 After that: `src/dive`, `src/ui`, `src/web`, `README.md` (the README content requirements in
 AGENTS.md §15 are a user requirement, including the 7-bit-vs-8-bit address trap as a listed wiring
@@ -423,13 +462,13 @@ mistake).
 
 | File | What it pins down |
 |---|---|
-| `AGENTS.md` | binding design record; §16 milestone status, §18 decisions 1–33, §19 risks 1–20, §20 open items 1–16 |
+| `AGENTS.md` | binding design record; §16 milestone status, §18 decisions 1–34, §19 risks 1–20, §20 open items 1–16 |
 | `HANDOFF.md` (this file) | machine + bench state, measured I2C and ADC semantics, resume point |
 | `lib/core/src/AdcRegs.h` | **the ADS1115 register map, PGA/RATE tables, LSB and mV scaling, and the measured bench-module rate table.** Pure C++ so it can be asserted; it was wrong twice while it lived only in `src/` |
-| `src/sensors/Ads1115Bus.{h,cpp}` | register driver: single-shot start (MODE written explicitly), `checkPart()` identity-by-timing, `measureAdcRates()`, `selfTest()`. The accepted conversion window (20–150 ms) and why it is wider than the datasheet figure |
+| `src/sensors/Ads1115Bus.{h,cpp}` | register driver: single-shot start (MODE written explicitly), `checkPart()` identity-by-timing (stores `measuredConvUs()` for the walker and the interlock), `measureAdcRates()`, `selfTest()`. The accepted conversion window (20–150 ms) and why it is wider than the datasheet figure. **`AdcPairWalker`**: the non-blocking alternating-mux scheduler (M1), sized from the measured period, carries the coil/ADC interlock window (`integrating()`, `coilSafeAfterUs()`), and reports achieved rate/counters via bench `t` — see §5f for its measured figures |
 | `src/sensors/BusProbe.cpp` | the measured four-shape probe table and the periman trap, in comments; the only probe form that is truthful and non-destructive |
 | `src/sensors/BusProbe.h` | probe contract, 7-bit address warning, "port must be down" rule for line checks |
-| `src/main.cpp` | boot order (solenoid safe-state first), bounded probing, `checkAdcs()` (presence is not identity), two-address device selection for baro and OLED, bus dead-vs-absent reporting, 5 s hot re-probe and bus retry, bench command REPL (`s p r c a d g v`), `gpioMapReport()`, `benchRunSim()` (static `SimRunner`, per-tick cost measurement, `SIM SLOW` line, history stride 16) |
+| `src/main.cpp` | boot order (solenoid safe-state first), bounded probing, `checkAdcs()` (presence is not identity), two-address device selection for baro and OLED, bus dead-vs-absent reporting, 5 s hot re-probe and bus retry, bench command REPL (`s p r c a d t g v`), `gpioMapReport()`, `benchRunSim()` (static `SimRunner`, per-tick cost measurement, `SIM SLOW` line, history stride 16); walker globals `g_walk1`/`g_walk2` (begin after `checkAdcs()`, re-begin on converter hot-plug), and `loop()`'s heartbeat as **service windows** — walkers + REPL run inside the HIGH-20/LOW-30 shape so the converters pace the sampling, not the loop delay |
 | `lib/core/src/FaultCode.h` | the fault enum plus `defaultSeverity`/`blocksArming`/`faultName`. `ADC_PART_WRONG`/`ADC_CONV_BAD` block arming; `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` deliberately do not |
 | `lib/core/src/BootReport.h` | `blocksArming()` refuses on **any active FATAL**, not only on listed codes |
 | `lib/core/src/PinMap.h` | **the GPIO capability table (one word per pad, 0..39) and the role assignment.** Pure C++, asserted natively — it was a paragraph in a header before and was wrong twice. Carries `noSuchPad` (24, 28–31: no such pad on the ESP32-D0WD-V3 die) and `kDieOnly` (20, 37, 38: die pads WROOM-32 does not bond out) as separate claims, `unusableReason()`, and `SPARE_OUT = 17` |
@@ -449,13 +488,15 @@ mistake).
 
 ## 9. Open items that block code, not just BOM
 
-- **Open item 13 is decided** (AGENTS.md decision 31: genuine TI ADS1115s) and no longer blocks the
-  scheduler — but the **parts are not yet fitted**, so the per-cell rate is still 8 SPS on the bench
-  module and 16 SPS on a real one. Write the scheduler against a measured period read from the part,
-  not a constant.
-- **Open item 14** (DRDY never actually wired, only read pulled-up and idle): the scheduler can be
-  written to poll the OS bit, but at 348–365 us a poll it is not the design in AGENTS.md §8. Wire
-  DRDY before certifying the interlock.
+- **Open item 13 is decided** (AGENTS.md decision 31: genuine TI ADS1115s) and no longer blocks any
+  code — the walker sizes itself from a measured period, not a constant. With the clones fitted the
+  achieved per-cell rate is **7.2 SPS measured** (§5f); a genuine part should land near 16. The only
+  outstanding action is ordering the two parts and re-running `d`/`a`/`t`.
+- **Open item 14** (DRDY never actually wired, only read pulled-up and idle): the walker now *does*
+  poll the OS bit at 10 ms cadence, and the cost is visible in the numbers — the ~4.4 ms average
+  detection lag is most of the gap between the clone's 8.05 SPS sizing and the 7.2 SPS achieved
+  (§5f). DRDY would make the interlock edge exact and close that gap; wire it before certifying the
+  M5 interlock, and settle it against the pin budget (item 15).
 - **Open item 15** (new): a SPI display panel needs four pads (SCK/MOSI/DC/CS) and **only GPIO 17 is
   spare and output-capable** after the current map; the core's default SPI pins 18/19/23 collide with
   I2C1 and `ADS_U1_DRDY`. Argue this with the panel choice (item 6) before buying anything — the
@@ -482,6 +523,11 @@ mistake).
   desk (`d` produces the measured numbers at any time). The same applies to **compute cost**: a bound
   on a loop is not a bound on its cost, and xtensa `expf` is ~3 us where x86 is ~40 ns. Bench `v`
   prints worst-tick cost; read it on the target, never assume it from a host run (risk 19).
+- **A gap you plan to schedule into is only real if you measured it.** The pair walker keeps a
+  converter integrating 95-96% of wall time, so the incidental inter-conversion gap is ~2-3 ms —
+  nowhere near a 20-250 ms pulse (§5f, decision 34). Any scheduler that "queues into the gap" must
+  come with a duty-cycle report, and where the duty says there is no gap, the schedule must *make*
+  one explicitly.
 - **Quote the pressure a litre is measured at.** Metabolic rate is a molar draw in surface litres
   (depth-independent); valve pulse volume is an ambient litre (depth-scaled). Conflating them keeps
   the setpoint tracking perfectly while every gas figure is wrong by the ambient factor — audit the

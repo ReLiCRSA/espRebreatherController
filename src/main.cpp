@@ -67,6 +67,20 @@ sensors::Ads1115 g_ads2(Wire1, 0x49, pins::ADS_U2_DRDY);
 sensors::Ads1115* g_adcs[] = {&g_ads1, &g_ads2};
 constexpr size_t kAdcCount = sizeof(g_adcs) / sizeof(g_adcs[0]);
 
+// The alternating-mux pair walkers (AGENTS.md 2): U1 walks cell 1 (AIN0/1) -> cell 2 (AIN2/3),
+// U2 walks cell 3 (AIN0/1) -> coil shunt (AIN2/3). The coil slot reads a floating input until
+// M5 fits the shunt stage, but walking it keeps the per-cell rate honest — all four pairs get
+// the same rate the converter can actually deliver, which bench 't' measures rather than assumes.
+// Cells 1+2 sharing U1 is the documented correlated-failure point (risk 2), not an accident of
+// this mapping.
+sensors::AdcPairWalker g_walk1(g_ads1, sensors::Ads1115::MUX_AIN0_AIN1,
+                               sensors::Ads1115::MUX_AIN2_AIN3, "cell1 U1.AIN0/1",
+                               "cell2 U1.AIN2/3");
+sensors::AdcPairWalker g_walk2(g_ads2, sensors::Ads1115::MUX_AIN0_AIN1,
+                               sensors::Ads1115::MUX_AIN2_AIN3, "cell3 U2.AIN0/1",
+                               "coil U2.AIN2/3");
+sensors::AdcPairWalker* g_walkers[] = {&g_walk1, &g_walk2};
+
 // Bus init state. A port that failed to initialise must never be probed (its answers are
 // meaningless) and must never be reported as "sensors absent" — that would blame the devices
 // for the controller's failure (no silent fallbacks, AGENTS.md 17).
@@ -605,6 +619,16 @@ void handleCommand(char c) {
                 initBus(b);
             }
             break;
+        case 't':
+            // The M1 scheduler gate, measured: conversions actually completed per cell pair, the
+            // measured conversion periods behind the coil/ADC interlock window, and the error
+            // counters. 'a' and 'd' write the config register mid-walk, so they stir these counters —
+            // the report says so rather than pretending the run was clean.
+            Serial.println(F("[adc] pair walkers: achieved per-cell rate + interlock window, "
+                             "counted since begin. Cell inputs float: raw values are expected "
+                             "nonsense — the rates and windows are the point."));
+            for (sensors::AdcPairWalker* w : g_walkers) w->report(Serial, millis());
+            break;
         case 'g':
             gpioMapReport();
             break;
@@ -615,9 +639,25 @@ void handleCommand(char c) {
         default:
             Serial.println(F("bench commands: s=full bus scan  p=probe table + report  "
                              "r=raw probe codes (destructive, bench only)  c=bus recovery  "
-                             "a=ADC self-test  d=ADC rate characterisation  g=pad map + pad test  "
+                             "a=ADC self-test  d=ADC rate characterisation  t=pair-walker rate + "
+                             "interlock window  g=pad map + pad test  "
                              "v=headless sim profile (SIM-stamped, touches no hardware)"));
             break;
+    }
+}
+
+// One heartbeat phase of housekeeping: drive the pair walkers and the bench REPL for ms. The
+// walkers self-throttle their OS-bit polling (kPollGapUs), so an idle walker costs nothing, and
+// the serial path stays responsive at ~2 ms instead of 50. This is why the old bare delay(20)/
+// delay(30) pair is gone: at a 50 ms loop cadence every achieved-rate figure 't' prints would be
+// paced by the loop, not by the converter.
+void serviceWindow(uint32_t ms) {
+    const uint32_t end = millis() + ms;
+    for (;;) {
+        for (sensors::AdcPairWalker* w : g_walkers) w->tick();
+        while (Serial.available()) handleCommand(static_cast<char>(Serial.read()));
+        if (millis() >= end) return;
+        delay(2);
     }
 }
 
@@ -654,6 +694,13 @@ void setup() {
     checkAdcs();
     printBootReport();
 
+    // Start the pair walkers only after checkAdcs() has timed a real conversion on each present
+    // converter — the walker sizes its poll cadence, stall timeout and interlock window from
+    // that measured period, not from the datasheet (AGENTS.md 2 / risk 16).
+    for (sensors::AdcPairWalker* w : g_walkers) w->begin();
+    Serial.println(F("[adc] alternating-mux pair walkers running — bench 't' prints the achieved "
+                     "per-cell rate and the coil/ADC interlock window, measured"));
+
 #if !HAVE_SOLENOID
     g_faults.raise(FaultCode::SOLENOID_DISABLED, Severity::INFO, millis(), "inert, not fitted");
     Serial.println(F("[o2] solenoid disabled — GPIO 26 will not be driven"));
@@ -688,13 +735,19 @@ void loop() {
         probeDevices();
         // A converter that just appeared has to be checked, not assumed: presence says an address
         // is answered, it does not say the part converts at the design rate.
-        if (adcChanged) checkAdcs();
+        if (adcChanged) {
+            checkAdcs();
+            // And the walkers re-size from the new part's own measured period. Uptime and
+            // achieved-rate counters restart with it, so 't' never mixes two parts' history.
+            for (sensors::AdcPairWalker* w : g_walkers) w->begin();
+        }
     }
 
-    while (Serial.available()) handleCommand(static_cast<char>(Serial.read()));
-
+    // External watchdog heartbeat: HIGH 20 ms, LOW 30 ms, same shape as before. The delays are
+    // now service windows: the pair walkers need ~10 ms polling resolution, and a bare 50 ms
+    // loop would pace the walkers instead of the converters deciding the rate.
     if (pins::WDT_HEARTBEAT >= 0) digitalWrite(pins::WDT_HEARTBEAT, HIGH);
-    delay(20);
+    serviceWindow(20);
     if (pins::WDT_HEARTBEAT >= 0) digitalWrite(pins::WDT_HEARTBEAT, LOW);
-    delay(30);
+    serviceWindow(30);
 }

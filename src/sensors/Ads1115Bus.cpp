@@ -74,6 +74,7 @@ Ads1115::PartCheck Ads1115::checkPart(uint32_t* convUsOut, unsigned* pollsOut) {
         ++polls;
         if (cfg & kOsBusy) {
             const uint32_t us = micros() - t0;
+            measConvUs_ = us;  // the sizing figure for the pair walker and the interlock
             if (convUsOut) *convUsOut = us;
             if (pollsOut) *pollsOut = polls;
             // An ADS1115 at 32 SPS cannot finish faster than ~31 ms. Coming back far below that
@@ -241,6 +242,193 @@ void Ads1115::selfTest(Print& out) {
             out.println(F("  conv check aborted: I2C transaction failed mid-conversion"));
             break;
     }
+}
+
+// ---------------------------------------------------------------------------
+// AdcPairWalker — see Ads1115Bus.h for the design notes (non-blocking, sized from
+// measurement, and the authority on the coil/ADC interlock window).
+// ---------------------------------------------------------------------------
+
+void AdcPairWalker::begin() {
+    rateField_ = adc::kRateDesign;
+    const uint32_t meas = adc_.measuredConvUs();
+    if (meas != 0) {
+        convSizedUs_ = meas;
+        sizedFromMeasure_ = true;
+        if (periodAvg_ == 0) periodAvg_ = meas;  // seed the EMA; conversions update it from here
+    } else {
+        // Fallback, announced: a walker on an uncharacterised part runs on the datasheet figure,
+        // and report() prints that loudly rather than letting the number look measured (risk 16).
+        convSizedUs_ = adc::convUs(adc::designConfig());
+        sizedFromMeasure_ = false;
+    }
+    // Stall detection: 4x the sizing period, floored at 250 ms so a datasheet-sized 31 ms part
+    // still gets a patient window. A stalled conversion is a converter fault, not slow timing.
+    convStallUs_ = convSizedUs_ * 4;
+    if (convStallUs_ < 250000) convStallUs_ = 250000;
+    startMs_ = millis();
+    state_ = adc_.present() ? START_A : ABSENT;
+}
+
+uint32_t AdcPairWalker::coilSafeAfterUs() const {
+    if (!integrating()) return 0;
+    const uint32_t elapsed = micros() - convStartUs_;  // unsigned arithmetic: wrap-safe
+    const uint32_t est = (periodAvg_ != 0) ? periodAvg_ : convSizedUs_;
+    return (est > elapsed) ? (est - elapsed) : 1;  // 1 = overdue but not yet confirmed by a poll
+}
+
+void AdcPairWalker::tick() {
+    if (state_ == OFF) return;
+
+    // Presence belongs to the boot probe / hot re-probe, not here; the walker just obeys it so a
+    // converter pulled from the bench stops generating transactions (and the samples age out,
+    // which is what makes a dropout visible downstream instead of a frozen "last good" value).
+    if (!adc_.present()) {
+        state_ = ABSENT;
+        return;
+    }
+    if (state_ == ABSENT) {
+        state_ = START_A;
+        return;
+    }
+    if (state_ == BACKOFF) {
+        if (millis() - backoffMs_ >= kBackoffMs) state_ = START_A;
+        return;
+    }
+
+    const uint32_t now = micros();
+
+    if (state_ == START_A || state_ == START_B) {
+        // Writing config with OS=1 both selects the pair and starts the conversion. MODE is set
+        // explicitly to single-shot in startSingleShot(): the mux *must* change between samples,
+        // and continuous mode locks it (that is the whole reason this walker exists).
+        const uint16_t mux = (state_ == START_A) ? muxA_ : muxB_;
+        if (!adc_.startSingleShot(mux, Ads1115::kGainDesign, rateField_)) {
+            ++ioErr_;
+            enterBackoff();
+            return;
+        }
+        convStartUs_ = micros();
+        lastPollUs_ = convStartUs_;
+        state_ = (state_ == START_A) ? WAIT_A : WAIT_B;
+        return;
+    }
+
+    // WAIT_A / WAIT_B — poll the OS bit at kPollGapUs cadence, one transaction per call at most.
+    if (now - lastPollUs_ < kPollGapUs) return;
+    lastPollUs_ = now;
+    ++polls_;
+
+    uint16_t cfg = 0;
+    if (!adc_.readReg(Ads1115::kRegConfig, &cfg)) {
+        ++ioErr_;
+        enterBackoff();
+        return;
+    }
+    if (cfg & Ads1115::kOsBusy) {
+        uint16_t conv = 0;
+        if (!adc_.readReg(Ads1115::kRegConv, &conv)) {
+            ++ioErr_;
+            enterBackoff();
+            return;
+        }
+        const uint32_t tDone = micros();
+        const uint32_t period = tDone - convStartUs_;
+        // A poll gap that lands *after* the conversion really finished inflates the period; a
+        // loop blocked for seconds (a 'v' sim run, a bus sweep) inflates it enormously. Late
+        // detections are counted but excluded from the period stats and the duty figure, so the
+        // interlock estimate stays honest. The sample is still stored: the conversion completed.
+        const bool late = (period >= convStallUs_);
+        if (late) {
+            ++lateDetect_;
+        } else {
+            if (periodAvg_ == 0) {
+                periodAvg_ = period;
+                periodMin_ = periodMax_ = period;
+            } else {
+                // Quarter-rate integer EMA: enough for a window sized in tens of ms. Note the
+                // min/max init: begin() may have seeded periodAvg_ from the boot measurement, so
+                // "first sample" cannot be inferred from periodAvg_ being zero — on-target 't'
+                // showed periodMin_ stuck at 0 when it was.
+                if (periodMin_ == 0) periodMin_ = periodMax_ = period;
+                const int32_t d = static_cast<int32_t>(period) - static_cast<int32_t>(periodAvg_);
+                periodAvg_ = static_cast<uint32_t>(static_cast<int32_t>(periodAvg_) + d / 4);
+                if (period < periodMin_) periodMin_ = period;
+                if (period > periodMax_) periodMax_ = period;
+            }
+            busyUs_ += period;
+        }
+        const int slot = (state_ == WAIT_A) ? 0 : 1;
+        raw_[slot] = static_cast<int16_t>(conv);
+        stampMs_[slot] = millis();  // taken after the conv read: the window closes at this edge
+        valid_[slot] = true;
+        ++convCount_[slot];
+        state_ = (state_ == WAIT_A) ? START_B : START_A;
+        return;
+    }
+
+    if (now - convStartUs_ >= convStallUs_) {
+        // Config written, OS never came back: part not converting, or the bus went dead mid-run.
+        ++timeouts_;
+        enterBackoff();
+    }
+}
+
+void AdcPairWalker::report(Print& out, uint32_t nowMs) const {
+    char line[170];
+    const uint32_t upMs = nowMs - startMs_;
+    const char* st = (state_ == OFF) ? "off" : (state_ == ABSENT) ? "absent"
+                   : (state_ == BACKOFF) ? "backoff" : "running";
+    snprintf(line, sizeof(line), "  @0x%02X walker: %s, uptime %lu ms, sized from %lu us %s",
+             adc_.address(), st, static_cast<unsigned long>(upMs),
+             static_cast<unsigned long>(convSizedUs_),
+             sizedFromMeasure_ ? "(measured at boot)"
+                               : "(** DATASHEET FIGURE - part never characterised: run 'd' **)");
+    out.println(line);
+
+    for (int s = 0; s < 2; ++s) {
+        // Achieved SPS counted from completed conversions x100, formatted by hand — the point of
+        // this line is that the number comes from what the part did, not from the field written.
+        const unsigned long sps100 = (upMs > 0)
+            ? static_cast<unsigned long>((static_cast<uint64_t>(convCount_[s]) * 10000000ULL) / upMs / 100)
+            : 0;
+        if (valid_[s]) {
+            const int16_t raw = raw_[s];
+            const float mV = adc::millivoltsOf(raw, adc::designConfig());
+            snprintf(line, sizeof(line),
+                     "  %-16s: %6lu conv, %3lu.%02lu SPS, raw=%+6d (%+7.1f mV), age %lu ms",
+                     label_[s], static_cast<unsigned long>(convCount_[s]),
+                     sps100 / 100, sps100 % 100, static_cast<int>(raw), mV,
+                     static_cast<unsigned long>(nowMs - stampMs_[s]));
+        } else {
+            snprintf(line, sizeof(line), "  %-16s: %6lu conv, %3lu.%02lu SPS, no sample yet",
+                     label_[s], static_cast<unsigned long>(convCount_[s]),
+                     sps100 / 100, sps100 % 100);
+        }
+        out.println(line);
+    }
+
+    snprintf(line, sizeof(line),
+             "  conv period: avg %lu us  min %lu  max %lu  (DS for field: %lu us)",
+             static_cast<unsigned long>(periodAvg_), static_cast<unsigned long>(periodMin_),
+             static_cast<unsigned long>(periodMax_),
+             static_cast<unsigned long>(adc::convUsField(adc::rateField(adc::designConfig()))));
+    out.println(line);
+
+    const uint32_t upUs = upMs * 1000ULL;
+    const unsigned busyPct = (upUs > 0) ? static_cast<unsigned>((uint64_t)busyUs_ * 100 / upUs) : 0;
+    snprintf(line, sizeof(line),
+             "  interlock: integrating now=%d  safe in %lu us  busy %u%% of wall  poll %lu us x %lu",
+             integrating() ? 1 : 0, static_cast<unsigned long>(coilSafeAfterUs()), busyPct,
+             static_cast<unsigned long>(kPollGapUs == 0 ? 0 : kPollGapUs),
+             static_cast<unsigned long>(polls_));
+    out.println(line);
+
+    snprintf(line, sizeof(line),
+             "  counters: ioErr %lu  convTimeout %lu  lateDetect %lu  (since begin; bench cmds 'a'/'d' stir these)",
+             static_cast<unsigned long>(ioErr_), static_cast<unsigned long>(timeouts_),
+             static_cast<unsigned long>(lateDetect_));
+    out.println(line);
 }
 
 } // namespace sensors

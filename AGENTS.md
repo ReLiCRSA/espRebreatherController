@@ -62,9 +62,12 @@ ESP32 classic (WROOM-32 devkit). Two cores are load-bearing: dive loop on core 0
   **alternate single-shot conversions** AIN0/1 -> AIN2/3 at **SPS 32**, giving 16 SPS per cell.
   SPS 32 is what the design asks for; what the fitted part actually delivers at that field is
   measured, not assumed (see the measured rate table below — the bench module gives 16.1 SPS there,
-  so the real per-cell rate is 8 SPS until the part or the field is changed). **Decision 31: the part
-  gets replaced** with a known-genuine TI ADS1115 (open item 13 is decided); the fitted module stays
-  on the bench for timing work and never goes near a dive.
+  so the real per-cell rate is 8 SPS until the part or the field is changed). The implemented
+  alternating-mux walker achieves **7.2 SPS per cell measured** on the fitted clones (bench `t`):
+  8 SPS sized, less the OS-poll detection lag — in-walk conversion periods measure 65.5-67.1 ms
+  against the 61.9 ms timed at boot. **Decision 31: the part gets replaced** with a known-genuine
+  TI ADS1115 (open item 13 is decided); the fitted module stays on the bench for timing work and
+  never goes near a dive.
 - **LSB 7.8125 uV at gain 16** (FSR/32768 — not the 0.125 mV often quoted, which is the *gain 1*
   figure). A galvanic cell in air (~9-13 mV) is therefore ~1150-1660 counts of a +/-32767 range:
   ample headroom for the bias network, ample resolution. `lib/core/src/AdcRegs.h` holds the register
@@ -361,6 +364,12 @@ faults are written into dive-log headers too.
   semaphore, so pulses queue into the gap. Costs a few ms of injection latency, removes a class of
   correlated ppO2 noise — dangerous specifically because noise looks like cell disagreement and trips
   voting.
+- **Measured 2026-11-19 (bench `t`), and it changes M5's job:** the alternating-mux walker keeps a
+  converter integrating **95-96% of wall time** at the fitted clones' rate (mean in-walk conversion
+  period 66.4 ms), so the incidental gap between conversions is only ~2-3 ms — nowhere near enough
+  for a 20-250 ms pulse. "Pulses queue into the gap" only works if a gap exists: the pulse scheduler
+  must **carve explicit conversion-free slots** into the walker's cycle (decision 34), not rely on
+  incidental ones. `t` prints busy duty, achieved per-cell rate and the interlock window on demand.
 - **Low-voltage lockout:** below ~3.4 V stop injecting automatically, alarm, hand control to manual
   bailout rather than chattering a valve on a dying rail.
 - If a latching valve is chosen: **pulse-then-release in both directions, never hold current** —
@@ -659,6 +668,9 @@ report, `r` raw probe codes (needs `BENCH_RAW_PROBE=1`), `c` 9-clock recovery + 
 `a` ADS1115 self-test (ID register, config decode, write-verify, DRDY line, one timed conversion),
 `d` ADS1115 rate characterisation — measured conversion period for all eight RATE fields, which is
 what the coil/ADC interlock window and the per-cell sample rate are derived from, not the datasheet,
+`t` pair-walker report — achieved per-cell SPS, measured in-walk conversion periods, interlock busy
+duty and error counters, counted from conversions actually completed (decision 34's numbers come
+from here),
 and `g` pad map + pad test — who owns each GPIO according to the core (periman), plus measured
 pull-up/pull-down and output behaviour on pads with nothing wired. `g` is what settled §3, and `v`
 runs the fixed headless sim profile (see §11): it prints per-minute SIM-stamped lines plus a
@@ -704,7 +716,10 @@ and restores it, `d` measures the conversion period field by field — which is 
 faults and the non-standard rate table in section 2 were found — and `g` measures who owns each GPIO
 and what its pads can do, which is how the pin map in section 3 was settled. The simulator runs
 **headless on the board** (bench `v`), and its on-target numbers are mole-balanced against hand
-calculations (risk 20).**
+calculations (risk 20). The alternating-mux pair walker runs in `loop()` and is measured by bench
+`t`: **7.2 SPS per cell achieved** on the fitted clones, in-walk conversion periods 65.5-67.1 ms
+(boot-timed 61.9 ms + OS-poll detection lag), interlock busy duty 95-96%, and a 60 s continuous run
+with zero I2C errors, zero conversion timeouts and the board responsive afterwards.**
 Layout note: PlatformIO only collects suites from `test/test_<name>/` folders (a bare `test/native/`
 group folder collects nothing), so the suites are `test/test_voting/`, `test/test_gas/`,
 `test/test_zhl/`, `test/test_boot/`, `test/test_adc/`, `test/test_pins/`, `test/test_sim/`. `test_build_src = no` in the
@@ -774,7 +789,7 @@ with `histDropped` accounting, strides, and `NO DATA`/`unevaluated` so an empty 
 | # | Deliverable | Gate | Status (2026-11-19) |
 |---|---|---|---|
 | M0 | installer, build, flash, I2C scan, boot report | `pio run -t upload` works on this Mac | **DONE** — flashed and verified on the devkit (CP2102, ESP32-D0WD-V3): "Hash of data verified", clean boot banner, boot report correct on an empty bench, `[arm] REFUSED`. Section 15 holds the evidence. |
-| M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **boot/bench half and the simulator half are now verified on hardware.** `lib/sim` is written (SimBaro, SimCells, LoopModel, ValveModel, CcrControlLaw, SimRunner) and runs the fixed 26-min profile **headless on the board** (bench `v`): closed-loop ppO2 through the real voter/gas/ZHL stack at hand-computed pulse demand (2/min at 30 m, mole balance closed), setpoint crossover, diluent-flush check PASS, deco ceiling/TTS appearing on schedule, everything SIM-stamped, ~30 s wall, worst tick 41.5 ms measured on-target. 14 new cases in `test/test_sim/` — **94 native cases green** in seven suites. Still open at M1: the alternating-mux scheduler at the **measured** per-cell rate (8 SPS on the fitted clone, not the designed 16 — needs cell 2 on AIN2/3). Open item 13 is decided (decision 31: genuine TI parts) and **both fitted modules now measure as clones**, so the sample-rate design waits on two parts, not on a decision. |
+| M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **DONE (2026-11-19).** Boot/bench and the simulator were verified earlier; the last open item, the **alternating-mux scheduler**, is now implemented and measured: `AdcPairWalker` in `src/sensors/Ads1115Bus` — non-blocking pair-step state machine, sized from the boot-measured conversion period (never the datasheet), polled OS bit at 10 ms cadence (DRDY still unwired, open item 14), I2C-error backoff, and a coil/ADC interlock window carried per converter. Bench `t` measures it: **7.2 SPS per cell achieved** on the fitted clones (design 16, clone-sized 8), in-walk periods 65.5-67.1 ms, interlock busy duty **95-96%** → decision 34: M5 must carve explicit pulse slots. `lib/sim` runs the fixed 26-min profile headless on the board (bench `v`) at hand-computed pulse demand; **94 native cases green** in seven suites. Open item 13's outstanding action (order two genuine TI parts, re-run `d`/`a`) stands — the walker re-sizes itself from the new parts' own measurement at boot. |
 | M2 | air cal + voting + diluent-flush check + alarms | native voting tests pass | voting + diluent-flush + cal sigma gate done natively; on-device wiring not started |
 | M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds 0x3E/0x3B (datasheet 8-bit 0x7C/0x77 corrected) and raises `BARO_RANGE_9M` when only the BMP085 answers; drivers not written |
 | M4 | ZHL-16C 3-gas + GF + ICD + CNS + MOD/END/density | validated natively **before** hardware depends on it | **engine complete and regression-anchored natively** (47 cases); *not* validated against a trusted computer yet — risk 13 |
@@ -840,6 +855,7 @@ Re-open only with the user's explicit agreement.
 | 31 | **The ppO2 converters shall be genuine TI ADS1115s.** The fitted module stays on the bench for timing work only; it does not go near a dive. Resolves open item 13 as option (a). | User's call, 2026-11-19 ("use the ADS1115, not the ADS1115S"). Risk 16 already said sourcing known-genuine parts is a safety action, not a preference; this makes it the plan. Note for honesty: **"ADS1115S" has no findable datasheet**, so part identity here stays a *measurement* claim (decision 29: timed conversion at the design RATE field, `d` for the whole table), never a part-name claim. Independent corroboration that generic breakouts carry non-TI dies with off-datasheet rate tables: Hackaday 2025-10-15 "How Bad Can A Cheap Knockoff ADS1115 ADC Be?" and excamera.substack.com "How bad can a $2.97 ADC be?" (which reports relabelled ADS1015 dies). Acceptance test when new parts arrive: `d` must measure 8/16/32/64/128/250/475/860 SPS, `a` must read ID 0x85, and `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` must clear on their own. |
 | 32 | **GPIO 33 is the Page button; the vibration motor moves to GPIO 16.** Resolves open item 12. | User's call, 2026-11-19. The old note "avoid 16/17 (UART0 on most devkits)" was measured false on this board — bench command `g` shows the console is UART0 on **GPIO1(TX)/GPIO3(RX)**, periman confirms both, and the core's own `doitESP32devkitV1` variant header says `TX = 1; RX = 3`. 16/17 are free, output-capable, and their internal pulls work (measured). 33 is kept for the button because it has an internal pull-up (34–39 do not) and reading a button is what that pad is for. The motor keeps an external gate pulldown either way — an internal pull is not a fail-safe. 17 is declared the spare. |
 | 33 | **The GPIO capability table and the role assignment live in `lib/core/src/PinMap.h`** (pure C++, asserted by `test/test_pins/`); `src/config/Pins.h` is an alias, not a second copy. | Same remedy as decision 28, applied to a different class of defect. The pin map was a paragraph nobody could test, and it was wrong twice: GPIO 33 assigned to two functions, and pad groups assumed free or unusable based on the die instead of the module (measured: 24 and 28–31 do not exist on the ESP32-D0WD-V3 die at all; 20/37/38 exist but WROOM-32 does not bond them out). A duplicate pin or an output on an input-only pad is now a test failure rather than a bench-chase. |
+| 34 | **The M5 coil-pulse scheduler must carve explicit conversion-free slots into the ADC cycle; the incidental inter-conversion gap is measured ~2–3 ms and shall not be designed against.** | Implemented-and-measured 2026-11-19, before M5 exists: the alternating-mux walker (`AdcPairWalker`) keeps both converters integrating 95–96% of wall time at the fitted clones' rate (mean in-walk conversion period 66.4 ms, bench `t`). §8's "pulses queue into the gap" assumed a gap exists; at 20–250 ms pulse widths it does not. Recorded now so M5 is designed against a measured figure instead of discovering the collision at the water. |
 
 ---
 
@@ -1224,3 +1240,33 @@ Re-open only with the user's explicit agreement.
   replace, not one; `ADS1115_U2` is no longer FATAL and the bench banner is `F:0 E:2 W:2` with
   `[arm] REFUSED` now for BARO/INA219 — the report stays honest as hardware changes under it.
   Still open at M1: the alternating-mux scheduler in `src/sensors/Ads1115Bus` at the measured rate.
+
+- 2026-11-19 (scheduler): **M1 is complete — the alternating-mux scheduler is implemented and
+  measured on-target.** Written: `AdcPairWalker` in `src/sensors/Ads1115Bus.{h,cpp}` — a
+  non-blocking pair-step state machine per converter (START AIN0/1 → poll OS → read → START AIN2/3
+  → …), sized from the conversion period `checkPart()` timed at boot (`Ads1115::measuredConvUs()`),
+  never from the datasheet rate table: the OS-bit poll cadence (10 ms), the conversion-stall
+  timeout (4× sizing, floor 250 ms), and the coil/ADC interlock window (running EMA of **measured**
+  in-walk periods) all come off that figure. OS bit is polled, not DRDY-interrupted (open item 14 —
+  DRDY still unwired). Raw codes are stored un-inverted; per-channel `invert` is applied at
+  consumption (CellArray, M2), so logs quote what the converter put on the bus. `main.cpp` fits two
+  walkers — U1: cell 1 → cell 2, U2: cell 3 → coil shunt (the coil slot walks a floating input to
+  keep per-cell rates honest until M5) — ticks them from `loop()`, re-begins them on converter
+  hot-plug so a swapped part is sized from its own measurement, and adds bench command **`t`**
+  (achieved rate, period stats, interlock window, error counters). `loop()`'s bare delay(20)/
+  delay(30) heartbeat became **service windows**: same HIGH-20/LOW-30 heartbeat shape, but the
+  walkers and the REPL run inside it, because at a 50 ms loop cadence the achieved rate would be
+  paced by the loop, not by the converters.
+  **Measured on-target** (three reads across two captures, uptimes 17 s / 60 s / 26 s): boot timed
+  61,870-62,120 us at the design field; **7.21-7.23 SPS per cell achieved** at both addresses (design asks 16, the clone's
+  real sizing figure is 8.05, the ~10% shortfall is the OS-poll detection lag); in-walk conversion
+  periods **65,498-67,112 us, avg 66.3-66.9 ms**; interlock **busy duty 95-96%** → the incidental
+  inter-conversion gap is ~2-3 ms, too short for a 20-250 ms pulse, so **decision 34**: M5's pulse
+  scheduler must carve explicit conversion-free slots, not queue into incidental ones. 60 s
+  continuous run: `ioErr 0, convTimeout 0, lateDetect 0`, sample ages < 200 ms, `p` responsive
+  afterwards. One report bug found by running it: `periodMin` printed 0 because `begin()` seeded the
+  EMA from the boot measurement, so the first-sample branch (the only min/max initialiser) never
+  ran — fixed and re-measured (min 65,498 us). `a`/`d` mid-walk writes stir the counters; the report
+  says so rather than pretending the run was clean.
+  App 488,497 B flash (31.1%), 63,864 B RAM (19.5%). Native suite unchanged at **94 green** (`src/`
+  is not built natively — that split is what makes that claim cheap to keep honest).

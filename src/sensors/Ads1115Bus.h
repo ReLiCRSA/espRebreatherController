@@ -8,9 +8,10 @@
 // register layer explicit also keeps the 16-bit big-endian register format visible at the point it
 // is used, which is where the subtle bugs are.
 //
-// Status: register layer + bring-up self-test (probeId / readReg / writeReg / selfTest). The
-// alternating 16 SPS-per-cell conversion scheduler is the next step and is NOT implemented here
-// yet — do not read this file as the M1 gate being met.
+// Status: register layer, bring-up self-test (probeId / readReg / writeReg / selfTest), and the
+// alternating-mux pair scheduler (AdcPairWalker) that M1 asked for. Its achieved rate and
+// interlock window are measured on-target by bench command 't' — like every other timing figure
+// here, they are read off the part, not off the datasheet.
 #pragma once
 
 #include <Arduino.h>
@@ -113,6 +114,13 @@ class Ads1115 {
                                        TOO_SLOW };
     PartCheck checkPart(uint32_t* convUsOut = nullptr, unsigned* pollsOut = nullptr);
 
+    // The conversion period that checkPart() last measured, in µs (0 = never measured). Everything
+    // downstream — the pair walker's poll cadence, its conversion-stall timeout, and the coil/ADC
+    // interlock window of AGENTS.md 8 — is sized from this measured number, never from the
+    // datasheet's rate table (decision 29, risk 16: the fitted clones run the "32 SPS" field at
+    // ~62 ms, twice the datasheet figure).
+    uint32_t measuredConvUs() const { return measConvUs_; }
+
     // Bring-up diagnostic: chip ID, a write-verify of one benign register, pointer-register
     // behaviour, DRDY line state and conversion timing. It changes nothing the cell chain depends
     // on (the one register it writes is restored).
@@ -124,6 +132,104 @@ class Ads1115 {
     int drdy_;
     uint8_t id_ = 0;
     bool present_ = false;
+    uint32_t measConvUs_ = 0;  // set by checkPart() when a conversion completes (any verdict)
+};
+
+// ---------------------------------------------------------------------------
+// AdcPairWalker — the alternating-mux scheduler AGENTS.md 2 requires.
+//
+// One converter feeds two differential pairs (U1: cells 1+2; U2: cell 3 + coil shunt). Continuous
+// mode locks the mux to one channel, so the converter has to be walked AIN0/1 -> AIN2/3 by
+// re-writing the config register between single-shot conversions. That is this state machine, and
+// it is deliberately **non-blocking**: the dive loop calls tick() alongside everything else, and
+// each call performs at most one or two I2C transactions. A blocking waitReady() in the dive path
+// would cost 62 ms per conversion on the fitted parts — minutes on a bad bus.
+//
+// Sizing comes from measurement, not the datasheet (decision 29 / risk 16): begin() reads
+// adc.measuredConvUs(), the period checkPart() timed at boot (~62 ms on the fitted clones, where
+// the datasheet promises 31.25 ms). So the design's "16 SPS per cell" is **8 SPS per cell** on
+// this hardware, and the per-cell rate the walker reports (bench 't') is counted from conversions
+// actually completed, not computed from the RATE field written.
+//
+// Coil/ADC interlock (AGENTS.md 8, risk 4): integrating() is true from the instant a conversion is
+// started until its result has been read back. Coil pulses must not fire inside that window — a
+// coil kick landing mid-conversion looks exactly like cell disagreement and trips voting.
+// coilSafeAfterUs() is the pulse scheduler's estimate of the remaining window, built on the
+// running average of **measured** conversion periods; integrating() itself is the authoritative
+// signal. DRDY would make this exact rather than polled (open item 14) — until it is wired, the
+// OS bit is polled at kPollGapUs cadence, and the poll cost (~350 us per config read, measured)
+// is included in the duty figures 't' prints.
+//
+// Raw codes are stored exactly as the converter put them on the bus. The per-channel `invert` flag
+// resolved on the bench is applied at consumption (CellArray, M2) — a log, display or test that
+// quotes a raw value must quote the un-inverted one, or an inverted scale hides a railed input.
+class AdcPairWalker {
+  public:
+    // OS-bit poll cadence. A config-register read measured ~350 us on this bus, so 10 ms costs
+    // ~3.5% of one converter's bus time and puts ~6 polls inside one 62 ms conversion — enough
+    // resolution to see the coil window close without spamming the bus.
+    static constexpr uint32_t kPollGapUs = 10000;
+    static constexpr uint32_t kBackoffMs = 1000;  // after I2C error or conversion stall
+
+    AdcPairWalker(Ads1115& adc, uint16_t muxA, uint16_t muxB,
+                  const char* labelA, const char* labelB)
+        : adc_(adc), muxA_(muxA), muxB_(muxB), label_{labelA, labelB} {}
+
+    // (Re)size from the converter's last measured conversion period and start walking. Called at
+    // boot after checkAdcs(), and again whenever a converter appears/disappears — a hot-swapped
+    // part gets its own measurement, not the previous part's. If the part has never been
+    // characterised, sizing falls back to the datasheet figure **and says so in report()**: a
+    // silent datasheet fallback in a timing path is exactly what risk 16 forbids.
+    void begin();
+
+    // Drive the state machine. Call at better than kPollGapUs cadence; costs nothing in ABSENT.
+    void tick();
+
+    bool integrating() const { return state_ == WAIT_A || state_ == WAIT_B; }
+    // µs until this converter is expected to be coil-safe again; 0 when it is idle. An estimate —
+    // integrating() going false is the authoritative edge. Never size a hardware window from the
+    // datasheet: the basis here is the running average of measured periods.
+    uint32_t coilSafeAfterUs() const;
+
+    // Slot 0 = mux A (AIN0/1), slot 1 = mux B (AIN2/3).
+    bool slotValid(int slot) const { return slot >= 0 && slot < 2 && valid_[slot]; }
+    int16_t slotRaw(int slot) const { return raw_[slot]; }
+    uint32_t slotAgeMs(int slot, uint32_t nowMs) const {
+        return (slot >= 0 && slot < 2 && valid_[slot]) ? nowMs - stampMs_[slot] : 0;
+    }
+
+    // Achieved rate, period stats, interlock duty and error counters — the M1 gate numbers, from
+    // the counter of conversions actually completed. Bench command 't'.
+    void report(Print& out, uint32_t nowMs) const;
+
+  private:
+    enum State : uint8_t { OFF, ABSENT, BACKOFF, START_A, WAIT_A, START_B, WAIT_B };
+
+    void enterBackoff() { state_ = BACKOFF; backoffMs_ = millis(); }
+
+    Ads1115& adc_;
+    uint16_t muxA_, muxB_;
+    const char* label_[2];
+
+    State state_ = OFF;
+    uint16_t rateField_ = adc::kRateDesign;
+    uint32_t convSizedUs_ = 0;      // the period begin() sized this walker from
+    bool sizedFromMeasure_ = false; // false = datasheet fallback, and report() says so loudly
+    uint32_t convStallUs_ = 0;      // elapsed past which the conversion is declared dead
+    uint32_t convStartUs_ = 0, lastPollUs_ = 0, backoffMs_ = 0;
+
+    int16_t raw_[2] = {0, 0};
+    uint32_t stampMs_[2] = {0, 0};
+    bool valid_[2] = {false, false};
+    uint32_t convCount_[2] = {0, 0};
+
+    // Counters are cumulative since begin() and deliberately include traffic stirred up by bench
+    // commands ('a' and 'd' write the config register mid-walk): the report says so rather than
+    // pretending the run was clean.
+    uint32_t ioErr_ = 0, timeouts_ = 0, lateDetect_ = 0, polls_ = 0;
+    uint32_t periodAvg_ = 0, periodMin_ = 0, periodMax_ = 0;
+    uint32_t busyUs_ = 0;   // cumulative µs with a conversion in flight (interlock duty)
+    uint32_t startMs_ = 0;  // uptime for achieved-SPS arithmetic
 };
 
 } // namespace sensors
