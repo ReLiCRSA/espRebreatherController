@@ -1,7 +1,7 @@
 # AGENTS.md — ESP32 CCR Rebreather Dive Computer
 
 **Status:** design complete, no source code written yet. Project root: `/Users/wvanghent/esp32`.
-**Last updated:** 2026-11-19.
+**Last updated:** 2026-11-20.
 
 ---
 
@@ -113,24 +113,33 @@ the Adafruit product page and the Adafruit 4-Channel ADC Breakouts guide (2026-1
   to carry a second independent computer.
 
 ### Depth
-- **MS5837** (7-bit **0x3E**; the datasheet's "0x7C" is the 8-bit write form) primary: 0–30 bar
+- **MS5837** (datasheet 7-bit **0x76** — TE DS: "Address (7 bits) 0x76 (1110110 b)"; the "0x7C"
+  that circulates in driver code is its 8-bit write byte) primary: 0–30 bar
   (~300 m), 0.2 mbar resolution, OSR 4096 (~10 ms) at 8 Hz.
   Gel-covered: max 24 h continuous immersion then 2 h drying — long immersion destroys it.
-- **BMP085** (7-bit **0x3B**; datasheet "0x77" is the 8-bit write form) fallback only:
+  **Not yet fitted**: 0x76 is datasheet-derived, not bench-measured on this project yet.
+- **BMP085** (datasheet 7-bit **0x77** — Bosch DS Table 7: address bits `1110111` + R/W, bus
+  bytes 0xEE write / 0xEF read; the Adafruit breakout uses this address) fallback only:
   300–1100 hPa => **~9 m usable depth ceiling**. If it is what is
   fitted, arm is allowed but a permanent `DEPTH RANGE 9m` banner shows and all depth-dependent
   logic clamps at 9 m. Never extrapolate.
-- Boot probe order: 0x3E then 0x3B. Selected driver reported in `/api/health` and on OLED boot line.
-- **Measured on the bench (2026-11-20, bench `b`): the fitted "BMP085" module is not a BMP085.**
-  It ACKs at 7-bit **0x77** — a genuine Bosch BMP085/180 has its 7-bit address **fixed at 0x3B**, and
-  is silent there — answers CHIPID `0xD0=0x55` (the BMP180 ID), but the fixed version byte answers
-  **`0xD1=0x02` where a genuine part reads `0x43`**, and the factory calibration ROM reads
-  **AC1=0x219C (8604) against the BMP180 spec value 7295**. A Bosch-family clone: same defect class
-  as risk 16, now on the depth sensor. Re-checked **on the design bus (I2C0)** the same day: 0x3E and
-  0x3B both NACK and the fingerprint reproduces identically at 0x77, so this is a property of the
-  silicon, not of the wiring. It is not trusted for depth and stays a bench object;
-  fallback procurement is open item 17. `b` re-measures the fingerprint (it writes the Bosch pointer
-  register — bench only, same class as `a`/`d`).
+- Boot probe order: 0x76 then 0x77. Selected driver reported in `/api/health` and on OLED boot line.
+- **Address correction (2026-11-20, decision 36): 0x3E and 0x3B were phantoms.** The probe table
+  previously "halved" the datasheet bytes (0x7C->0x3E, 0x77->0x3B); neither is any real address, and
+  an earlier entry here recorded the fitted module as a "clone" against that false yardstick.
+  **Measured on the bench (bench `b`, I2C0): the fitted module is a genuine BMP180-die part** —
+  ACKs at the datasheet 7-bit **0x77**, CHIPID `0xD0=0x55` (BMP180 ID). The two readings that
+  looked like mismatches are not: **`0xD1=0x02`** — 0xD1 (version MSB) is in the BMP085 manual
+  only, the BMP180 datasheet has no such register, so reading an undefined register returning 0x02
+  is meaningless, not contradictory; **AC1=0x219C (8604)** — the 0xAA–0xBF calibration block is
+  per-chip factory trim (the DS's 7295 is its worked-example value), and 8604 is normal. The
+  Adafruit BMP085/BMP180 breakout is exactly this part at exactly this address. It is now found at
+  boot (`I2C0: [0x77 0x3C]`) and the fallback path raises `BARO_RANGE_9M depth clamps 9 m` as
+  designed. Corroborated independently by Adafruit's own BMP085/180 guide: "if an Adafruit BMP085
+  Breakout is properly connected it should show up at **0x77**". `b` re-measures the fingerprint (it writes the Bosch pointer register — bench only,
+  same class as `a`/`d`). Caution kept: BMP280/BME280 also live at 7-bit 0x76/0x77 (CSB strap), so
+  an ACK at 0x76 is not proof of an MS5837 until its PROM read says so — and only one baro fits
+  on I2C0 without an address clash.
 - Depth = `(Pamb - Psurf) * k`; `Psurf` is **learned at boot** (only relative accuracy matters,
   +/-2 mbar ~ 2 cm, not the +/-200 mbar absolute spec). Salinity configurable (fresh 1.000,
   salt 1.025). Learned Psurf also gates air calibration.
@@ -171,7 +180,7 @@ than on this module.
 
 | Function | GPIO |
 |---|---|
-| I2C0 SDA / SCL (OLED 0x3C + baro 0x3E/0x3B + INA219 0x40, all 7-bit) | 21 / 22 |
+| I2C0 SDA / SCL (OLED 0x3C + baro 0x76/0x77 + INA219 0x40, all 7-bit) | 21 / 22 |
 | I2C1 SDA / SCL (2x ADS1115) | 18 / 19 |
 | ADS1115 U1 / U2 DRDY | 23 / 4 |
 | Solenoid drive (10k pulldown + flyback) | 26 |
@@ -246,8 +255,9 @@ BENCH (default) --arm checklist pass--> ARMED_DIVE --> SURFACE_INTERVAL --> BENC
 Arming requires a **two-button physical sequence**. The web page cannot arm the unit.
 
 ### Boot fault report (boot is never fatal)
-Probed at boot (7-bit addresses, which is what `Wire` takes — the baro datasheets quote 8-bit
-forms): ADS1115 @0x48, @0x49, MS5837 @**0x3E**, BMP085 @**0x3B**, SSD1306 @0x3C/0x3D, INA219 @0x40,
+Probed at boot (7-bit addresses, which is what `Wire` takes — take the 7-bit form each datasheet
+states; see §2, decision 36, on why "halving" a quoted byte is banned): ADS1115 @0x48, @0x49,
+MS5837 @**0x76**, BMP085 @**0x77**, SSD1306 @0x3C/0x3D, INA219 @0x40,
 cell input bias sanity (each pair within +/-250 mV and not railed), LittleFS mount, NVS, config
 schema version, tissue-state recovery validity, V_BAT and 3.3 V rail.
 
@@ -706,7 +716,9 @@ from here),
 and `g` pad map + pad test — who owns each GPIO according to the core (periman), plus measured
 pull-up/pull-down and output behaviour on pads with nothing wired,
 and `b` baro identity — Bosch-family CHIPID/version/cal-ROM reads at the candidate addresses, which
-is how the fitted "BMP085" was measured to be a clone (§2) rather than inferred from its label. `g` is what settled §3, and `v`
+is how the fitted BMP085 was established as genuine — and, equally instructively, how a wrong
+expectation (phantom 0x3B) was measured against a good part and produced a false "clone" verdict
+(§2, decision 36, risk 21). `g` is what settled §3, and `v`
 runs the fixed headless sim profile (see §11): it prints per-minute SIM-stamped lines plus a
 measured **worst-tick cost** line — per-tick compute cost is derived from the target, never assumed
 from the host (risk 19).
@@ -721,15 +733,20 @@ Commands: `pio run`, `pio run -t upload`, `pio device monitor`, `pio test -e nat
 `pio run -t uploadfs`.
 
 **README.md must contain** (user requirement): the safety statement and what this is not; BOM
-(Bar30/MS5837-30BA breakout, 2x Adafruit ADS1115 breakout #1085 (decision 35), MOSFET + flyback Schottky + 10 mOhm shunt, INA219,
+(Bar30/MS5837-30BA breakout, Adafruit BMP085 breakout as the fallback (**BMP180 die, 7-bit 0x77** —
+the module on the bench, measured genuine per decision 36; its exact Adafruit product number is not
+verified here, so the BOM names the part, not a SKU), 2x Adafruit ADS1115 breakout #1085 (decision 35), MOSFET + flyback Schottky + 10 mOhm shunt, INA219,
 1 MOhm x12, 10 ohm x12, watchdog IC, 2P PCM >=3 A, valve); full wiring tables plus an ASCII harness
-diagram for MS5837 (3.3 V, 7-bit 0x3E / datasheet 8-bit 0x7C, Bar30 DF13 colours: red power /
+diagram for MS5837 (3.3 V, **7-bit 0x76** per its datasheet — the "0x7C" in circulating driver
+code is the 8-bit write byte; Bar30 DF13 colours: red power /
 black GND / yellow SDA / blue SCL),
-BMP085 fallback (7-bit 0x3B), both ADS1115 with ADDR straps 0x48/0x49 and DRDY lines, the per-cell 1 MOhm +
+BMP085 fallback (**7-bit 0x77**, Bosch DS Table 7 bits `1110111`+R/W), both ADS1115 with ADDR straps 0x48/0x49 and DRDY lines, the per-cell 1 MOhm +
 10 ohm + RC network and polarity, OLED, solenoid drive stage, buzzer, motor, buttons, watchdog,
 INA219; **common wiring mistakes** (powering a galvanic cell, missing common-mode resistors, both
 ADDR straps at GND, solenoid without flyback, a diode in the coil path, ADC2 pins, GPIO 34–39 as
-outputs, panel on I2C that should be SPI, **searching for the baro at 0x7C when `Wire` wants 0x3E**);
+outputs, panel on I2C that should be SPI, **doing address arithmetic on a datasheet number — this
+project's own probe table carried phantom 0x3E/0x3B for a day because someone halved 0x7C/0x77;
+take the 7-bit form the datasheet states and confirm with a sweep**);
 power and battery budget including the 0.3 J/pulse vs
 0.4 W math; valve selection table and the seat-pressure warning; maintenance (MS5837 24 h immersion /
 2 h drying, annual cell replacement, connector corrosion, moisture and potting); and the pre-water
@@ -739,12 +756,15 @@ bench procedure.
 
 ## 16. Test strategy
 
-**Current state (2026-11-19): `pio test -e native` is green — 94 cases across seven suites
+**Current state (2026-11-20): `pio test -e native` is green — 94 cases across seven suites
 (`test_voting`, `test_gas`, `test_zhl`, `test_boot`, `test_adc`, `test_pins`, `test_sim`);
-`pio run -e esp32` links **and is flashed and running on the devkit** with two ADS1115 modules and
-an SSD1306 actually attached (both converters measure as clones — risk 16, decision 31). The
+`pio run -e esp32` links **and is flashed and running on the devkit** with two ADS1115 modules,
+an SSD1306 and an Adafruit BMP085 actually attached (the converters measure as clones — risk 16,
+decision 31; the BMP085 measures as genuine — decision 36). The
 positive-ACK caveat that M0 left open is closed: `I2C1: 2 device(s) [0x48 0x49]`,
-`I2C0: 1 device(s) [0x3C]`, and the corresponding faults clear while the missing ones stay raised.
+`I2C0: 2 device(s) [0x77 0x3C]`, and the corresponding faults clear while the missing ones stay
+raised — including the designed fallback behaviour: with only the BMP085 answering,
+`BARO_RANGE_9M depth clamps 9 m` is raised and arming stays allowed with the banner (§13).
 Reads and writes on the attached converter are verified, not assumed: `a` write-verifies a register
 and restores it, `d` measures the conversion period field by field — which is how the register-map
 faults and the non-standard rate table in section 2 were found — and `g` measures who owns each GPIO
@@ -825,7 +845,7 @@ with `histDropped` accounting, strides, and `NO DATA`/`unevaluated` so an empty 
 | M0 | installer, build, flash, I2C scan, boot report | `pio run -t upload` works on this Mac | **DONE** — flashed and verified on the devkit (CP2102, ESP32-D0WD-V3): "Hash of data verified", clean boot banner, boot report correct on an empty bench, `[arm] REFUSED`. Section 15 holds the evidence. |
 | M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **DONE (2026-11-19).** Boot/bench and the simulator were verified earlier; the last open item, the **alternating-mux scheduler**, is now implemented and measured: `AdcPairWalker` in `src/sensors/Ads1115Bus` — non-blocking pair-step state machine, sized from the boot-measured conversion period (never the datasheet), polled OS bit at 10 ms cadence (DRDY still unwired, open item 14), I2C-error backoff, and a coil/ADC interlock window carried per converter. Bench `t` measures it: **7.2 SPS per cell achieved** on the fitted clones (design 16, clone-sized 8), in-walk periods 65.5-67.1 ms, interlock busy duty **95-96%** → decision 34: M5 must carve explicit pulse slots. `lib/sim` runs the fixed 26-min profile headless on the board (bench `v`) at hand-computed pulse demand; **94 native cases green** in seven suites. Open item 13's outstanding action (order two Adafruit #1085 breakouts — decision 35 — and re-run `d`/`a`/`t`) stands — the walker re-sizes itself from the new parts' own measurement at boot. |
 | M2 | air cal + voting + diluent-flush check + alarms | native voting tests pass | voting + diluent-flush + cal sigma gate done natively; on-device wiring not started |
-| M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds 0x3E/0x3B (datasheet 8-bit 0x7C/0x77 corrected) and raises `BARO_RANGE_9M` when only the BMP085 answers; drivers not written |
+| M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds **0x76/0x77** (datasheet 7-bit forms, decision 36 — the old 0x3E/0x3B were phantoms) and raises `BARO_RANGE_9M` when only the BMP085 answers — **measured on the bench 2026-11-20: the fitted Adafruit BMP085 is found at 0x77 and `BARO_RANGE_9M depth clamps 9 m` fires**; drivers not written |
 | M4 | ZHL-16C 3-gas + GF + ICD + CNS + MOD/END/density | validated natively **before** hardware depends on it | **engine complete and regression-anchored natively** (47 cases); *not* validated against a trusted computer yet — risk 13 |
 | M5 | pulse-driven solenoid + click verification + breathing-state machine + bailout | three-way solenoid fault taxonomy + ADC-window interlock | not started |
 | M6 | web + WS + settings + cal UI + dive-log graphs | phone on SoftAP, all tabs, offline graphs render | not started (deps resolve and compile) |
@@ -891,6 +911,7 @@ Re-open only with the user's explicit agreement.
 | 33 | **The GPIO capability table and the role assignment live in `lib/core/src/PinMap.h`** (pure C++, asserted by `test/test_pins/`); `src/config/Pins.h` is an alias, not a second copy. | Same remedy as decision 28, applied to a different class of defect. The pin map was a paragraph nobody could test, and it was wrong twice: GPIO 33 assigned to two functions, and pad groups assumed free or unusable based on the die instead of the module (measured: 24 and 28–31 do not exist on the ESP32-D0WD-V3 die at all; 20/37/38 exist but WROOM-32 does not bond them out). A duplicate pin or an output on an input-only pad is now a test failure rather than a bench-chase. |
 | 34 | **The M5 coil-pulse scheduler must carve explicit conversion-free slots into the ADC cycle; the incidental inter-conversion gap is measured ~2–3 ms and shall not be designed against.** | Implemented-and-measured 2026-11-19, before M5 exists: the alternating-mux walker (`AdcPairWalker`) keeps both converters integrating 95–96% of wall time at the fitted clones' rate (mean in-walk conversion period 66.4 ms, bench `t`). §8's "pulses queue into the gap" assumed a gap exists; at 20–250 ms pulse widths it does not. Recorded now so M5 is designed against a measured figure instead of discovering the collision at the water. This is **inherent to the walk scheme, not an artifact of the clones**: the walker re-arms the next conversion immediately, so back-to-back conversions leave the same ~µs gap at genuine-part rates too — only the window size changes (62 ms → ~31 ms). |
 | 35 | **The two ppO2 converters are specified as Adafruit "ADS1115 16-Bit ADC – 4 Channel with PGA" breakouts (product #1085), 2x.** This is the named procurement that satisfies decision 31; it changes nothing about driver or acceptance. | User's call, 2026-11-19. Facts checked against the Adafruit product page and the 4-Channel ADC Breakouts guide: the board carries the TI ADS1115 (chip spec SBAS444 — the same table `AdcRegs.h` implements and `test/test_adc/` asserts, so **no register-map, PGA, LSB or rate change anywhere**), VIN 2.0–5.5 V (run at 3.3 V), default address 0x48 with one back-side `A0` solder jumper giving 0x49 — exactly this design's 0x48/0x49 pair — ALRT/DRDY broken out on the header (open item 14 becomes wireable), and on-board 10k I2C pull-ups (two boards ≈ 5k total; add none externally). Caveats kept on the record: **identity remains a measurement claim, never a brand claim** (decision 29) — the arrival acceptance test is unchanged (`d` measures the eight datasheet rates, `a` reads ID `0x85`, `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` clear by themselves); decision 27 also stands — the Adafruit ADS1X15 library is a bring-up cross-check at most, never in the dive path. Two board revisions (STEMMA QT / header-only) are both acceptable. |
+| 36 | **I2C address policy: take the 7-bit form the datasheet itself states; never do arithmetic on a quoted address byte. Probe-table baro addresses become 0x76 (MS5837) and 0x77 (BMP085/180).** Corrects the 2026-11-19 note that "datasheets quote 8-bit forms, halve them" — that produced phantom 0x3E/0x3B, which no part has ever answered at. | Evidence, read from the primary sources on 2026-11-20 (copies in the session temp dir): Bosch BMP180 DS (BST-BMP180-DS000-09) Table 7 — "BMP180 addresses: A7..A1 = 1 1 1 0 1 1 1, W/R", i.e. 7-bit **0x77**, bus bytes 0xEE write / 0xEF read; there is no 0x3B anywhere in the part. TE MS5837-07BA DS — "Module ref / Mode / Pins used / Address (7 bits): MS5837-07BA, I2C, SDA SCL, **0x76 (1110110 b)**"; "0x7C" is the 8-bit write byte that circulates in driver code, and 0xA0–0xAC in the PROM-read diagrams are **command bytes**, not slave addresses — two separate traps in one datasheet. The immediate proof: the bench's Adafruit BMP085 is found at 0x77 and is a genuine part (see item 17's closure); boot now reports `I2C0: [0x77 0x3C]` + `BARO_RANGE_9M` instead of `ERROR BARO`. Also recorded: **0x76/0x77 are shared by BMP280/BME280 (CSB strap)**, so presence at 0x76 is not identity for the MS5837 — the PROM read confirms it (M3) — and one baro per I2C0 max without a clash. The failure mode this decision closes is the general one (risk 21): a wrong yardstick makes honest measurements look like part failures, and on this project the *next* suspect was already in the log as a bogus procurement action. |
 
 ---
 
@@ -997,6 +1018,18 @@ Re-open only with the user's explicit agreement.
     state the injected ambient litres must equal metabolic surf L x Pamb/Psurf (measured: 2 pulses
     per minute against a hand-computed 2.0, 14 pulses over a 7-min hold against a hand-computed
     2.15 amb L). A ppO2 trace that holds setpoint is not evidence the gas accounting is right.
+21. **A wrong datasheet reading becomes a wrong fact in the record, and honest measurements then
+    indict good parts.** The probe table's baro addresses were derived by *halving* quoted bytes
+    (0x7C→0x3E, 0x77→0x3B); neither exists. Every measurement against those phantoms was correct —
+    and every conclusion drawn from them was wrong: the Adafruit BMP085 on the bench was written up
+    as a Bosch-family clone (item 17, closed), and a procurement action was opened against a good
+    module. Rules: take the address form the datasheet states (BMP180 DS Table 7: bits
+    `1110111`+R/W = 7-bit 0x77; MS5837 DS: "Address (7 bits) 0x76"), never binary arithmetic on a
+    quoted number; confirm expected-presence with a full sweep (`s`), not with the fitted table
+    alone — a sweep is what shows a device at an address the table forgot; and remember 0x76/0x77
+    are shared with BMP280/BME280, so at these two addresses presence never proves identity — the
+    PROM read (MS5837) or a real conversion (Bosch) does. "Presence is not identity" cuts both
+    ways: **identity is also not a comparison against an unverified expectation.**
 
 ---
 
@@ -1020,7 +1053,7 @@ Re-open only with the user's explicit agreement.
 | 14 | **DRDY is wired to GPIO 23 but the line has only ever been read pulled-up and idle** | The driver currently polls the OS bit over I2C (348 us/poll measured). DRDY would cut that to an interrupt and make the coil/ADC interlock exact rather than polled. Needs the module's DRDY actually connected and the polarity/behavior measured (open-drain, needs a pull-up) before the scheduler can depend on it. The Adafruit #1085 (decision 35) **breaks ALRT out on its header**, so once those boards are fitted this is one jumper + one pull-up per converter — not a board-modification project. Still must be measured before the scheduler trusts it, and settled against the pin budget (item 15). |
 | 15 | **Display panel vs the pin budget** (new, from closing item 12): a SPI panel needs four pads (SCK/MOSI/DC/CS) and after the current map **only GPIO 17 is spare and output-capable** | The core's own SPI defaults (18/19/23) collide with I2C1 and ADS_U1_DRDY, so a panel cannot simply take `SPI.begin()` defaults. Options, none free: free the two DRDY pads by polling the OS bit instead (costs 348 us/poll and an exact interlock, item 14), take strapping pins against the §3 policy, or keep the panel on I2C and accept the frame-time cost (§12 says a >128x64 panel must not go on I2C). Must be argued with item 6 when the panel is chosen — not during bring-up at the water. |
 | 16 | **The ADS1115 module stopped answering on I2C1** (`SDA held low before init`, probes returning **err 5 = timeout**, nine clocks + port re-init did not free it) | **CLOSED 2026-11-19 — not a fault.** The user confirms the dropouts were **their own intervention on the bench** (the module being unplugged/re-fitted), not a flaky connection. Nothing to fix and no maintenance action. What the episode is kept for is the diagnostic it produced: `err 5` (bus being held) vs `err 2` (address unanswered) are different hardware stories, and **a converter that has lost its supply clamps SDA/SCL through its protection diodes** — that is exactly what a disconnected or unpowered module looks like, and exactly what a converter failing mid-dive will look like in the log. Securing jumpers for the dive build stays good practice (§20 item 9, enclosure/connector work), but it is not a corrective action for anything seen so far. |
-| 17 | **The fitted "BMP085" fallback module is a Bosch-family clone** (ACKs 0x77, silent 0x3B; `0xD0=0x55`, `0xD1=0x02` not 0x43, AC1=8604 not 7295) — measured 2026-11-20 by bench `b` | **OPEN.** It is not a BMP085 and is not trusted for depth: the address, the version byte and the calibration ROM all disagree with the datasheet, so its conversion behaviour is unknown. The MS5837 primary path (decision 7) is unaffected. Outstanding question, not an action: source a genuine BMP085 (or BMP280, with its own driver) for the fallback, or drop the fallback and carry only the MS5837 plus the second independent computer. Until decided, the boot probe stays 0x3E/0x3B — a clone sitting at 0x77 is deliberately invisible to the design, and `b` names it truthfully. |
+| 17 | **"The fitted BMP085 is a Bosch-family clone" (ACKs 0x77, silent 0x3B; `0xD1=0x02` not 0x43, AC1=8604 not 7295) — recorded 2026-11-20 by bench `b`** | **CLOSED 2026-11-20 — misdiagnosis, the module is fine.** All three "disagreements" were the *report's* errors, not the part's: 0x3B was a phantom produced by halving the datasheet's 0x77 (Bosch DS Table 7: bits `1110111`+R/W = 7-bit **0x77**, which is where the module correctly answers); 0xD1 is undefined in the BMP180 datasheet, so its readback 0x02 proves nothing (0x43 is BMP085-only); the 0xAA–0xBF cal block is per-chip factory trim, 8604 is normal, 7295 is the DS's worked example. The module is an Adafruit BMP085 (BMP180 die) behaving exactly as specified. The real defect was in the probe table — fixed to 0x76/0x77 (decision 36), and boot now finds it: `I2C0: [0x77 0x3C]`, `BARO_RANGE_9M depth clamps 9 m`, correct fallback behaviour. The fallback part question is therefore **resolved: the fitted module is the fallback**. What stays open in miniature: the MS5837 (0x76) is still unprocured/unfitted, so its side of the table is datasheet-derived until one is measured; and the BMP180's conversion behaviour is trusted only once `Bmp085.cpp` makes it produce a real, sane pressure (identity by register reads is necessary, not sufficient). |
 
 ---
 
@@ -1358,3 +1391,33 @@ Re-open only with the user's explicit agreement.
   not trusted for depth). No change to the boot probe table, the fault set, or any dive-path code.
   App 490,081 B flash (31.2%), 63,864 B RAM (19.5%); flashed and verified on the board. Native
   suite unchanged at 94 green.
+
+- 2026-11-20 (correction, logged because the wrong yardstick is the lesson): **the entry above is a
+  misdiagnosis — the bench BMP085 is a genuine part, and the firmware's baro addresses were
+  phantoms.** The user's "0x77 is the Adafruit BMP085" checked out against the primary sources the
+  same day (Bosch BST-BMP180-DS000-09 and the TE MS5837-07BA DS, both pulled and read):
+  1. **0x3B never existed.** Bosch DS Table 7: "BMP180 addresses — A7..A1 = `1 1 1 0 1 1 1`, W/R"
+     = 7-bit **0x77**, bus bytes 0xEE/0xEF. The 2026-11-19 rule "datasheets quote 8-bit, halve
+     them" was wrong for Bosch — and its MS5837 half was wrong too: the TE DS says "Address (7
+     bits) **0x76** (1110110 b)"; "0x7C" is a circulating 8-bit write byte, and 0xA0–0xAC in the
+     PROM diagrams are command bytes. **0x3E and 0x3B were both arithmetic phantoms.**
+  2. **The two "register disagreements" were my errors, not the part's.** `0xD1` is in the BMP085
+     manual only — the BMP180 datasheet has no 0xD1 — so `0xD1=0x02` is an undefined-register read
+     proving nothing, not a mismatch against "the fixed 0x43". AC1 is per-chip factory trim (the
+     0xAA–0xBF block varies chip to chip; 7295 is the DS's worked example): 8604 is normal.
+     `0xD0=0x55` at 0x77 is exactly what an Adafruit BMP085 (BMP180 die) should answer.
+  3. **Fixed and re-measured**: probe table 0x76/0x77 (MS5837 side datasheet-derived — no MS5837
+     fitted yet; BMP085 side measured), baro-selection logic, `kDiag`, the `b` candidate list and
+     its NOTE text (the "fixed at 0x3B" claim removed), `BusProbe.h`'s address comment, and the
+     README-must-teach line in §15 (it previously taught the wrong lesson). Boot now: `I2C0:
+     [0x77 0x3C]`, `ERROR BARO_RANGE_9M depth clamps 9 m`, `[arm] checklist: sensors ok` — the
+     designed fallback behaviour, first time the fallback path has ever run on real hardware. `b`
+     reproduces the fingerprint at I2C0 with the corrected interpretation.
+  Item 17 closed with its resolution, **decision 36** (address policy) and **risk 21** added;
+  §2/§3/§4/§15/§16 corrected. The pattern matches §20 item 16's lesson but one level up: there,
+  an inference fit the evidence but missed a variable; here, **the evidence was measured honestly
+  and the expectation it was compared against was wrong — "presence is not identity" also means
+  identity is never proved by comparing against an unverified datasheet claim.** No dive-path
+  logic changed; only probe addresses and bench text. Native suite re-run: 94 green. App 489,973 B
+  flash (31.2%), 63,864 B RAM (19.5%); the corrected image is flashed and the boot output above is
+  from the board.

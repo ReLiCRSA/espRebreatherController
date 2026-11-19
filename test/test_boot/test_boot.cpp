@@ -37,7 +37,7 @@ void test_a_present_device_raises_nothing() {
 
 void test_hotplug_closes_the_fault_but_keeps_the_history() {
     boot::Report r;
-    r.raise(FaultCode::BARO, T0, "no response at 0x7C");
+    r.raise(FaultCode::BARO, T0, "no response at 0x76/0x77");
     TEST_ASSERT_TRUE(r.blocksArming());
     r.clear(FaultCode::BARO, T0 + 5000);
     TEST_ASSERT_FALSE(r.active(FaultCode::BARO));

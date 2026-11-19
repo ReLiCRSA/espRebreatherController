@@ -39,9 +39,16 @@ namespace {
 
 boot::Report g_faults;
 
-// All addresses are 7-bit, which is what Wire takes. The baro datasheets quote 8-bit forms:
-// MS5837 "0x7C" -> 0x3E, BMP085 "0x77" -> 0x3B. Getting this wrong means the unit never finds
-// its depth sensor and reports it missing forever.
+// All addresses are 7-bit, which is what Wire takes. Corrected 2026-11-20 against the datasheets
+// themselves — an earlier note here "halved" the quoted bytes (0x77 -> 0x3B, 0x7C -> 0x3E) and
+// both results were phantoms no part ever answered at:
+//   BMP085/180: Bosch DS Table 7 gives address bits 1110111 + R/W, i.e. **7-bit 0x77**
+//     (bus bytes 0xEE write / 0xEF read). There is no 0x3B anywhere.
+//   MS5837: TE DS, "Module ref / Mode / Pins used / Address (7 bits): MS5837-07BA I2C SDA, SCL
+//     **0x76 (1110110 b)**". The "0x7C" seen in some code is the 8-bit write byte 11101100.
+// Lesson for the README's common-wiring-mistakes list: a datasheet address may be quoted as
+// 7-bit, 8-bit, or as command bytes (MS5837's PROM reads are 0xA0..0xAC) — never do address
+// arithmetic on them; take the 7-bit form the datasheet states, and confirm with a bus sweep.
 struct DevSpec {
     FaultCode code;
     uint8_t addr;
@@ -53,8 +60,8 @@ struct DevSpec {
 DevSpec g_devices[] = {
     {FaultCode::ADS1115_U1, 0x48, &Wire1, "ADS1115 U1", false},
     {FaultCode::ADS1115_U2, 0x49, &Wire1, "ADS1115 U2", false},
-    {FaultCode::BARO, 0x3E, &Wire, "MS5837", false},
-    {FaultCode::BARO, 0x3B, &Wire, "BMP085", false},
+    {FaultCode::BARO, 0x76, &Wire, "MS5837", false},
+    {FaultCode::BARO, 0x77, &Wire, "BMP085", false},
     {FaultCode::OLED, 0x3C, &Wire, "SSD1306 A", false},
     {FaultCode::OLED, 0x3D, &Wire, "SSD1306 B", false},
     {FaultCode::INA219, 0x40, &Wire, "INA219", false},
@@ -128,8 +135,8 @@ void probeDevices() {
     bool ms5837 = false, bmp085 = false;
     for (const DevSpec& d : g_devices) {
         if (d.code != FaultCode::BARO || !d.present) continue;
-        if (d.addr == 0x3E) ms5837 = true;
-        if (d.addr == 0x3B) bmp085 = true;
+        if (d.addr == 0x76) ms5837 = true;
+        if (d.addr == 0x77) bmp085 = true;
     }
     if (ms5837) {
         // Either the MS5837 answered at boot, or it hot-plugged later: in both cases the
@@ -285,25 +292,20 @@ void knownScan() {
         printScanLine(b.label, sensors::scanKnown(*b.wire, addrs, kDevCount, b.sda, b.scl));
 }
 
-// Baro identity by measurement — presence is not identity (decision 29), and the full sweep
-// earned this command: it found a device ACKing at 7-bit 0x77 while 0x3B stayed silent. That is
-// the signature of a BMP280-class part, not a BMP085: the datasheet's "0x77" for the BMP085 is
-// the 8-bit form of 7-bit 0x3B. Bosch CHIPID reads (pointer write + read of 0xD0, then 0x30 for
-// the BMP3xx family) are WRITES to the pointer register — bench-only, same class as 'a'/'d', and
-// the banner says so. MS5837 (0x3E) has no ID register; its confirmation is the PROM read, which
-// lands with the M3 driver.
+// Baro identity by measurement — presence is not identity (decision 29). The candidate list is
+// the datasheet 7-bit forms (Bosch DS Table 7: 1110111+R/W = 0x77; TE MS5837 DS: "Address (7
+// bits) 0x76"), plus the BMP280/BME280 strap pair, which share 0x76/0x77 (CSB selects) — so an
+// ACK at 0x76 is *not* proof of an MS5837 until the PROM read says so. Bosch CHIPID reads
+// (pointer write + read of 0xD0, then 0x30 for the BMP3xx family) are WRITES to the pointer
+// register — bench-only, same class as 'a'/'d', and the banner says so.
 void baroIdentity() {
-    static const uint8_t kBaro[] = {0x3E, 0x3B, 0x76, 0x77};
+    static const uint8_t kBaro[] = {0x76, 0x77};
     bool any = false;
     for (BusState& b : g_buses) {
         if (!busUp(b.wire)) continue;
         for (uint8_t a : kBaro) {
             if (!sensors::probeAddress(*b.wire, a).ok) continue;
             any = true;
-            if (a == 0x3E) {
-                Serial.printf("  %s @0x3E ACK — MS5837-class: no ID register; confirm by PROM read (M3)\n", b.label);
-                continue;
-            }
             uint8_t d0 = 0x00, r30 = 0x00, d1 = 0x00, ac1msb = 0x00, ac1lsb = 0x00;
             bool gotD0 = false, got30 = false, gotD1 = false, gotAc1 = false;
             auto readReg = [&](uint8_t reg, uint8_t& out, bool& ok) {
@@ -314,32 +316,32 @@ void baroIdentity() {
             };
             readReg(0xD0, d0, gotD0);
             readReg(0x30, r30, got30);
-            readReg(0xD1, d1, gotD1);           // BMP085/180 "version MSB": constant 0x43
-            readReg(0xAA, ac1msb, gotAc1);      // calibration PROM AC1 MSB: factory per-chip,
-            bool okLsb = false;                 // but sanity: genuine parts read 0x1C (AC1=7295 typ.)
-            readReg(0xAB, ac1lsb, okLsb);
-            gotAc1 = gotAc1 && okLsb;
+            readReg(0xD1, d1, gotD1);           // "version MSB": BMP085 says 0x43; the BMP180
+            bool okLsb = false;                 // datasheet has no 0xD1 at all, so 0x02 there
+            readReg(0xAA, ac1msb, gotAc1);      // is an undefined-register read, not a mismatch.
+            readReg(0xAB, ac1lsb, okLsb);       // AC1 is per-chip factory trim (0xAA..0xBF block
+            gotAc1 = gotAc1 && okLsb;           // varies chip to chip) — sanity only, never ID.
             const char* who = "?";
-            if (d0 == 0x55) who = "BMP085/BMP180 register map (CHIPID 0xD0=0x55)";
+            if (d0 == 0x55) who = "BMP085/BMP180 (CHIPID 0xD0=0x55)";
             else if (d0 == 0x58 || d0 == 0x40 || d0 == 0x41) who = "BMP280 (CHIPID 0xD0=0x58; 0x40/0x41 older revs)";
             else if (d0 == 0x60) who = "BME280 (CHIPID 0xD0=0x60)";
             else if (r30 == 0x03) who = "BMP388-class (CHIPID 0x30=0x03)";
             else if (r30 == 0x01) who = "BMP390-class (CHIPID 0x30=0x01)";
-            Serial.printf("  %s @0x%02X ACK  0xD0=%s0x%02X  0xD1=%s0x%02X(BMP180: 0x43)  "
+            else if (a == 0x76) who = "no Bosch CHIPID — MS5837-class? confirm by PROM read (M3)";
+            Serial.printf("  %s @0x%02X ACK  0xD0=%s0x%02X  0xD1=%s0x%02X(BMP085:0x43,BMP180:none)  "
                           "AC1=0x%02X%02X  0x30=%s0x%02X  -> %s\n",
                           b.label, a,
                           gotD0 ? "" : "no-read ", d0,
                           gotD1 ? "" : "no-read ", d1,
                           gotAc1 ? ac1msb : 0, gotAc1 ? ac1lsb : 0,
                           got30 ? "" : "no-read ", r30, who);
-            if (d0 == 0x55 && a != 0x3B)
-                Serial.println(F("    NOTE: a genuine BMP085/180 has 7-bit address FIXED at 0x3B "
-                                 "(datasheet 0x77 is the 8-bit form). Answering at 0x77 with the "
-                                 "0x55 chip ID is a Bosch-family clone/variant — label proves "
-                                 "nothing; trust these reads only after it converts a real pressure."));
+            if (d0 == 0x55)
+                Serial.println(F("    note: 0x77 is the datasheet 7-bit address for this family "
+                                 "(bits 1110111 + R/W). CHIPID 0x55 claims a BMP085/180 register "
+                                 "map; conversion correctness is still proved by a real reading."));
         }
     }
-    if (!any) Serial.println(F("  no baro-class address ACKed on any live bus"));
+    if (!any) Serial.println(F("  no baro-class address (0x76/0x77) ACKed on any live bus"));
     Serial.println(F("  note: the design fits baro on I2C0 only (SDA 21/SCL 22) — an ACK on I2C1 "
                      "means the module is on the ADC bus, not where the firmware will look."));
 }
@@ -658,7 +660,7 @@ void handleCommand(char c) {
             Serial.println(F("[diag] raw transaction codes — WRITES 0x00 to whatever answers, "
                              "only safe on a bare bus:"));
             // The addresses we fit; extend on the bench when bring-up needs more.
-            static const uint8_t kDiag[] = {0x3C, 0x3E, 0x3B, 0x40, 0x48, 0x49};
+            static const uint8_t kDiag[] = {0x3C, 0x76, 0x77, 0x40, 0x48, 0x49};
             for (BusState& b : g_buses)
                 if (busUp(b.wire)) sensors::probeReport(*b.wire, kDiag, sizeof(kDiag), b.sda, b.scl);
             break;

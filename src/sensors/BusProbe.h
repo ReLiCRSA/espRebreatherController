@@ -4,10 +4,14 @@
 // devkit — before them the boot report confidently printed sixteen phantom devices per bus and
 // "ALL SENSORS OK" with nothing connected.
 //
-// 1. Addresses here are 7-bit, because that is what `Wire` takes. Datasheets are inconsistent:
-//    the MS5837 is documented as "0x7C" and the BMP085 as "0x77" (8-bit write forms), so their
-//    7-bit addresses are **0x3E** and **0x3B**. The ADS1115 (0x48/0x49), SSD1306 (0x3C/0x3D) and
-//    INA219 (0x40) are already 7-bit in their datasheets. Probing 0x7C finds nothing forever.
+// 1. Addresses here are 7-bit, because that is what `Wire` takes. Datasheets are inconsistent,
+//    and address arithmetic on a quoted number is banned — corrected 2026-11-20 against the
+//    datasheets themselves after "halving" produced two phantom addresses (0x3E/0x3B) that no
+//    part ever answered at. Bosch BMP085/180 DS Table 7: address bits 1110111 + R/W = **0x77**
+//    (bus bytes 0xEE/0xEF). TE MS5837 DS: "Address (7 bits) **0x76** (1110110 b)"; the "0x7C"
+//    that circulates in driver code is its 8-bit write byte. The ADS1115 (0x48/0x49), SSD1306
+//    (0x3C/0x3D) and INA219 (0x40) are already 7-bit in their datasheets. Take the 7-bit form
+//    the datasheet states, and confirm with a bus sweep — never divide a number in half.
 //
 // 2. A zero-length write is not a presence test, and writing a byte to probe is destructive.
 //    See probeAddress() for the four transaction shapes and what each one actually returns.
