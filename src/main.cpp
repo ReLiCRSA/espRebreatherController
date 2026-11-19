@@ -285,6 +285,65 @@ void knownScan() {
         printScanLine(b.label, sensors::scanKnown(*b.wire, addrs, kDevCount, b.sda, b.scl));
 }
 
+// Baro identity by measurement — presence is not identity (decision 29), and the full sweep
+// earned this command: it found a device ACKing at 7-bit 0x77 while 0x3B stayed silent. That is
+// the signature of a BMP280-class part, not a BMP085: the datasheet's "0x77" for the BMP085 is
+// the 8-bit form of 7-bit 0x3B. Bosch CHIPID reads (pointer write + read of 0xD0, then 0x30 for
+// the BMP3xx family) are WRITES to the pointer register — bench-only, same class as 'a'/'d', and
+// the banner says so. MS5837 (0x3E) has no ID register; its confirmation is the PROM read, which
+// lands with the M3 driver.
+void baroIdentity() {
+    static const uint8_t kBaro[] = {0x3E, 0x3B, 0x76, 0x77};
+    bool any = false;
+    for (BusState& b : g_buses) {
+        if (!busUp(b.wire)) continue;
+        for (uint8_t a : kBaro) {
+            if (!sensors::probeAddress(*b.wire, a).ok) continue;
+            any = true;
+            if (a == 0x3E) {
+                Serial.printf("  %s @0x3E ACK — MS5837-class: no ID register; confirm by PROM read (M3)\n", b.label);
+                continue;
+            }
+            uint8_t d0 = 0x00, r30 = 0x00, d1 = 0x00, ac1msb = 0x00, ac1lsb = 0x00;
+            bool gotD0 = false, got30 = false, gotD1 = false, gotAc1 = false;
+            auto readReg = [&](uint8_t reg, uint8_t& out, bool& ok) {
+                b.wire->beginTransmission(a);
+                b.wire->write(reg);
+                ok = b.wire->endTransmission(false) == 0 && b.wire->requestFrom(a, (uint8_t)1) == 1;
+                if (ok) out = b.wire->read();
+            };
+            readReg(0xD0, d0, gotD0);
+            readReg(0x30, r30, got30);
+            readReg(0xD1, d1, gotD1);           // BMP085/180 "version MSB": constant 0x43
+            readReg(0xAA, ac1msb, gotAc1);      // calibration PROM AC1 MSB: factory per-chip,
+            bool okLsb = false;                 // but sanity: genuine parts read 0x1C (AC1=7295 typ.)
+            readReg(0xAB, ac1lsb, okLsb);
+            gotAc1 = gotAc1 && okLsb;
+            const char* who = "?";
+            if (d0 == 0x55) who = "BMP085/BMP180 register map (CHIPID 0xD0=0x55)";
+            else if (d0 == 0x58 || d0 == 0x40 || d0 == 0x41) who = "BMP280 (CHIPID 0xD0=0x58; 0x40/0x41 older revs)";
+            else if (d0 == 0x60) who = "BME280 (CHIPID 0xD0=0x60)";
+            else if (r30 == 0x03) who = "BMP388-class (CHIPID 0x30=0x03)";
+            else if (r30 == 0x01) who = "BMP390-class (CHIPID 0x30=0x01)";
+            Serial.printf("  %s @0x%02X ACK  0xD0=%s0x%02X  0xD1=%s0x%02X(BMP180: 0x43)  "
+                          "AC1=0x%02X%02X  0x30=%s0x%02X  -> %s\n",
+                          b.label, a,
+                          gotD0 ? "" : "no-read ", d0,
+                          gotD1 ? "" : "no-read ", d1,
+                          gotAc1 ? ac1msb : 0, gotAc1 ? ac1lsb : 0,
+                          got30 ? "" : "no-read ", r30, who);
+            if (d0 == 0x55 && a != 0x3B)
+                Serial.println(F("    NOTE: a genuine BMP085/180 has 7-bit address FIXED at 0x3B "
+                                 "(datasheet 0x77 is the 8-bit form). Answering at 0x77 with the "
+                                 "0x55 chip ID is a Bosch-family clone/variant — label proves "
+                                 "nothing; trust these reads only after it converts a real pressure."));
+        }
+    }
+    if (!any) Serial.println(F("  no baro-class address ACKed on any live bus"));
+    Serial.println(F("  note: the design fits baro on I2C0 only (SDA 21/SCL 22) — an ACK on I2C1 "
+                     "means the module is on the ADC bus, not where the firmware will look."));
+}
+
 void printBootReport() {
     char line[96];
     g_faults.summaryLine(line, sizeof(line));
@@ -629,6 +688,11 @@ void handleCommand(char c) {
                              "nonsense — the rates and windows are the point."));
             for (sensors::AdcPairWalker* w : g_walkers) w->report(Serial, millis());
             break;
+        case 'b':
+            Serial.println(F("[baro] identity by CHIPID reads (writes the Bosch pointer register — "
+                             "bench only, same class as 'a'/'d'):"));
+            baroIdentity();
+            break;
         case 'g':
             gpioMapReport();
             break;
@@ -640,7 +704,7 @@ void handleCommand(char c) {
             Serial.println(F("bench commands: s=full bus scan  p=probe table + report  "
                              "r=raw probe codes (destructive, bench only)  c=bus recovery  "
                              "a=ADC self-test  d=ADC rate characterisation  t=pair-walker rate + "
-                             "interlock window  g=pad map + pad test  "
+                             "interlock window  b=baro identity (Bosch CHIPID)  g=pad map + pad test  "
                              "v=headless sim profile (SIM-stamped, touches no hardware)"));
             break;
     }

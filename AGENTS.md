@@ -121,6 +121,15 @@ the Adafruit product page and the Adafruit 4-Channel ADC Breakouts guide (2026-1
   fitted, arm is allowed but a permanent `DEPTH RANGE 9m` banner shows and all depth-dependent
   logic clamps at 9 m. Never extrapolate.
 - Boot probe order: 0x3E then 0x3B. Selected driver reported in `/api/health` and on OLED boot line.
+- **Measured on the bench (2026-11-20, bench `b`): the fitted "BMP085" module is not a BMP085.**
+  It ACKs at 7-bit **0x77** — a genuine Bosch BMP085/180 has its 7-bit address **fixed at 0x3B**, and
+  is silent there — answers CHIPID `0xD0=0x55` (the BMP180 ID), but the fixed version byte answers
+  **`0xD1=0x02` where a genuine part reads `0x43`**, and the factory calibration ROM reads
+  **AC1=0x219C (8604) against the BMP180 spec value 7295**. A Bosch-family clone: same defect class
+  as risk 16, now on the depth sensor. It has also been seen on **I2C1** (the ADC bus) across bench
+  captures — the design fits baro on I2C0. It is not trusted for depth and stays a bench object;
+  fallback procurement is open item 17. `b` re-measures the fingerprint (it writes the Bosch pointer
+  register — bench only, same class as `a`/`d`).
 - Depth = `(Pamb - Psurf) * k`; `Psurf` is **learned at boot** (only relative accuracy matters,
   +/-2 mbar ~ 2 cm, not the +/-200 mbar absolute spec). Salinity configurable (fresh 1.000,
   salt 1.025). Learned Psurf also gates air calibration.
@@ -694,7 +703,9 @@ what the coil/ADC interlock window and the per-cell sample rate are derived from
 duty and error counters, counted from conversions actually completed (decision 34's numbers come
 from here),
 and `g` pad map + pad test — who owns each GPIO according to the core (periman), plus measured
-pull-up/pull-down and output behaviour on pads with nothing wired. `g` is what settled §3, and `v`
+pull-up/pull-down and output behaviour on pads with nothing wired,
+and `b` baro identity — Bosch-family CHIPID/version/cal-ROM reads at the candidate addresses, which
+is how the fitted "BMP085" was measured to be a clone (§2) rather than inferred from its label. `g` is what settled §3, and `v`
 runs the fixed headless sim profile (see §11): it prints per-minute SIM-stamped lines plus a
 measured **worst-tick cost** line — per-tick compute cost is derived from the target, never assumed
 from the host (risk 19).
@@ -1008,6 +1019,7 @@ Re-open only with the user's explicit agreement.
 | 14 | **DRDY is wired to GPIO 23 but the line has only ever been read pulled-up and idle** | The driver currently polls the OS bit over I2C (348 us/poll measured). DRDY would cut that to an interrupt and make the coil/ADC interlock exact rather than polled. Needs the module's DRDY actually connected and the polarity/behavior measured (open-drain, needs a pull-up) before the scheduler can depend on it. The Adafruit #1085 (decision 35) **breaks ALRT out on its header**, so once those boards are fitted this is one jumper + one pull-up per converter — not a board-modification project. Still must be measured before the scheduler trusts it, and settled against the pin budget (item 15). |
 | 15 | **Display panel vs the pin budget** (new, from closing item 12): a SPI panel needs four pads (SCK/MOSI/DC/CS) and after the current map **only GPIO 17 is spare and output-capable** | The core's own SPI defaults (18/19/23) collide with I2C1 and ADS_U1_DRDY, so a panel cannot simply take `SPI.begin()` defaults. Options, none free: free the two DRDY pads by polling the OS bit instead (costs 348 us/poll and an exact interlock, item 14), take strapping pins against the §3 policy, or keep the panel on I2C and accept the frame-time cost (§12 says a >128x64 panel must not go on I2C). Must be argued with item 6 when the panel is chosen — not during bring-up at the water. |
 | 16 | **The ADS1115 module stopped answering on I2C1** (`SDA held low before init`, probes returning **err 5 = timeout**, nine clocks + port re-init did not free it) | **CLOSED 2026-11-19 — not a fault.** The user confirms the dropouts were **their own intervention on the bench** (the module being unplugged/re-fitted), not a flaky connection. Nothing to fix and no maintenance action. What the episode is kept for is the diagnostic it produced: `err 5` (bus being held) vs `err 2` (address unanswered) are different hardware stories, and **a converter that has lost its supply clamps SDA/SCL through its protection diodes** — that is exactly what a disconnected or unpowered module looks like, and exactly what a converter failing mid-dive will look like in the log. Securing jumpers for the dive build stays good practice (§20 item 9, enclosure/connector work), but it is not a corrective action for anything seen so far. |
+| 17 | **The fitted "BMP085" fallback module is a Bosch-family clone** (ACKs 0x77, silent 0x3B; `0xD0=0x55`, `0xD1=0x02` not 0x43, AC1=8604 not 7295) — measured 2026-11-20 by bench `b` | **OPEN.** It is not a BMP085 and is not trusted for depth: the address, the version byte and the calibration ROM all disagree with the datasheet, so its conversion behaviour is unknown. The MS5837 primary path (decision 7) is unaffected. Outstanding question, not an action: source a genuine BMP085 (or BMP280, with its own driver) for the fallback, or drop the fallback and carry only the MS5837 plus the second independent computer. Until decided, the boot probe stays 0x3E/0x3B — a clone sitting at 0x77 is deliberately invisible to the design, and `b` names it truthfully. |
 
 ---
 
@@ -1327,3 +1339,21 @@ Re-open only with the user's explicit agreement.
   §6, §7 step 1 with fit details, §8, §9). **Docs-only change: no code touched, native suite
   unchanged at 94 green.** Outstanding action stays: order the two boards, close `A0` on U2, run
   `d`/`a`/`t`.
+
+- 2026-11-20 (baro bring-up start): **the bench's "BMP085" is a clone — found by measurement, not
+  inference.** Compiled, flashed and read the boot report on request (checking for the BMP085):
+  boot stays honest — `I2C0: [0x3C]`, `ERROR BARO x3 no MS5837/BMP085`, `[arm] REFUSED`. The full
+  sweep (`s`) found a third device, **0x77 — on I2C1**, and it moved between I2C0 and I2C1 across
+  captures (bench intervention; §20 item 16's lesson applied — stated as a fact, no fault inferred).
+  A genuine BMP085 has its 7-bit address **fixed at 0x3B** (datasheet "0x77" is the 8-bit form), so
+  0x77 could not be one — and "presence is not identity" demanded the register read, not the
+  address guess. New bench command **`b`** (baro identity: Bosch CHIPID 0xD0, version 0xD1, cal-ROM
+  AC1 at candidate addresses; writes the pointer register, so bench-only, documented in the banner):
+  the module answers `0xD0=0x55` (BMP180's chip ID) but **`0xD1=0x02` where a genuine part reads the
+  fixed `0x43`**, and **AC1=8604 against the BMP180 spec 7295**. Address, version byte and factory
+  ROM all disagree with the datasheet: a Bosch-family clone, risk 16's defect class arrived at the
+  depth sensor. Recorded in §2 and as **open item 17** (source a genuine BMP085/BMP280 for the
+  fallback, or drop the fallback; the clone is deliberately invisible to the 0x3E/0x3B boot probe and
+  not trusted for depth). No change to the boot probe table, the fault set, or any dive-path code.
+  App 490,081 B flash (31.2%), 63,864 B RAM (19.5%); flashed and verified on the board. Native
+  suite unchanged at 94 green.

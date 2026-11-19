@@ -16,7 +16,7 @@ the ADC register map, the GPIO pin map, and now the **source interfaces** in `Se
 regression-anchored: **94 native cases green** across seven suites. `src/` boots on the board:
 safe-state pins first, bounded I2C presence probing, active converter checks, honest boot fault
 report, arming refusal, hot re-probe every 5 s, two alternating-mux pair walkers running in `loop()`,
-serial bench commands (`s p r c a d t g v`).
+serial bench commands (`s p r c a d t b g v`).
 **M0 and M1 are DONE.** Bench `v` runs the fixed 26-min profile **headless on the board**, closed
 loop through the real voter/gas/ZHL stack, mole-balanced against hand calculations (136 pulses /
 20.40 amb L, 2 pulses/min at the 30 m bottom — risk 20), SIM-stamped, ~30 s wall, worst tick
@@ -25,7 +25,9 @@ item, the **alternating-mux scheduler** (`AdcPairWalker` in `src/sensors/Ads1115
 and measured (bench `t`): **7.2 SPS per cell achieved** on the fitted clones, interlock busy duty
 **95-96%** — decision 34: M5's pulse scheduler must carve explicit conversion-free slots, the
 incidental gap is only ~2-3 ms. Baro/INA219 drivers (M3) come next. **Two ADS1115 modules
-(0x48 + 0x49) and one SSD1306 (0x3C) are wired; the baro and the INA219 are not.**
+(0x48 + 0x49) and one SSD1306 (0x3C) are wired; the baro and the INA219 are not — and the
+"BMP085" module on the bench turned out to be a Bosch-family clone answering at 0x77 (§5g), so
+the M3 fallback needs a real part before it needs a driver (open item 17).**
 
 Two decisions were taken with the user on 2026-11-19 and are now binding (AGENTS.md §18): the ppO2
 converters **shall be genuine TI ADS1115s** (decision 31 — the fitted clone stays on the bench for
@@ -350,13 +352,44 @@ reads 65,498 us. The counters are cumulative since `begin()` and include traffic
 commands `a`/`d` (they write the config register mid-walk); the report says so rather than
 pretending the run was clean.
 
+### 5g. The fitted "BMP085" is a Bosch-family clone (AGENTS.md §2, open item 17)
+
+Measured 2026-11-20 with the new bench command **`b`** — `b` is not a presence probe, it *reads*
+Bosch registers (CHIPID 0xD0, version 0xD1, cal-ROM AC1) at the candidate addresses, so it writes
+the pointer register: bench-only, same class as `a`/`d`. Measured answers, verbatim:
+
+```
+[baro] identity by CHIPID reads (writes the Bosch pointer register — bench only, same class as 'a'/'d'):
+  I2C1 @0x77 ACK  0xD0=0x55  0xD1=0x02(BMP180: 0x43)  AC1=0x219C  0x30=0x00  -> BMP085/BMP180 register map (CHIPID 0xD0=0x55)
+```
+
+What that means:
+- It **ACKs at 7-bit 0x77 and is silent at 0x3B**. A genuine BMP085/180 has its 7-bit address
+  **fixed at 0x3B** — the datasheet's "0x77" is the 8-bit write form. So 0x77 cannot be a genuine
+  one, and the boot probe table correctly reports `ERROR BARO … no MS5837/BMP085`.
+- `0xD0=0x55` is the BMP180 chip ID — but **`0xD1` answers 0x02 where a genuine part answers the
+  fixed 0x43**, and **AC1 reads 0x219C (8604) against the BMP180 spec value 7295**. Three
+  independent disagreements with the datasheet: address, version byte, factory ROM.
+- The boot sweep put it on **I2C1** — the ADC bus. The design fits baro on **I2C0** (SDA 21/SCL 22),
+  so it is invisible to the fitted-address probe on purpose.
+- **Do not write a `Bmp085` driver against this module and believe it.** Risk 16's defect class has
+  arrived at the depth sensor: a die that disagrees with its markings has no characterised
+  conversion behaviour, and depth is the decompression input. Open item 17 is the procurement
+  question (genuine BMP085, or BMP280 with its own driver, or no fallback at all).
+- **A clone at 0x77 was also seen moving between I2C0 and I2C1 across captures** — bench
+  intervention, not a flaky bus (§20 item 16's lesson: name it as intervention, do not assign a
+  defect).
+
 ## 6. What is on the bench right now
 
 - ESP32 Doit devkit V3 over USB. **Wired: two ADS1115 modules on I2C1 — 0x48 (ADDR->GND) and 0x49
   (ADDR->VDD), both VDD 3.3 / SDA 18 / SCL 19 — and one SSD1306 on I2C0 at 0x3C.** These two ADC
   modules are the clones of §5b: fitted for timing work only, to be replaced by 2x Adafruit #1085
   (decision 35, §7 step 1). Not wired: the
-  baro, the INA219, the solenoid, all buttons, buzzer, motor, watchdog. Cell inputs floating, DRDY
+  baro **on its design bus**, the INA219, the solenoid, all buttons, buzzer, motor, watchdog. What
+  IS fitted on **I2C1** (wrong bus for it) is the "BMP085" clone of §5g — it ACKs at 0x77 only, so
+  the boot report still shows `ERROR BARO … no MS5837/BMP085`, which is correct behaviour, not a
+  bug. Cell inputs floating, DRDY
   lines not connected (open item 14).
 - Firmware flashed = current `src/` at HEAD of this session. Expected boot output with exactly the
   above fitted, verbatim:
@@ -379,7 +412,7 @@ CCR dive computer — boot (never fatal), entering BENCH
 [arm] REFUSED — see faults above
 [adc] alternating-mux pair walkers running — bench 't' prints the achieved per-cell rate and the coil/ADC interlock window, measured
 [o2] solenoid disabled — GPIO 26 will not be driven
-bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (destructive, bench only)  c=bus recovery  a=ADC self-test  d=ADC rate characterisation  t=pair-walker rate + interlock window  g=pad map + pad test  v=headless sim profile (SIM-stamped, touches no hardware)
+bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (destructive, bench only)  c=bus recovery  a=ADC self-test  d=ADC rate characterisation  t=pair-walker rate + interlock window  b=baro identity (Bosch CHIPID)  g=pad map + pad test  v=headless sim profile (SIM-stamped, touches no hardware)
 ```
 
   (The conversion microseconds vary slightly boot to boot — 61.8-62.1 ms so far; it is the ~97%
@@ -459,7 +492,10 @@ measured — 7.2 SPS/cell achieved, sized from the boot-measured period, interlo
 2. **M3 — `src/sensors` drivers**: `Ms5837` @0x3E, `Bmp085` @0x3B (with the 9 m clamp banner),
    `Ina219` @0x40, `Depth` with learned `Psurf` — they implement the same `Barometer` interface
    `SimBaro` already does, so the sim path is the test double. M3 gate: fallback verified by
-   physically removing the MS5837. Wire the baro (and the INA219) on I2C0; the cell bias networks
+   physically removing the MS5837. **But see §5g: the fitted "BMP085" is a clone answering at 0x77
+   with a wrong version byte and cal ROM — do not develop the fallback driver against it; settle
+   open item 17 (genuine BMP085, BMP280 + driver, or no fallback) first.** The MS5837 primary path
+   is unaffected. Wire the baro (and the INA219) on I2C0; the cell bias networks
    (1 MOhm + 10 ohm + RC, risk 6) stay a separate wiring step before any cell reading is believed.
 3. **Before M5, settle the interlock design against decision 34**: the incidental inter-conversion
    gap is ~2-3 ms (§5f), so the pulse scheduler must carve explicit conversion-free slots into the
@@ -474,13 +510,13 @@ mistake).
 
 | File | What it pins down |
 |---|---|
-| `AGENTS.md` | binding design record; §16 milestone status, §18 decisions 1–35, §19 risks 1–20, §20 open items 1–16 |
+| `AGENTS.md` | binding design record; §16 milestone status, §18 decisions 1–35, §19 risks 1–20, §20 open items 1–17 |
 | `HANDOFF.md` (this file) | machine + bench state, measured I2C and ADC semantics, resume point |
 | `lib/core/src/AdcRegs.h` | **the ADS1115 register map, PGA/RATE tables, LSB and mV scaling, and the measured bench-module rate table.** Pure C++ so it can be asserted; it was wrong twice while it lived only in `src/` |
 | `src/sensors/Ads1115Bus.{h,cpp}` | register driver: single-shot start (MODE written explicitly), `checkPart()` identity-by-timing (stores `measuredConvUs()` for the walker and the interlock), `measureAdcRates()`, `selfTest()`. The accepted conversion window (20–150 ms) and why it is wider than the datasheet figure. **`AdcPairWalker`**: the non-blocking alternating-mux scheduler (M1), sized from the measured period, carries the coil/ADC interlock window (`integrating()`, `coilSafeAfterUs()`), and reports achieved rate/counters via bench `t` — see §5f for its measured figures |
 | `src/sensors/BusProbe.cpp` | the measured four-shape probe table and the periman trap, in comments; the only probe form that is truthful and non-destructive |
 | `src/sensors/BusProbe.h` | probe contract, 7-bit address warning, "port must be down" rule for line checks |
-| `src/main.cpp` | boot order (solenoid safe-state first), bounded probing, `checkAdcs()` (presence is not identity), two-address device selection for baro and OLED, bus dead-vs-absent reporting, 5 s hot re-probe and bus retry, bench command REPL (`s p r c a d t g v`), `gpioMapReport()`, `benchRunSim()` (static `SimRunner`, per-tick cost measurement, `SIM SLOW` line, history stride 16); walker globals `g_walk1`/`g_walk2` (begin after `checkAdcs()`, re-begin on converter hot-plug), and `loop()`'s heartbeat as **service windows** — walkers + REPL run inside the HIGH-20/LOW-30 shape so the converters pace the sampling, not the loop delay |
+| `src/main.cpp` | boot order (solenoid safe-state first), bounded probing, `checkAdcs()` (presence is not identity), two-address device selection for baro and OLED, bus dead-vs-absent reporting, 5 s hot re-probe and bus retry, bench command REPL (`s p r c a d t b g v` — `b`/`baroIdentity()` reads Bosch CHIPID/version/cal-ROM: the measured baro fingerprint of §5g), `gpioMapReport()`, `benchRunSim()` (static `SimRunner`, per-tick cost measurement, `SIM SLOW` line, history stride 16); walker globals `g_walk1`/`g_walk2` (begin after `checkAdcs()`, re-begin on converter hot-plug), and `loop()`'s heartbeat as **service windows** — walkers + REPL run inside the HIGH-20/LOW-30 shape so the converters pace the sampling, not the loop delay |
 | `lib/core/src/FaultCode.h` | the fault enum plus `defaultSeverity`/`blocksArming`/`faultName`. `ADC_PART_WRONG`/`ADC_CONV_BAD` block arming; `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` deliberately do not |
 | `lib/core/src/BootReport.h` | `blocksArming()` refuses on **any active FATAL**, not only on listed codes |
 | `lib/core/src/PinMap.h` | **the GPIO capability table (one word per pad, 0..39) and the role assignment.** Pure C++, asserted natively — it was a paragraph in a header before and was wrong twice. Carries `noSuchPad` (24, 28–31: no such pad on the ESP32-D0WD-V3 die) and `kDieOnly` (20, 37, 38: die pads WROOM-32 does not bond out) as separate claims, `unusableReason()`, and `SPARE_OUT = 17` |
@@ -516,6 +552,11 @@ mistake).
   I2C1 and `ADS_U1_DRDY`. Argue this with the panel choice (item 6) before buying anything — the
   options are freeing the DRDY pads (item 14's other side), taking a strapping pin against the §3
   policy, or keeping the panel on I2C and accepting the frame-time cost.
+- **Open item 17 is open and it blocks the M3 fallback driver** (§5g): the fitted "BMP085" answers
+  at 0x77 with `0xD0=0x55` but `0xD1=0x02` (genuine: 0x43) and AC1=8604 (BMP180 spec: 7295) — a
+  Bosch-family clone with no characterised conversion behaviour. Writing `Bmp085.cpp` against it
+  would produce a driver that talks to a part nobody has measured, on the decompression input.
+  Settle first: genuine BMP085, or BMP280 + its own driver, or no fallback. `Ms5837` can proceed.
 - **Open item 16 is closed** (§6): the `err 5` / `SDA held low` boot was the module being unplugged by
   hand, not a fault. No action. The `2`-vs-`5` reading is still worth knowing.
 - **Open item 12 is closed** (decision 32): 33 = Page button, motor on 16, `test/test_pins/` asserts
