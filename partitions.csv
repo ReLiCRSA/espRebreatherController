@@ -1,0 +1,10 @@
+# ESP32 classic partition table, 4 MB flash (AGENTS.md 15).
+# Two 1.5 MB app slots so a failed update can fall back, plus 768 KB of LittleFS for web
+# assets, display templates, the dive ring and the fault ring. ESP-IDF requires app
+# partitions to start on a 64 KB boundary, which is what pushed the layout to 0x20000.
+# Name,   Type, SubType,  Offset,   Size,    Flags
+nvs,      data, nvs,      0x9000,   0x6000,
+otadata,  data, ota,      0xf000,   0x2000,
+app0,     app,  ota_0,    0x20000,  0x180000,
+app1,     app,  ota_1,    0x1A0000, 0x180000,
+fs,       data, littlefs, 0x320000, 0xC0000,

@@ -1,0 +1,6 @@
+{
+  "name": "core",
+  "version": "0.1.0",
+  "description": "Platform-independent dive math: voting, gas limits, CNS/OTU, ZHL-16C. No Arduino headers (AGENTS.md 17).",
+  "dependencies": {}
+}
