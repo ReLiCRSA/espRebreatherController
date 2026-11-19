@@ -422,15 +422,21 @@ faults are written into dive-log headers too.
 - **Boot lands in `BENCH` by default.** Works fully with zero sensors attached. Bench mode: solenoid
   GPIO inert unless explicitly commanded by a bounded bench test.
 - **Simulate at the ADC/sensor layer, not the answer layer.** `SimBaro` and `SimCells` implement the
-  same `Barometer` / `CellArray` source interfaces as the real drivers, so ADS1115 mux scheduling,
-  cell offset/slope calibration, voting, bias sanity checks, RNS depth smoothing, surface-pressure
-  learning and diluent-flush verification all stay in the loop. A simulator that injects ppO2 and
-  depth directly would test the deco maths and nothing else.
+  same `Barometer` / `CellSource` source interfaces as the real drivers (declared once in
+  `lib/core/src/SensorIf.h`, so the sim and the real drivers are interchangeable by construction), so
+  ADS1115 mux scheduling, cell offset/slope calibration, voting, bias sanity checks, RNS depth
+  smoothing, surface-pressure learning and diluent-flush verification all stay in the loop. A
+  simulator that injects ppO2 and depth directly would test the deco maths and nothing else.
+  **As built (2026-11-19):** `lib/sim/` = `SimBaro`, `SimCells` (the cell fault injector lives inside
+  it, because a fault has to be injected before the mV come out), `LoopModel`, `ValveModel`,
+  `CcrControlLaw`, `SimRunner`. Bench `v` runs it headless on the board through the real
+  voter/gas/ZHL stack. Not yet built: the web Simulator panel and `POST /api/sim/verify` assertions,
+  which come with M6.
 - **Closed loop model, not a scripted ppO2:** the sim holds `metabolic O2 rate` (configurable,
-  ~1.2 L/min, workload-dependent) and `loop volume` (~8 L) and integrates ppO2 from **the
-  firmware's own commanded pulses**. If pulse widths are too short, ppO2 sags and the low-ppO2
-  alarm fires; if the deadband is wrong, you see the oscillation. This is how a bad control law is
-  caught before water.
+  ~1.2 **surface** L/min — a molar draw, depth-independent; see risk 20 — and workload-dependent)
+  and `loop volume` (~8 L) and integrates ppO2 from **the firmware's own commanded pulses**. If
+  pulse widths are too short, ppO2 sags and the low-ppO2 alarm fires; if the deadband is wrong,
+  you see the oscillation. This is how a bad control law is caught before water.
 - **Fault injectors:** per cell — stuck value, slow drift, dead cell (0 mV), step change, added
   noise, t90 lag, **current-limited cell** (correct in air, progressively low above 1.0 bar; the
   classic failure air calibration cannot detect, and it only appears at depth). Solenoid — no click,
@@ -566,7 +572,8 @@ platformio.ini  partitions.csv  README.md  AGENTS.md
 lib/            host-buildable pure C++, no Arduino headers — this is what `pio test -e native`
   core/src/     covers. (Moved out of src/core deliberately: src/ can never compile natively.)
                 FaultCode  BootReport  GasMix  GasModel  Voting  O2Toxicity  Zhl16c  AdcRegs  PinMap
-  sim/          SimBaro  SimCells  LoopModel  FaultInjector  ProfileRunner  (to do)
+  sim/          SimBaro  SimCells(+fault injectors)  LoopModel  ValveModel  CcrControlLaw  SimRunner
+                built and running headless on-target (bench `v`); web sim panel + /api/sim/verify await M6
 src/            ESP32-only (Arduino/ESP-IDF headers allowed here)
   main.cpp                     setup(), boot probe, hot re-probe loop, bench command REPL
   config/  Pins.h (alias of core/PinMap.h)  Features.h  RuntimeConfig.{h,cpp}
@@ -653,7 +660,10 @@ report, `r` raw probe codes (needs `BENCH_RAW_PROBE=1`), `c` 9-clock recovery + 
 `d` ADS1115 rate characterisation — measured conversion period for all eight RATE fields, which is
 what the coil/ADC interlock window and the per-cell sample rate are derived from, not the datasheet,
 and `g` pad map + pad test — who owns each GPIO according to the core (periman), plus measured
-pull-up/pull-down and output behaviour on pads with nothing wired. `g` is what settled §3.
+pull-up/pull-down and output behaviour on pads with nothing wired. `g` is what settled §3, and `v`
+runs the fixed headless sim profile (see §11): it prints per-minute SIM-stamped lines plus a
+measured **worst-tick cost** line — per-tick compute cost is derived from the target, never assumed
+from the host (risk 19).
 Probe error codes mean different hardware stories and are worth reading: **2** = NACK on the address
 (nothing there), **5** = timeout (the bus is being held — measured when an ADS1115 module lost its
 supply and clamped SDA through its protection diodes; nine clocks did not free it).
@@ -683,18 +693,21 @@ bench procedure.
 
 ## 16. Test strategy
 
-**Current state (2026-11-19): `pio test -e native` is green — 80 cases across six suites
-(`test_voting`, `test_gas`, `test_zhl`, `test_boot`, `test_adc`, `test_pins`); `pio run -e esp32`
-links **and is flashed and running on the devkit** with one ADS1115 module and an SSD1306 actually
-attached. The positive-ACK caveat that M0 left open is closed: `I2C1: 1 device(s) [0x48]`,
+**Current state (2026-11-19): `pio test -e native` is green — 94 cases across seven suites
+(`test_voting`, `test_gas`, `test_zhl`, `test_boot`, `test_adc`, `test_pins`, `test_sim`);
+`pio run -e esp32` links **and is flashed and running on the devkit** with two ADS1115 modules and
+an SSD1306 actually attached (both converters measure as clones — risk 16, decision 31). The
+positive-ACK caveat that M0 left open is closed: `I2C1: 2 device(s) [0x48 0x49]`,
 `I2C0: 1 device(s) [0x3C]`, and the corresponding faults clear while the missing ones stay raised.
 Reads and writes on the attached converter are verified, not assumed: `a` write-verifies a register
 and restores it, `d` measures the conversion period field by field — which is how the register-map
 faults and the non-standard rate table in section 2 were found — and `g` measures who owns each GPIO
-and what its pads can do, which is how the pin map in section 3 was settled.**
+and what its pads can do, which is how the pin map in section 3 was settled. The simulator runs
+**headless on the board** (bench `v`), and its on-target numbers are mole-balanced against hand
+calculations (risk 20).**
 Layout note: PlatformIO only collects suites from `test/test_<name>/` folders (a bare `test/native/`
 group folder collects nothing), so the suites are `test/test_voting/`, `test/test_gas/`,
-`test/test_zhl/`, `test/test_boot/`, `test/test_adc/`, `test/test_pins/`. `test_build_src = no` in the
+`test/test_zhl/`, `test/test_boot/`, `test/test_adc/`, `test/test_pins/`, `test/test_sim/`. `test_build_src = no` in the
 `native` env: `src/` is ESP32-only by design and is not built on the host. `lib/core` is built
 natively and linked into every suite.
 
@@ -731,6 +744,17 @@ die-pads-not-bonded-out set (20, 37, 38) and the flash set (6–11) each asserte
 pad number 0..39 has a decided capability word; the ADC/bus wiring matches the §3 table; and the
 spare output budget is asserted to be exactly one pad (17), so freeing a pin forces the §3 budget to
 be re-derived on purpose.
+`test_sim`: loop physics against hand calculations — **depth-independent** metabolic sag (0.152
+bar/min at both 10 m and 30 m, the risk-20 regression) with the zero-mole floor at the hand-computed
+276 s; closed-loop setpoint hold asserted in **pulse quanta** (~14 pulses over a 7-min hold at 30 m
+against the hand-computed 2.15 amb L demand); volt-seconds seat criterion (low battery clicks but
+delivers nothing); width compensation; the three click-fault signatures distinguished in the right
+dimension; a no-click fault sagging ppO2 **and** flagging electrically; current-limited / stuck /
+dead / absent cells reaching the voter as millivolts; deterministic noise; diluent-flush agreement
+from the other side (fraction -> mV -> cal -> vote) including the stuck-cell case that makes it
+fail; source stamping; bit-identical repeat runs; and the assertion harness itself — ring overwrite
+with `histDropped` accounting, strides, and `NO DATA`/`unevaluated` so an empty window can never
+"pass" an assertion.
 
 - `pio test -e native` covers `lib/core/` **and** `lib/sim/` — the same physics models run on the
   host with no hardware. (They live under `lib/`, not `src/core`, so they build natively; `src/` is
@@ -750,7 +774,7 @@ be re-derived on purpose.
 | # | Deliverable | Gate | Status (2026-11-19) |
 |---|---|---|---|
 | M0 | installer, build, flash, I2C scan, boot report | `pio run -t upload` works on this Mac | **DONE** — flashed and verified on the devkit (CP2102, ESP32-D0WD-V3): "Hash of data verified", clean boot banner, boot report correct on an empty bench, `[arm] REFUSED`. Section 15 holds the evidence. |
-| M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **boot + bench half verified on hardware, and now verified against a fitted converter**: boots clean, reports every miss, hot re-probe + bus retry + serial bench commands (`s p r c a d g`) work; the ADS1115 register layer is written, its reads/writes are write-verified on hardware, and its part identity and rate table are measured, not assumed (9 native cases in `test_adc`, 14 in `test_boot`). Still open at M1: the alternating-mux scheduler at the **measured** per-cell rate (8 SPS on the fitted clone, not the designed 16 — needs cell 2 on AIN2/3), and `lib/sim`. Open item 13 is decided (decision 31: genuine TI parts), so the sample-rate design waits on parts, not on a decision. |
+| M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **boot/bench half and the simulator half are now verified on hardware.** `lib/sim` is written (SimBaro, SimCells, LoopModel, ValveModel, CcrControlLaw, SimRunner) and runs the fixed 26-min profile **headless on the board** (bench `v`): closed-loop ppO2 through the real voter/gas/ZHL stack at hand-computed pulse demand (2/min at 30 m, mole balance closed), setpoint crossover, diluent-flush check PASS, deco ceiling/TTS appearing on schedule, everything SIM-stamped, ~30 s wall, worst tick 41.5 ms measured on-target. 14 new cases in `test/test_sim/` — **94 native cases green** in seven suites. Still open at M1: the alternating-mux scheduler at the **measured** per-cell rate (8 SPS on the fitted clone, not the designed 16 — needs cell 2 on AIN2/3). Open item 13 is decided (decision 31: genuine TI parts) and **both fitted modules now measure as clones**, so the sample-rate design waits on two parts, not on a decision. |
 | M2 | air cal + voting + diluent-flush check + alarms | native voting tests pass | voting + diluent-flush + cal sigma gate done natively; on-device wiring not started |
 | M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds 0x3E/0x3B (datasheet 8-bit 0x7C/0x77 corrected) and raises `BARO_RANGE_9M` when only the BMP085 answers; drivers not written |
 | M4 | ZHL-16C 3-gas + GF + ICD + CNS + MOD/END/density | validated natively **before** hardware depends on it | **engine complete and regression-anchored natively** (47 cases); *not* validated against a trusted computer yet — risk 13 |
@@ -890,6 +914,38 @@ Re-open only with the user's explicit agreement.
     never fires. The pin map therefore lives in `lib/core/src/PinMap.h` under `test/test_pins/`
     (decision 33) and the pad claims/pulls are measured by bench command `g`. When adding a role, edit
     the table and let the test say whether the pad exists, can drive, and is free.
+19. **A bounded loop is not necessarily a cheap loop, and host timing does not transfer to the
+    target.** The first headless sim runs looked like a hang: the console went silent at the minute
+    the profile reached its deco obligation, no watchdog fired, and the board never answered again
+    until it was reflashed. Nothing was wrong with the physics — every plan-search loop was capped —
+    but an `NDL=999` tick paid a full 999-minute sweep at a 5 s step: 11,880 iterations, each
+    recomputing 32 `expf`. That is 0.5 ms on x86 and **1.15 s on xtensa**, because the ESP32's
+    soft-float `expf` is ~3 us, not the PC's ~40 ns. Bounded, numerically correct, and effectively a
+    hang at the bench. Fix: hoist the tissue decay factors per search call (bit-identical — the
+    `expf` inputs are the same) and phase the NDL horizon (fine step to 5 min, 15 s to 60 min,
+    120 s beyond). Measured: that tick went 1.3 ms → 0.07 ms natively, and the board's worst tick
+    went **1145 ms → 41.5 ms**. Rules that follow: treat per-tick compute cost as a **measured
+    quantity on the target**, never a host number (bench `v` prints worst-tick cost for this reason);
+    where a loop is capped, make cap-saturation *reportable* (`DecoPlan.bounded`,
+    `Engine::lastPlanSteps()`, the `SIM SLOW` line) — a search that burns its whole budget must be
+    visible, not merely survivable; and a watchdog is no substitute for cost discipline, because a
+    loop that yields every 15 ticks starves the display and the alarms for minutes without ever
+    tripping anything.
+20. **Ambient litres and surface litres both produce self-consistent setpoint tracking, so a units
+    error between them is invisible in ppO2 and wrong only in the gas figures.** Metabolic O2 use
+    is a molar draw, quoted in surface (STPD) litres and depth-independent; a valve's per-pulse
+    volume is an *ambient* litre and scales with pressure. The first loop model multiplied a
+    surface-quoted 1.2 L/min by ambient pressure, quadrupling consumption at 30 m — and the closed
+    loop still held 0.68 against a 0.70 setpoint, because the control law just injected 4x more.
+    The pulse count, injected litres, diluent consumption and sim runtime were all 4x wrong and all
+    looked plausible; the sim's own test encoded the wrong convention as a "hand-computed" anchor.
+    Found by auditing the mole balance of the on-target capture against a hand calculation, not by
+    any test. Rules that follow: the loop integrates **moles**; metabolism is
+    `metabolicRateSurfLpm`, injection is `pulseVolAmbL`, and the two conversions are stated in
+    `LoopModel.h`; and a gas figure is only believed after a **mole-balance** check — at steady
+    state the injected ambient litres must equal metabolic surf L x Pamb/Psurf (measured: 2 pulses
+    per minute against a hand-computed 2.0, 14 pulses over a 7-min hold against a hand-computed
+    2.15 amb L). A ppO2 trace that holds setpoint is not evidence the gas accounting is right.
 
 ---
 
@@ -1094,3 +1150,77 @@ Re-open only with the user's explicit agreement.
   protection diodes is what a disconnected module looks like — and what a converter failing mid-dive
   will look like in a dive log. Going forward: when a fault report could be caused by operator action,
   say so in the report rather than assigning a defect.
+
+- 2026-11-19 (simulator): **M1's simulator gate met — the sim profile runs headless on the board.**
+  Written: `lib/core/src/SensorIf.h` (`Barometer`, `CellSource`, `ClockSource`,
+  `SourceKind`/`SourceMix` — the same interfaces the real drivers will implement, which is what keeps
+  the sim at the ADC/sensor layer as §11 requires), and `lib/sim/` — `SimBaro`, `SimCells`,
+  `LoopModel`, `ValveModel`, `CcrControlLaw`, `SimRunner`. Each 1 s tick goes through the real stack:
+  profile → SimBaro → LoopModel/ValveModel (what O2 the firmware's own pulses actually delivered) →
+  SimCells (millivolts, faults injectable) → `evaluateCells()` (the real voter) → `resolveInspired()`
+  → `zhl::Engine::step()` → CNS/OTU/`plan()`/`ndlMin()`. Nothing downstream is handed an answer.
+  Bench command `v` runs a fixed 26-min, 6-segment profile (30 m for 8 min on air CCR, diluent flush
+  at depth, GF 30/70, dual setpoint 1.30/0.70 with crossover at 21 m).
+  **Measured on-target:** closed loop holds ppO2 0.70 against a 0.70 setpoint at 30 m at
+  **2 pulses/min** (hand-computed demand: 1.2 surf L/min = 0.305 amb L/min at 3.96 amb, into
+  0.15 amb L/pulse = 2.0 pulses/min), crossover takes it to 1.30 at the surface segment,
+  diluent-flush verification PASSes (expected 0.82 bar, worst cell deviation 0.00), deco ceiling
+  7.1 m / TTS 3.8 min appears on schedule at t=12 min, 136 pulses / 20.40 ambient L for the whole
+  profile, CNS 4.3% / OTU 68, every line `SIM`-stamped, ~30 s wall, and the board returns to
+  bench and answers `p` afterwards. New suite `test/test_sim/` (14 cases, physics anchors
+  hand-computed) — **94 native cases green** across seven suites.
+  Six defects found on the way, all mine; the first four by running rather than reasoning, the
+  last two by auditing the capture's numbers against hand calculations — no test caught them:
+  1. **stack smash**: `SimRunner` was a local in the bench command, ~28 KB (later ~145 KB) on an
+     8 KB task stack — the run died in the loop task with `TG1WDT_SYS_RESET`. It is a static local
+     now, and that is a rule, not a preference.
+  2. **DRAM overflow**: a 512-entry history ring put the image 52 KB over. `SIM_HIST_CAPACITY` is
+     per-target now — 96 snapshots on Arduino (Snapshot is 280 B; DRAM settles at ~19%), 512 on the
+     host where the tests want the whole trace.
+  3. **3-channel overrun**: `CellSource::readMv` writes all three channels, a caller passing a
+     1-element array wrote past it. Caught by ASan (`-fsanitize=address,undefined`); the interface
+     now says plainly that callers must pass full arrays.
+  4. **the "hang"** — see risk 19. Two runs ended mid-profile with no watchdog, no crash, no further
+     output, and the console dead. The plan search was capped, so the first suspicion (an unbounded
+     loop) was wrong, and the second (platform libm noise putting a knife-edge stop comparison on
+     the other side) was also wrong. The instrumentation that settled it was per-tick `micros()`
+     cost plus `Engine::lastPlanSteps()`: `NDL=999` ticks cost **1.15 s on the board** against 0.5 ms
+     natively, so a 26-minute profile was a 25–45 minute run and the captures were simply ending
+     early. Fixed by hoisting the per-compartment decay factors out of the search loops (bit-identical,
+     `expf` on the same input) and giving `ndlMin` a phased horizon. Worst tick measured on-target:
+     **1145 ms → 41.5 ms**, with `pulses=250 / injected=37.50 ambL` unchanged — the physics did not
+     move, only the cost. (Those gas figures were themselves wrong for a different reason — defect 5;
+     cost and units were each fixed and re-measured separately, which is what kept the two effects
+     separable.) A 240-min hold budget (`kMaxHoldMin`) also landed in the plan search: a
+     single stop holding that long is non-progress, and it now sets `bounded`/`noProgress` instead of
+     silently spending the 20k step budget.
+  5. **metabolic-units defect — AGENTS.md risk 20.** Auditing the capture's mole balance by hand:
+     at 30 m the loop drained 0.59 bar/min where 1.2 L/min into 8 L is 0.15 bar/min **at any depth**.
+     The model multiplied a surface-quoted metabolic rate by ambient pressure. Setpoint tracking was
+     impeccable; every gas figure was 4x wrong; and the sim's own test asserted the wrong rate as its
+     "hand-computed" anchor, so the suite could not see it. Fixed: `metabolicRateSurfLpm` with
+     `surfRefBar`, the unit convention stated in `LoopModel.h`, and the anchors re-derived — sag is
+     now asserted **depth-independent** (0.396 bar after 2 min at both 10 m and 30 m, zero-mole floor
+     at the hand-computed 276 s), and the closed-loop case asserts ~14 pulses over a 7-min hold
+     against the hand-computed 2.15 amb L (measured 14; the old model needed ~4x). Re-measured
+     on-target after the fix: 136 pulses / 20.40 amb L for the profile, bottom hold 0.70 at
+     2 pulses/min, mole balance closed at the hand number.
+  6. **history ring and empty-window assertions.** `hist_` stopped storing at capacity, so an
+     on-target run kept only its first 96 s; and window queries over a dropped span returned `0.0f`,
+     which sits inside most assertion bands — `verify()` could "pass" without ever looking at the
+     run. Fixed: a true ring with `histDropped()` accounting, `setHistoryStride()` (bench `v` uses
+     16: 96 x 16 s covers the whole profile), `windowCount()`, and `verify()` now reports
+     `NO DATA`/`unevaluated` — `allPassed()` requires zero unevaluated items. Pinned by a new test,
+     `test_history_ring_overwrites_and_reports_no_data`.
+  Two lessons, both risk 13 in a new currency. **Cost is a measured quantity like timing**, and
+  "bounded" is not "cheap" — `v` prints a worst-tick cost line so the number is never assumed.
+  And **a trace that behaves is not a model that computes correctly**: setpoint holding hid a 4x
+  units error only a mole balance could see, so every gas figure the sim prints is now quoted
+  against a hand calculation (risk 20).
+  App 486,109 B flash (30.9% of the 1.5 MB app slot), 63,648 B RAM (19.4%); flashed. **Both ADS1115
+  modules are now fitted**
+  (0x48 + 0x49 on I2C1) and **both raise the clone warnings** — `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH`
+  at 0x49 too (ID `0x00`, 61 ms conversion at the 32 SPS field), so decision 31 has two parts to
+  replace, not one; `ADS1115_U2` is no longer FATAL and the bench banner is `F:0 E:2 W:2` with
+  `[arm] REFUSED` now for BARO/INA219 — the report stays honest as hardware changes under it.
+  Still open at M1: the alternating-mux scheduler in `src/sensors/Ads1115Bus` at the measured rate.

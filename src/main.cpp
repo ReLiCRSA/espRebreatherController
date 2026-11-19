@@ -30,6 +30,11 @@
 // lib/core is a library directory, so these resolve from lib/core/src.
 #include "BootReport.h"
 
+// lib/sim is also a library directory. The headless bench run ('v') drives the same sim stack
+// the native test suite exercises (AGENTS.md 11, M1 gate: "sim profile runs headless"); it is
+// pure C++ and touches no pin.
+#include "SimRunner.h"
+
 namespace {
 
 boot::Report g_faults;
@@ -446,6 +451,124 @@ void gpioMapReport() {
                      "SPI flash path)"));
 }
 
+// Headless simulator run (M1 gate, AGENTS.md 11). Everything below is lib/sim + lib/core: the
+// depth comes from SimBaro, the millivolts from SimCells, and ppO2 is *not supplied to anything* —
+// it falls out of metabolism against the pulses the control law commanded through the valve model,
+// then runs through the real voter, gas model and ZHL engine. It touches no pin, no bus and no
+// radio, and every line is stamped SIM (AGENTS.md 19 risk 11: source stamping is not decoration).
+//
+// This runs in one go inside the bench loop. A profile of a few minutes of dive time is tens of
+// thousands of arithmetic operations; on the ESP32 that is tens of seconds (worst tick 41.5 ms
+// measured — AGENTS.md risk 19), and the idle-task WDT *is* armed on this core: the loop below
+// yields with delay(1) every 15 engine ticks. Do not wire it to anything while it runs.
+void benchRunSim(Stream& out) {
+    // NOT a local: SimRunner is ~145 KB (the 512-entry snapshot history dominates). The Arduino
+    // loop task stack is ~8 KB, and constructing it there smashed memory and came back as
+    // TG1WDT_SYS_RESET with no panic output — measured on the first 'v' run. Static storage is
+    // also the AGENTS.md 17 rule in miniature: no large allocation in the running path.
+    static sim::SimRunner r;
+    r.resetRun();
+    sim::CalSet cal{};              // shipped air-cal shape: 47.6 mV/bar, 0 offset
+    zhl::Config ec{};               // GF 30/70, 6 m last stop, defaults from Zhl16c.h
+    GasModelConfig gc{};            // dual setpoint 0.7 above / 1.3 below the 21 m crossover
+    sim::ControlConfig cc{};
+    cc.enabled = true;              // the law computes and injects inside the MODEL only
+    r.setConfig(ec, gc, cal, cc);
+    r.setBattery(3.7f);
+
+    sim::GasSet gases{};            // air diluent, escape air, O2 — the bench default set
+    r.setGases(gases);
+
+    sim::Profile p{};
+    auto seg = [&](int i, float depthM, float min, BreathingState mode) {
+        p.seg[i].depthM = depthM;
+        p.seg[i].durationMin = min;
+        p.seg[i].mode = mode;
+    };
+    seg(0, 30.0f, 5.0f, BreathingState::CCR_CLOSED);      // descent (ramped at the profile rate)
+    seg(1, 30.0f, 8.0f, BreathingState::CCR_CLOSED);      // bottom
+    seg(2, 30.0f, 1.0f, BreathingState::CCR_DILUENT_FLUSH);  // flush: independent cell check
+    seg(3, 21.0f, 3.0f, BreathingState::CCR_CLOSED);
+    seg(4, 6.0f, 6.0f, BreathingState::CCR_CLOSED);       // deco stop
+    seg(5, 0.0f, 3.0f, BreathingState::CCR_CLOSED);
+    p.count = 6;
+    p.defaultRateMPerMin = 8.0f;
+    r.setProfile(p);
+    // 96-entry ring on the Arduino x 16 s stride = the whole 1560 s profile retained. At stride 1
+    // the ring would silently hold only the first 96 seconds and every window query about the
+    // later dive would be answering from nothing (the NO-DATA rule in SimRunner::verify).
+    r.setHistoryStride(16);
+
+    out.println(F("[sim] SIM run — 30 m / 8 min CCR on air, diluent flush at depth, GF 30/70"));
+    out.println(F("      SIM DATA, bench only: no pin, no bus, no radio is touched"));
+    uint32_t nextReport = 0;
+    bool flushChecked = false;
+    int ticksSinceYield = 0;
+    // This core arms the task WDT on its idle tasks: a bench command that blocks for seconds
+    // without yielding takes TG1WDT_SYS_RESET (measured on the first 'v' run — the run died
+    // mid-profile and rebooted the board). Yielding every 15 engine ticks feeds the dog and
+    // costs nothing; wall-clock is not the point of a headless model run.
+    //
+    // Per-tick cost is measured, not assumed (the same discipline as the ADC rate table): a
+    // deco search that saturates its step budget is bounded but expensive — seconds per tick
+    // here — and that is exactly what looks like a hang from the console. The SLOW line is
+    // printed *before* the next tick so a tick that never finishes still leaves its
+    // neighbourhood on the wire.
+    uint32_t worstTickUs = 0;
+    uint32_t worstTickAt = 0;
+    uint32_t prevTickUs = 0;
+    uint32_t prevTickAt = 0;
+    int prevPlanSteps = 0;
+    while (!r.finished()) {
+        if (++ticksSinceYield >= 15) {
+            ticksSinceYield = 0;
+            delay(1);
+        }
+        if (prevTickUs > 100000)
+            out.printf("  SIM SLOW: t=%us took %luus plansteps=%d — next tick starting\n",
+                       (unsigned)prevTickAt, (unsigned long)prevTickUs, prevPlanSteps);
+        const uint32_t t0 = micros();
+        const sim::Snapshot& s = r.tick();
+        prevTickUs = micros() - t0;
+        prevTickAt = s.tSec;
+        prevPlanSteps = r.engine.lastPlanSteps();
+        if (prevTickUs > worstTickUs) { worstTickUs = prevTickUs; worstTickAt = s.tSec; }
+        if (s.tSec >= nextReport) {
+            out.printf("  SIM t=%4um d=%5.1fm ppO2=%4.2f sp=%4.2f pul=%5ld inj=%6.2fL "
+                       "vote=%d pass=%d NDL=%5.0f ceil=%4.1fm TTS=%5.1f CNS=%3.0f%% src=%s\n",
+                       (unsigned)(s.tSec / 60), s.depthM, s.ppO2Used, s.setpointBar,
+                       (long)s.pulsesTotal, s.injectedAmbL, (int)s.vote, s.passing,
+                       s.ndlMin, s.ceilingM, s.ttsMin, s.cnsPct, sourceName(s.sources));
+            nextReport += 60;
+        }
+        if (!flushChecked && s.mode == BreathingState::CCR_DILUENT_FLUSH) {
+            flushChecked = true;
+            // The check the diver actually gets: do all three cells independently land on the
+            // diluent's expected ppO2? (AGENTS.md 5 — voting cannot fake this.)
+            CellReading rd[CELL_COUNT];
+            for (int i = 0; i < CELL_COUNT; ++i) {
+                rd[i].mv = s.cellMv[i];
+                rd[i].present = s.cellPresent[i];
+            }
+            VoteOutcome v = evaluateCells(rd, cal.cal, cal.vote, false);
+            const float expected = expectedPpO2ForFlush(gases.diluent.fo2, s.ambBar, gc.pH2OBar);
+            float worst = 0.0f;
+            const bool ok = diluentFlushAgrees(v, expected, 0.15f, &worst);
+            out.printf("  SIM diluent flush @%5.1fm: expected ppO2 %4.2f, worst cell dev %4.2f -> %s\n",
+                       s.depthM, expected, worst, ok ? "PASS" : "FAIL");
+        }
+    }
+    const sim::Snapshot& f = r.last();
+    out.printf("  SIM done: pulses=%lu injected=%.2f ambL  CNS=%.1f%% OTU=%.0f  sources=%s\n",
+               (unsigned long)f.pulsesTotal, f.injectedAmbL, f.cnsPct, f.otu,
+               sourceName(f.sources));
+    out.printf("  SIM tick cost: worst %luus at t=%us (plan search saturating its step budget is "
+               "bounded but slow — this number is how you notice)\n",
+               (unsigned long)worstTickUs, (unsigned)worstTickAt);
+    out.println(F("  honest limits (AGENTS.md 19 risk 12): metabolic rate and loop volume are "
+                  "unmeasured defaults; this tunes the control law, it does not validate the loop"));
+}
+
 void handleCommand(char c) {
     switch (c) {
         case 's':
@@ -485,11 +608,15 @@ void handleCommand(char c) {
         case 'g':
             gpioMapReport();
             break;
+        case 'v':
+            benchRunSim(Serial);
+            break;
         case 'h':
         default:
             Serial.println(F("bench commands: s=full bus scan  p=probe table + report  "
                              "r=raw probe codes (destructive, bench only)  c=bus recovery  "
-                             "a=ADC self-test  d=ADC rate characterisation  g=pad map + pad test"));
+                             "a=ADC self-test  d=ADC rate characterisation  g=pad map + pad test  "
+                             "v=headless sim profile (SIM-stamped, touches no hardware)"));
             break;
     }
 }

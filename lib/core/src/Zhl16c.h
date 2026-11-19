@@ -82,6 +82,10 @@ public:
     float ambAt(float depthM, const Config& cfg) const;
 
     DecoPlan plan(const AscentGas& asc, float ambBar, const Config& cfg) const;
+    // Search iterations consumed by the most recent plan() call. A run that saturates the step
+    // cap is a plan the model could not finish; "how close to the cap" is how that gets caught
+    // on-target without a trace build, where a capped search can cost minutes of CPU per tick.
+    int lastPlanSteps() const { return lastPlanSteps_; }
 
     // Minutes of continued breathing at `ambBar` before a mandatory stop appears at or below it.
     // The gas argument matters: in a CCR the inspired state, not the mix, sets the loading.
@@ -98,6 +102,16 @@ private:
     float toleratedOf(int ci, const Blend& bl, float anchor, const Config& cfg) const;
     float ceilingCopies(const float* n2, const float* he, float anchor, int* compOut,
                         const Config& cfg) const;
+
+    // Tissue-response factors `1 - exp(-ln2*dt/tht)` per compartment. They depend only on the
+    // timestep, and the NDL and plan searches integrate thousands of fixed-step iterations —
+    // recomputing 32 expf per iteration made an NDL=999 sweep take 1.15 s per tick on the
+    // ESP32 (xtensa's soft-float expf is ~3 us, not x86's ~40 ns). Precomputing per search
+    // call is bit-identical: expf on the same input returns the same value.
+    struct Decay { float n2[NCOMP]; float he[NCOMP]; };
+    static void decayFor(float dtSec, Decay& out);
+    void stepCopies(float* n2, float* he, const Inspired& insp, const Decay& dec,
+                    const Config& cfg) const;
     // Operates on caller-owned arrays: const on the engine, because planning and NDL search
     // must not disturb the live tissue state.
     void stepCopies(float* n2, float* he, const Inspired& insp, float dtSec, const Config& cfg) const;
@@ -106,6 +120,7 @@ private:
     float phe_[NCOMP]{};
     float gfLowPressure_ = 1.013f;
     int   guidingComp_ = -1;
+    mutable int lastPlanSteps_ = 0;
 };
 
 } // namespace zhl

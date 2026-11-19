@@ -1,0 +1,6 @@
+{
+  "name": "sim",
+  "version": "0.1.0",
+  "description": "Sensor-layer dive simulator: SimBaro, SimCells, loop/valve physics, reference control law, profile runner. Pure C++ (AGENTS.md 11, 17).",
+  "dependencies": { "core": "*" }
+}
