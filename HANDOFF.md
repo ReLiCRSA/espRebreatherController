@@ -31,7 +31,12 @@ Two decisions were taken with the user on 2026-11-19 and are now binding (AGENTS
 converters **shall be genuine TI ADS1115s** (decision 31 — the fitted clone stays on the bench for
 timing work only), and **GPIO 33 is the Page button while the vibration motor moves to GPIO 16**
 (decision 32). The pin map itself moved to `lib/core/src/PinMap.h` under native test (decision 33),
-because it had been wrong twice as an untestable paragraph.
+because it had been wrong twice as an untestable paragraph. A later decision the same day names the
+procurement: **2x Adafruit ADS1115 breakout, product #1085** (decision 35) — board facts checked
+against the Adafruit product page/guide (AGENTS.md §2): TI ADS1115 die, VIN 3.3 V, default 0x48 with
+one back-side `A0` solder jumper giving 0x49 (close it on U2), ALRT/DRDY on the header, on-board 10k
+I2C pull-ups (add none externally). Acceptance on arrival is unchanged: identity stays a
+*measurement* claim — `d`/`a`/`t`, never the label.
 
 The single most important hardware lesson: **neither fitted "ADS1115" module is a genuine ADS1115.**
 The second module (0x49) was fitted after this file was first written and measures the same way as
@@ -231,11 +236,12 @@ Fitted at 0x48 on I2C1 (ADDR -> GND), measured 2026-11-19 with bench commands `a
   per-cell rate after walking both pairs is **8 SPS, not 16**. The **coil/ADC interlock window is
   62 ms, not 31 ms** — a window coded from the datasheet would leave half of a live conversion
   unguarded, and coil noise looks exactly like cell disagreement, which trips voting. 860 SPS is
-  unreachable. **Decided 2026-11-19 (AGENTS.md decision 31): source known-genuine TI ADS1115s** and
-  keep this module for bench timing work only. Outstanding action, not an open question: when new parts
-  arrive, `d` must measure 8/16/32/64/128/250/475/860 SPS and `a` must read ID `0x85`, and
-  `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` must clear by themselves. Note that **"ADS1115S" has no
-  datasheet** — so identity here is always a measurement claim, never a part-name claim.
+  unreachable. **Decided 2026-11-19 (AGENTS.md decisions 31 + 35): the replacements are 2x Adafruit
+  ADS1115 breakout #1085** and this module stays bench-only for timing work. Outstanding action, not
+  an open question: when the boards arrive (U2 = `A0` jumper closed for 0x49), `d` must measure
+  8/16/32/64/128/250/475/860 SPS and `a` must read ID `0x85`, and `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH`
+  must clear by themselves. Note that **"ADS1115S" has no datasheet** — so identity here is always a
+  measurement claim, never a part-name claim, Adafruit boards included until they pass `d`/`a`.
 - **Config-register read granularity: 348–365 us per poll.** That is the polling cost of watching the
   OS bit, and it is why DRDY (open item 14) matters: with DRDY wired, the interlock becomes an
   interrupt instead of a 350 us poll loop.
@@ -347,7 +353,9 @@ pretending the run was clean.
 ## 6. What is on the bench right now
 
 - ESP32 Doit devkit V3 over USB. **Wired: two ADS1115 modules on I2C1 — 0x48 (ADDR->GND) and 0x49
-  (ADDR->VDD), both VDD 3.3 / SDA 18 / SCL 19 — and one SSD1306 on I2C0 at 0x3C.** Not wired: the
+  (ADDR->VDD), both VDD 3.3 / SDA 18 / SCL 19 — and one SSD1306 on I2C0 at 0x3C.** These two ADC
+  modules are the clones of §5b: fitted for timing work only, to be replaced by 2x Adafruit #1085
+  (decision 35, §7 step 1). Not wired: the
   baro, the INA219, the solenoid, all buttons, buzzer, motor, watchdog. Cell inputs floating, DRDY
   lines not connected (open item 14).
 - Firmware flashed = current `src/` at HEAD of this session. Expected boot output with exactly the
@@ -438,12 +446,16 @@ M0 and M1 are **done**: the alternating-mux scheduler (`AdcPairWalker`, bench `t
 measured — 7.2 SPS/cell achieved, sized from the boot-measured period, interlock duty 95-96%
 (§5f). Next, in order:
 
-1. **Order known-genuine TI ADS1115 modules** (AGENTS.md decision 31 — decided 2026-11-19, an
-   outstanding action, not a question; **both** fitted modules measure as clones, so that is two
-   parts). On arrival: `d` must measure 8/16/32/64/128/250/475/860 SPS at both addresses and `a`
-   must read ID `0x85`, with `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` clearing by themselves (~31 ms
-   conversion, not 62), and `t` re-derived (expect ~16 SPS/cell, a few ms of OS-poll lag on top).
-   The walker re-begins from each part's own measurement at boot — no code change needed.
+1. **Order 2x Adafruit ADS1115 breakout #1085** (AGENTS.md decision 31, procurement named by
+   decision 35 — an outstanding action, not a question; **both** fitted modules measure as clones, so
+   that is two boards). Fit: VIN+GND from the 3.3 V rail (never the A+/A- rails — those are the
+   board's filtered outputs), SDA 18 / SCL 19, **U1 as shipped (0x48), U2 with the back-side `A0`
+   solder jumper closed (0x49)**; the boards' own 10k I2C pull-ups are enough — add none. Optionally
+   jumper ALRT→GPIO 23/4 for DRDY (open item 14 — measure polarity before the scheduler uses it).
+   On arrival: `d` must measure 8/16/32/64/128/250/475/860 SPS at both addresses and `a` must read
+   ID `0x85`, with `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` clearing by themselves (~31 ms conversion,
+   not 62), and `t` re-derived (expect ~16 SPS/cell, a few ms of OS-poll lag on top). The walker
+   re-begins from each part's own measurement at boot — no code change needed.
 2. **M3 — `src/sensors` drivers**: `Ms5837` @0x3E, `Bmp085` @0x3B (with the 9 m clamp banner),
    `Ina219` @0x40, `Depth` with learned `Psurf` — they implement the same `Barometer` interface
    `SimBaro` already does, so the sim path is the test double. M3 gate: fallback verified by
@@ -462,7 +474,7 @@ mistake).
 
 | File | What it pins down |
 |---|---|
-| `AGENTS.md` | binding design record; §16 milestone status, §18 decisions 1–34, §19 risks 1–20, §20 open items 1–16 |
+| `AGENTS.md` | binding design record; §16 milestone status, §18 decisions 1–35, §19 risks 1–20, §20 open items 1–16 |
 | `HANDOFF.md` (this file) | machine + bench state, measured I2C and ADC semantics, resume point |
 | `lib/core/src/AdcRegs.h` | **the ADS1115 register map, PGA/RATE tables, LSB and mV scaling, and the measured bench-module rate table.** Pure C++ so it can be asserted; it was wrong twice while it lived only in `src/` |
 | `src/sensors/Ads1115Bus.{h,cpp}` | register driver: single-shot start (MODE written explicitly), `checkPart()` identity-by-timing (stores `measuredConvUs()` for the walker and the interlock), `measureAdcRates()`, `selfTest()`. The accepted conversion window (20–150 ms) and why it is wider than the datasheet figure. **`AdcPairWalker`**: the non-blocking alternating-mux scheduler (M1), sized from the measured period, carries the coil/ADC interlock window (`integrating()`, `coilSafeAfterUs()`), and reports achieved rate/counters via bench `t` — see §5f for its measured figures |
@@ -488,10 +500,12 @@ mistake).
 
 ## 9. Open items that block code, not just BOM
 
-- **Open item 13 is decided** (AGENTS.md decision 31: genuine TI ADS1115s) and no longer blocks any
-  code — the walker sizes itself from a measured period, not a constant. With the clones fitted the
-  achieved per-cell rate is **7.2 SPS measured** (§5f); a genuine part should land near 16. The only
-  outstanding action is ordering the two parts and re-running `d`/`a`/`t`.
+- **Open item 13 is decided** (AGENTS.md decision 31; procurement named by decision 35: 2x Adafruit
+  ADS1115 breakout #1085) and no longer blocks any code — the walker sizes itself from a measured
+  period, not a constant. With the clones fitted the achieved per-cell rate is **7.2 SPS measured**
+  (§5f); the genuine part should land near 16. The only outstanding action is ordering the two
+  boards and re-running `d`/`a`/`t` (§7 step 1 has the fit details: 3.3 V rail, `A0` jumper on U2,
+  no external pull-ups, optional ALRT jumpers).
 - **Open item 14** (DRDY never actually wired, only read pulled-up and idle): the walker now *does*
   poll the OS bit at 10 ms cadence, and the cost is visible in the numbers — the ~4.4 ms average
   detection lag is most of the gap between the clone's 8.05 SPS sizing and the 7.2 SPS achieved

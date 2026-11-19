@@ -52,10 +52,29 @@ ESP32 classic (WROOM-32 devkit). Two cores are load-bearing: dive loop on core 0
 - ~10 min humidity/temperature acclimation gate before arming (not a polarographic warm-up).
 
 ### ADC — two ADS1115, true differential pairs
-| Device | Addr | AIN0/AIN1 | AIN2/AIN3 | DRDY |
+**Procured part: 2x Adafruit "ADS1115 16-Bit ADC - 4 Channel with PGA" (product #1085)** — decision
+35, the named way decision 31's "genuine TI ADS1115" is satisfied. Board-level facts checked against
+the Adafruit product page and the Adafruit 4-Channel ADC Breakouts guide (2026-11-19):
+- Carries the TI **ADS1115** (Adafruit publishes full schematic/EagleCAD; chip spec is TI SBAS444,
+  which is what `AdcRegs.h` implements). Two board revisions exist — current **STEMMA QT** and the
+  older header-only — functionally identical; either is acceptable.
+- **Supply VIN 2.0–5.5 V; run it from the 3.3 V rail** so board logic level matches the ESP32.
+  **A+ / A- are the board's ferrite-filtered analog rails — outputs, not inputs**; power at VIN/GND
+  and land the cell/coil networks on the **A0..A3** pads.
+- **Address: default 0x48; one back-side solder jumper `A0` closed -> 0x49.** That is exactly the
+  0x48/0x49 pair this design uses. 0x4A/0x4B (ADDR->SDA/SCL) exist on the chip but the board does
+  not strap ADDR that way — do not plan a third or fourth converter on those addresses.
+- **ALRT pin is on the header** (comparator output or conversion-ready / DRDY, open-drain,
+  active-low, needs a pull-up). Open item 14 becomes a jumper + pull-up once these boards are
+  fitted, with no extra hardware.
+- **On-board 10k I2C pull-ups to VIN on SDA/SCL.** Two boards parallel to ~5k on I2C1 — fine;
+  **do not add external pull-ups to I2C1** on top.
+- Power-LED cut jumper on the back (optional for the dive build). Board 25.4 x 17.8 mm.
+
+| Device | Addr | AIN0/AIN1 | AIN2/AIN3 | DRDY (ALRT) |
 |---|---|---|---|---|
-| U1 | 0x48 (ADDR->GND) | cell 1 | cell 2 | GPIO 23 |
-| U2 | 0x49 (ADDR->VDD) | cell 3 | coil shunt (differential) | GPIO 4 |
+| U1 | 0x48 (#1085 as shipped: `A0` jumper open) | cell 1 | cell 2 | GPIO 23 |
+| U2 | 0x49 (`A0` jumper **closed**) | cell 3 | coil shunt (differential) | GPIO 4 |
 
 - Both on **I2C1** (SDA 18 / SCL 19). I2C0 carries OLED + baro + INA219 only.
 - **Gain 16 (+/-256 mV)**. Continuous mode locks the mux to one channel, so the driver must
@@ -66,8 +85,11 @@ ESP32 classic (WROOM-32 devkit). Two cores are load-bearing: dive loop on core 0
   alternating-mux walker achieves **7.2 SPS per cell measured** on the fitted clones (bench `t`):
   8 SPS sized, less the OS-poll detection lag — in-walk conversion periods measure 65.5-67.1 ms
   against the 61.9 ms timed at boot. **Decision 31: the part gets replaced** with a known-genuine
-  TI ADS1115 (open item 13 is decided); the fitted module stays on the bench for timing work and
-  never goes near a dive.
+  TI ADS1115 (open item 13 is decided; decision 35 names the Adafruit #1085 breakout as the
+  procured part); the fitted module stays on the bench for timing work and never goes near a dive.
+  On the genuine chip the design's 32 SPS field is 31.25 ms — so expect ~16 SPS per cell from the
+  walker and a ~31-33 ms interlock window — but those stay **measurement-derived expectations, not
+  sizing inputs**: the walker sizes from each part's own boot measurement either way (decision 29).
 - **LSB 7.8125 uV at gain 16** (FSR/32768 — not the 0.125 mV often quoted, which is the *gain 1*
   figure). A galvanic cell in air (~9-13 mV) is therefore ~1150-1660 counts of a +/-32767 range:
   ample headroom for the bias network, ample resolution. `lib/core/src/AdcRegs.h` holds the register
@@ -687,7 +709,7 @@ Commands: `pio run`, `pio run -t upload`, `pio device monitor`, `pio test -e nat
 `pio run -t uploadfs`.
 
 **README.md must contain** (user requirement): the safety statement and what this is not; BOM
-(Bar30/MS5837-30BA breakout, 2x ADS1115 modules, MOSFET + flyback Schottky + 10 mOhm shunt, INA219,
+(Bar30/MS5837-30BA breakout, 2x Adafruit ADS1115 breakout #1085 (decision 35), MOSFET + flyback Schottky + 10 mOhm shunt, INA219,
 1 MOhm x12, 10 ohm x12, watchdog IC, 2P PCM >=3 A, valve); full wiring tables plus an ASCII harness
 diagram for MS5837 (3.3 V, 7-bit 0x3E / datasheet 8-bit 0x7C, Bar30 DF13 colours: red power /
 black GND / yellow SDA / blue SCL),
@@ -789,7 +811,7 @@ with `histDropped` accounting, strides, and `NO DATA`/`unevaluated` so an empty 
 | # | Deliverable | Gate | Status (2026-11-19) |
 |---|---|---|---|
 | M0 | installer, build, flash, I2C scan, boot report | `pio run -t upload` works on this Mac | **DONE** — flashed and verified on the devkit (CP2102, ESP32-D0WD-V3): "Hash of data verified", clean boot banner, boot report correct on an empty bench, `[arm] REFUSED`. Section 15 holds the evidence. |
-| M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **DONE (2026-11-19).** Boot/bench and the simulator were verified earlier; the last open item, the **alternating-mux scheduler**, is now implemented and measured: `AdcPairWalker` in `src/sensors/Ads1115Bus` — non-blocking pair-step state machine, sized from the boot-measured conversion period (never the datasheet), polled OS bit at 10 ms cadence (DRDY still unwired, open item 14), I2C-error backoff, and a coil/ADC interlock window carried per converter. Bench `t` measures it: **7.2 SPS per cell achieved** on the fitted clones (design 16, clone-sized 8), in-walk periods 65.5-67.1 ms, interlock busy duty **95-96%** → decision 34: M5 must carve explicit pulse slots. `lib/sim` runs the fixed 26-min profile headless on the board (bench `v`) at hand-computed pulse demand; **94 native cases green** in seven suites. Open item 13's outstanding action (order two genuine TI parts, re-run `d`/`a`) stands — the walker re-sizes itself from the new parts' own measurement at boot. |
+| M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **DONE (2026-11-19).** Boot/bench and the simulator were verified earlier; the last open item, the **alternating-mux scheduler**, is now implemented and measured: `AdcPairWalker` in `src/sensors/Ads1115Bus` — non-blocking pair-step state machine, sized from the boot-measured conversion period (never the datasheet), polled OS bit at 10 ms cadence (DRDY still unwired, open item 14), I2C-error backoff, and a coil/ADC interlock window carried per converter. Bench `t` measures it: **7.2 SPS per cell achieved** on the fitted clones (design 16, clone-sized 8), in-walk periods 65.5-67.1 ms, interlock busy duty **95-96%** → decision 34: M5 must carve explicit pulse slots. `lib/sim` runs the fixed 26-min profile headless on the board (bench `v`) at hand-computed pulse demand; **94 native cases green** in seven suites. Open item 13's outstanding action (order two Adafruit #1085 breakouts — decision 35 — and re-run `d`/`a`/`t`) stands — the walker re-sizes itself from the new parts' own measurement at boot. |
 | M2 | air cal + voting + diluent-flush check + alarms | native voting tests pass | voting + diluent-flush + cal sigma gate done natively; on-device wiring not started |
 | M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds 0x3E/0x3B (datasheet 8-bit 0x7C/0x77 corrected) and raises `BARO_RANGE_9M` when only the BMP085 answers; drivers not written |
 | M4 | ZHL-16C 3-gas + GF + ICD + CNS + MOD/END/density | validated natively **before** hardware depends on it | **engine complete and regression-anchored natively** (47 cases); *not* validated against a trusted computer yet — risk 13 |
@@ -855,7 +877,8 @@ Re-open only with the user's explicit agreement.
 | 31 | **The ppO2 converters shall be genuine TI ADS1115s.** The fitted module stays on the bench for timing work only; it does not go near a dive. Resolves open item 13 as option (a). | User's call, 2026-11-19 ("use the ADS1115, not the ADS1115S"). Risk 16 already said sourcing known-genuine parts is a safety action, not a preference; this makes it the plan. Note for honesty: **"ADS1115S" has no findable datasheet**, so part identity here stays a *measurement* claim (decision 29: timed conversion at the design RATE field, `d` for the whole table), never a part-name claim. Independent corroboration that generic breakouts carry non-TI dies with off-datasheet rate tables: Hackaday 2025-10-15 "How Bad Can A Cheap Knockoff ADS1115 ADC Be?" and excamera.substack.com "How bad can a $2.97 ADC be?" (which reports relabelled ADS1015 dies). Acceptance test when new parts arrive: `d` must measure 8/16/32/64/128/250/475/860 SPS, `a` must read ID 0x85, and `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` must clear on their own. |
 | 32 | **GPIO 33 is the Page button; the vibration motor moves to GPIO 16.** Resolves open item 12. | User's call, 2026-11-19. The old note "avoid 16/17 (UART0 on most devkits)" was measured false on this board — bench command `g` shows the console is UART0 on **GPIO1(TX)/GPIO3(RX)**, periman confirms both, and the core's own `doitESP32devkitV1` variant header says `TX = 1; RX = 3`. 16/17 are free, output-capable, and their internal pulls work (measured). 33 is kept for the button because it has an internal pull-up (34–39 do not) and reading a button is what that pad is for. The motor keeps an external gate pulldown either way — an internal pull is not a fail-safe. 17 is declared the spare. |
 | 33 | **The GPIO capability table and the role assignment live in `lib/core/src/PinMap.h`** (pure C++, asserted by `test/test_pins/`); `src/config/Pins.h` is an alias, not a second copy. | Same remedy as decision 28, applied to a different class of defect. The pin map was a paragraph nobody could test, and it was wrong twice: GPIO 33 assigned to two functions, and pad groups assumed free or unusable based on the die instead of the module (measured: 24 and 28–31 do not exist on the ESP32-D0WD-V3 die at all; 20/37/38 exist but WROOM-32 does not bond them out). A duplicate pin or an output on an input-only pad is now a test failure rather than a bench-chase. |
-| 34 | **The M5 coil-pulse scheduler must carve explicit conversion-free slots into the ADC cycle; the incidental inter-conversion gap is measured ~2–3 ms and shall not be designed against.** | Implemented-and-measured 2026-11-19, before M5 exists: the alternating-mux walker (`AdcPairWalker`) keeps both converters integrating 95–96% of wall time at the fitted clones' rate (mean in-walk conversion period 66.4 ms, bench `t`). §8's "pulses queue into the gap" assumed a gap exists; at 20–250 ms pulse widths it does not. Recorded now so M5 is designed against a measured figure instead of discovering the collision at the water. |
+| 34 | **The M5 coil-pulse scheduler must carve explicit conversion-free slots into the ADC cycle; the incidental inter-conversion gap is measured ~2–3 ms and shall not be designed against.** | Implemented-and-measured 2026-11-19, before M5 exists: the alternating-mux walker (`AdcPairWalker`) keeps both converters integrating 95–96% of wall time at the fitted clones' rate (mean in-walk conversion period 66.4 ms, bench `t`). §8's "pulses queue into the gap" assumed a gap exists; at 20–250 ms pulse widths it does not. Recorded now so M5 is designed against a measured figure instead of discovering the collision at the water. This is **inherent to the walk scheme, not an artifact of the clones**: the walker re-arms the next conversion immediately, so back-to-back conversions leave the same ~µs gap at genuine-part rates too — only the window size changes (62 ms → ~31 ms). |
+| 35 | **The two ppO2 converters are specified as Adafruit "ADS1115 16-Bit ADC – 4 Channel with PGA" breakouts (product #1085), 2x.** This is the named procurement that satisfies decision 31; it changes nothing about driver or acceptance. | User's call, 2026-11-19. Facts checked against the Adafruit product page and the 4-Channel ADC Breakouts guide: the board carries the TI ADS1115 (chip spec SBAS444 — the same table `AdcRegs.h` implements and `test/test_adc/` asserts, so **no register-map, PGA, LSB or rate change anywhere**), VIN 2.0–5.5 V (run at 3.3 V), default address 0x48 with one back-side `A0` solder jumper giving 0x49 — exactly this design's 0x48/0x49 pair — ALRT/DRDY broken out on the header (open item 14 becomes wireable), and on-board 10k I2C pull-ups (two boards ≈ 5k total; add none externally). Caveats kept on the record: **identity remains a measurement claim, never a brand claim** (decision 29) — the arrival acceptance test is unchanged (`d` measures the eight datasheet rates, `a` reads ID `0x85`, `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` clear by themselves); decision 27 also stands — the Adafruit ADS1X15 library is a bring-up cross-check at most, never in the dive path. Two board revisions (STEMMA QT / header-only) are both acceptable. |
 
 ---
 
@@ -981,8 +1004,8 @@ Re-open only with the user's explicit agreement.
 | 10 | Second independent computer + hand board selection | Required by section 13, not yet chosen. |
 | 11 | MS5837 mounting (Bar30 M10 bulkhead) and its drying discipline in the maintenance schedule | Part suggested, procedure written, not yet validated. |
 | 12 | **GPIO 33 is assigned to both the vibration motor and the Page button** (section 3) | **RESOLVED 2026-11-19** (decision 32): 33 stays the Page button, the motor moves to GPIO 16. Measured by bench command `g`: this board's console is GPIO1/GPIO3, not 16/17. `test/test_pins/` now asserts no two roles share a pad, so the class of defect is closed too, not just this instance. |
-| 13 | **The fitted ADS1115 module's rate table is not the datasheet's** (risk 16): 4 rates not 8, and the design's 32 SPS field gives 16.1 SPS | **DECIDED 2026-11-19** (decision 31): option (a) — source known-genuine TI ADS1115s; the fitted module stays on the bench for timing work only. Outstanding action, not an open question: order the parts, then re-run `d` (must measure 8/16/32/64/128/250/475/860 SPS) and `a` (must read ID 0x85) and confirm `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` clear by themselves. Until then every timing figure in the firmware is derived from the measured table, so both parts work and neither is trusted from its label. |
-| 14 | **DRDY is wired to GPIO 23 but the line has only ever been read pulled-up and idle** | The driver currently polls the OS bit over I2C (348 us/poll measured). DRDY would cut that to an interrupt and make the coil/ADC interlock exact rather than polled. Needs the module's DRDY actually connected and the polarity/behavior measured (open-drain, needs a pull-up) before the scheduler can depend on it. |
+| 13 | **The fitted ADS1115 module's rate table is not the datasheet's** (risk 16): 4 rates not 8, and the design's 32 SPS field gives 16.1 SPS | **DECIDED 2026-11-19** (decision 31, procurement named by decision 35): option (a) — **2x Adafruit ADS1115 breakout #1085**; the fitted module stays on the bench for timing work only. Outstanding action, not an open question: order the two boards, close the `A0` jumper on U2 for 0x49, then re-run `d` (must measure 8/16/32/64/128/250/475/860 SPS), `a` (must read ID 0x85) and `t` (expect ~16 SPS/cell) and confirm `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` clear by themselves. Until then every timing figure in the firmware is derived from the measured table, so both parts work and neither is trusted from its label — including the Adafruit boards until they pass that test. |
+| 14 | **DRDY is wired to GPIO 23 but the line has only ever been read pulled-up and idle** | The driver currently polls the OS bit over I2C (348 us/poll measured). DRDY would cut that to an interrupt and make the coil/ADC interlock exact rather than polled. Needs the module's DRDY actually connected and the polarity/behavior measured (open-drain, needs a pull-up) before the scheduler can depend on it. The Adafruit #1085 (decision 35) **breaks ALRT out on its header**, so once those boards are fitted this is one jumper + one pull-up per converter — not a board-modification project. Still must be measured before the scheduler trusts it, and settled against the pin budget (item 15). |
 | 15 | **Display panel vs the pin budget** (new, from closing item 12): a SPI panel needs four pads (SCK/MOSI/DC/CS) and after the current map **only GPIO 17 is spare and output-capable** | The core's own SPI defaults (18/19/23) collide with I2C1 and ADS_U1_DRDY, so a panel cannot simply take `SPI.begin()` defaults. Options, none free: free the two DRDY pads by polling the OS bit instead (costs 348 us/poll and an exact interlock, item 14), take strapping pins against the §3 policy, or keep the panel on I2C and accept the frame-time cost (§12 says a >128x64 panel must not go on I2C). Must be argued with item 6 when the panel is chosen — not during bring-up at the water. |
 | 16 | **The ADS1115 module stopped answering on I2C1** (`SDA held low before init`, probes returning **err 5 = timeout**, nine clocks + port re-init did not free it) | **CLOSED 2026-11-19 — not a fault.** The user confirms the dropouts were **their own intervention on the bench** (the module being unplugged/re-fitted), not a flaky connection. Nothing to fix and no maintenance action. What the episode is kept for is the diagnostic it produced: `err 5` (bus being held) vs `err 2` (address unanswered) are different hardware stories, and **a converter that has lost its supply clamps SDA/SCL through its protection diodes** — that is exactly what a disconnected or unpowered module looks like, and exactly what a converter failing mid-dive will look like in the log. Securing jumpers for the dive build stays good practice (§20 item 9, enclosure/connector work), but it is not a corrective action for anything seen so far. |
 
@@ -1270,3 +1293,37 @@ Re-open only with the user's explicit agreement.
   says so rather than pretending the run was clean.
   App 488,497 B flash (31.1%), 63,864 B RAM (19.5%). Native suite unchanged at **94 green** (`src/`
   is not built natively — that split is what makes that claim cheap to keep honest).
+
+- 2026-11-19 (ADC procurement): **the ppO2 converters are now specified by product: 2x Adafruit
+  "ADS1115 16-Bit ADC – 4 Channel with PGA" breakout, product #1085** (decision 35 — the named
+  procurement that satisfies decision 31). Specs checked against that product, not assumed: the
+  Adafruit product page and the Adafruit 4-Channel ADC Breakouts guide (pinouts page) were read on
+  2026-11-19. What the check found:
+  1. **No chip-level spec change anywhere.** The board carries the TI ADS1115 against datasheet
+     SBAS444 — the same register map, PGA/RATE tables, LSB 7.8125 uV at gain 16 and power-on word
+     `0x8583` that `lib/core/src/AdcRegs.h` already implements and `test/test_adc/` already asserts.
+     Design values matched the datasheet before; the parts didn't. The fix was procurement, not the
+     tables.
+  2. **Board-level facts recorded in §2**: VIN 2.0–5.5 V (run from the 3.3 V rail); `A+`/`A-` are
+     the board's ferrite-filtered analog rails — outputs, not supply inputs; address is default
+     **0x48 with one back-side `A0` solder jumper giving 0x49**, which is exactly this design's
+     pair — the chip's 0x4A/0x4B (ADDR→SDA/SCL) options are **not** strapped out on this board, so
+     a third/fourth converter on those addresses is not an option; **ALRT/DRDY is broken out on the
+     header**, which makes open item 14 a jumper + pull-up once fitted; **on-board 10k I2C pull-ups
+     to VIN**, two boards ≈ 5k total on I2C1 — add none externally; power-LED cut jumper; current
+     STEMMA QT and older header-only revisions are functionally identical.
+  3. **Caveats kept on the record in decision 35**: identity remains a *measurement* claim, never a
+     brand claim (decision 29) — the arrival acceptance test is unchanged and applies to the
+     Adafruit boards like to any part: `d` measures the eight datasheet rates, `a` reads ID `0x85`,
+     `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` clear by themselves, `t` re-derives (~31 ms conversion,
+     ~16 SPS/cell expected — expectations, never sizing inputs). Decision 27 also stands: the
+     Adafruit ADS1X15 library stays a bring-up cross-check at most, out of the dive path.
+  4. **Decision 34 annotated**: the ~2–3 ms inter-conversion gap is inherent to the alternating-mux
+     walk (the walker re-arms conversions back-to-back), not an artifact of the clones — at genuine
+     rates only the window size changes (62 ms → ~31 ms), so M5's conversion-free-slot scheduling is
+     required with the new boards too.
+  Updated: §2 (procured-part block + address-strap table rewritten to the `A0` jumper), §15 BOM line,
+  §16 M1 row, §18 decision 34 annotation + decision 35, §20 items 13/14, HANDOFF.md (header, §5b,
+  §6, §7 step 1 with fit details, §8, §9). **Docs-only change: no code touched, native suite
+  unchanged at 94 green.** Outstanding action stays: order the two boards, close `A0` on U2, run
+  `d`/`a`/`t`.
