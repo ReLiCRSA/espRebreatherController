@@ -378,7 +378,9 @@ What that means:
   question (genuine BMP085, or BMP280 with its own driver, or no fallback at all).
 - **A clone at 0x77 was also seen moving between I2C0 and I2C1 across captures** — bench
   intervention, not a flaky bus (§20 item 16's lesson: name it as intervention, do not assign a
-  defect).
+  defect). Re-checked **on the design bus (I2C0) 2026-11-20**: 0x3E and 0x3B both NACK, and the
+  `b` fingerprint reproduced **identically** at 0x77 — the clone identity is bus-independent, a
+  property of the silicon, not of the wiring.
 
 ## 6. What is on the bench right now
 

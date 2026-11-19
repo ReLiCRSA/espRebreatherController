@@ -126,8 +126,9 @@ the Adafruit product page and the Adafruit 4-Channel ADC Breakouts guide (2026-1
   is silent there — answers CHIPID `0xD0=0x55` (the BMP180 ID), but the fixed version byte answers
   **`0xD1=0x02` where a genuine part reads `0x43`**, and the factory calibration ROM reads
   **AC1=0x219C (8604) against the BMP180 spec value 7295**. A Bosch-family clone: same defect class
-  as risk 16, now on the depth sensor. It has also been seen on **I2C1** (the ADC bus) across bench
-  captures — the design fits baro on I2C0. It is not trusted for depth and stays a bench object;
+  as risk 16, now on the depth sensor. Re-checked **on the design bus (I2C0)** the same day: 0x3E and
+  0x3B both NACK and the fingerprint reproduces identically at 0x77, so this is a property of the
+  silicon, not of the wiring. It is not trusted for depth and stays a bench object;
   fallback procurement is open item 17. `b` re-measures the fingerprint (it writes the Bosch pointer
   register — bench only, same class as `a`/`d`).
 - Depth = `(Pamb - Psurf) * k`; `Psurf` is **learned at boot** (only relative accuracy matters,
