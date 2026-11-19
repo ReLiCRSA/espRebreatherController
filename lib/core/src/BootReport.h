@@ -73,7 +73,9 @@ class Report {
     bool blocksArming() const {
         for (size_t i = 0; i < kCapacity; ++i)
             if (slots_[i].code != FaultCode::NONE && slots_[i].present &&
-                ::blocksArming(slots_[i].code))
+                // AGENTS.md 13: an unresolved FATAL refuses arming on its own, so a new fatal code
+                // cannot become armable just because nobody remembered to list it in the table.
+                (slots_[i].severity == Severity::FATAL || ::blocksArming(slots_[i].code)))
                 return true;
         return false;
     }

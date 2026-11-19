@@ -19,6 +19,30 @@ enum class FaultCode : uint16_t {
     CONFIG_CORRUPT = 19,
     TISSUE_STATE_STALE = 20,
     EXTERNAL_WATCHDOG = 21,
+    // A presence probe ACKs an ADS1015 exactly like an ADS1115, and the parts differ in sample
+    // rate and LSB size. Identity is therefore checked by *measured conversion period* at the
+    // design rate (the two parts' RATE tables differ 100x at the same field value), not by the ID
+    // register — see src/sensors/Ads1115Bus.h.
+    ADC_PART_WRONG = 22,
+    // A converter that ACKs its address but does not sample at a rate the control loop and the
+    // coil/ADC interlock can be built on: no conversion at all, a conversion far too fast (another
+    // part's rate table), or one far too slow. The detail string carries the measured period, and
+    // bench command 'd' characterises the whole rate table.
+    ADC_CONV_BAD = 23,
+    // The ID register does not answer with the ADS1115's documented 0x85. Informational in
+    // severity: measured 2026-11-19, the bench module reads 0x00 there while its config register
+    // reads back the datasheet power-on default exactly, so a zero ID marks an unmarked/clone die,
+    // not a wrong part. It is said out loud (AGENTS.md 17) but it does not ground the unit — the
+    // conversion-timing checks are what prove fitness.
+    ADC_ID_UNKNOWN = 24,
+    // The converter's measured conversion period does not match the datasheet's for the rate field
+    // written, i.e. its rate table is not the ADS1115's. Measured on the first bench module
+    // 2026-11-19: the design's 32 SPS field yields 16.1 SPS, and the part implements only four rates
+    // (8/16/32/64 SPS) instead of eight. It samples, so it is not fatal, but the per-cell sample rate
+    // and the coil/ADC interlock window are then not the designed ones and must be re-derived from
+    // measurement (bench command 'd'). Held at WARN deliberately: this is a parts-sourcing finding
+    // for the bench to resolve, not something to refuse a dive at the water for.
+    ADC_RATE_MISMATCH = 25,
 
     // Power
     VBAT_LOW = 30,
@@ -81,6 +105,10 @@ inline Severity defaultSeverity(FaultCode c) {
 
         case FaultCode::BARO:
         case FaultCode::BARO_RANGE:
+        // ACKs its address but is not the part this design's timing assumes, or does not convert at
+        // all: ppO2 cannot be trusted either way, and a presence probe alone would never say so.
+        case FaultCode::ADC_PART_WRONG:
+        case FaultCode::ADC_CONV_BAD:
         case FaultCode::OLED:
         case FaultCode::INA219:
         case FaultCode::LITTLEFS:
@@ -109,6 +137,10 @@ inline Severity defaultSeverity(FaultCode c) {
         case FaultCode::SIM_REJECTED_ARMED:
         case FaultCode::DEPTH_STALE:
         case FaultCode::DILUENT_FLUSH_MISMATCH:
+        // Present, converting, but the ID register does not match the ADS1115's: worth saying out
+        // loud, not worth grounding the dive unit for. See the enum comment.
+        case FaultCode::ADC_ID_UNKNOWN:
+        case FaultCode::ADC_RATE_MISMATCH:
             return Severity::WARN;
 
         default:
@@ -121,7 +153,12 @@ inline bool blocksArming(FaultCode c) {
     switch (c) {
         case FaultCode::ADS1115_U1:
         case FaultCode::ADS1115_U2:
+        case FaultCode::ADC_PART_WRONG:
+        case FaultCode::ADC_CONV_BAD:
         case FaultCode::BARO:
+        case FaultCode::OLED:              // AGENTS.md 13: the in-water display is required to arm
+        case FaultCode::I2C_BUS_STUCK:    // a bus that failed to init carries ppO2 and depth
+        case FaultCode::EXTERNAL_WATCHDOG:
         case FaultCode::CELL_BIAS:
         case FaultCode::CELL_DEAD:
         case FaultCode::CELL_AGED:
@@ -142,6 +179,10 @@ inline const char* faultName(FaultCode c) {
         case FaultCode::NONE: return "NONE";
         case FaultCode::ADS1115_U1: return "ADS1115_U1";
         case FaultCode::ADS1115_U2: return "ADS1115_U2";
+        case FaultCode::ADC_PART_WRONG: return "ADC_PART_WRONG";
+        case FaultCode::ADC_CONV_BAD: return "ADC_CONV_BAD";
+        case FaultCode::ADC_ID_UNKNOWN: return "ADC_ID_UNKNOWN";
+        case FaultCode::ADC_RATE_MISMATCH: return "ADC_RATE_MISMATCH";
         case FaultCode::BARO: return "BARO";
         case FaultCode::BARO_RANGE: return "BARO_RANGE_9M";
         case FaultCode::OLED: return "OLED";

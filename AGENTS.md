@@ -60,11 +60,27 @@ ESP32 classic (WROOM-32 devkit). Two cores are load-bearing: dive loop on core 0
 - Both on **I2C1** (SDA 18 / SCL 19). I2C0 carries OLED + baro + INA219 only.
 - **Gain 16 (+/-256 mV)**. Continuous mode locks the mux to one channel, so the driver must
   **alternate single-shot conversions** AIN0/1 -> AIN2/3 at **SPS 32**, giving 16 SPS per cell.
+  SPS 32 is what the design asks for; what the fitted part actually delivers at that field is
+  measured, not assumed (see the measured rate table below — the bench module gives 16.1 SPS there,
+  so the real per-cell rate is 8 SPS until the part or the field is changed).
+- **LSB 7.8125 uV at gain 16** (FSR/32768 — not the 0.125 mV often quoted, which is the *gain 1*
+  figure). A galvanic cell in air (~9-13 mV) is therefore ~1150-1660 counts of a +/-32767 range:
+  ample headroom for the bias network, ample resolution. `lib/core/src/AdcRegs.h` holds the register
+  map, the PGA/RATE tables and this arithmetic; `test/test_adc/` asserts them.
 - Differential cells float: **1 MOhm from each cell lead to GND/AIN_COM** to define common mode,
   plus 10 ohm series and an RC low-pass per pair. Without the resistors the inputs rail and read
   garbage.
 - O2 is reduced at the sensing electrode, so signal polarity may be negative. Per-channel
   `invert` flag resolved on the bench.
+- **Measured on the first module on the bench (2026-11-19): it is not a genuine ADS1115.** It ACKs
+  at 0x48, its config register reads/writes correctly (power-on `cfg=0x8583`, exactly the datasheet
+  default), it converts — but the ID register answers 0x00, the pointer register answers 0x00 and
+  does not track writes, and its RATE field implements only **four** rates selected by bits 6:5:
+  measured 8.1/8.1/16.1/16.1/31.9/31.9/63.7/63.7 SPS for fields 0..7 (reproduced across two runs,
+  each field pairing to the same period within 0.5%), against the datasheet's
+  8/16/32/64/128/250/475/860. So the design's "32 SPS" field delivers 16.1 SPS (8 SPS per cell
+  pair-cycle), and 860 SPS is unreachable. Consequences are in section 8 (interlock window) and
+  risk 16; `GET`/bench command `d` re-measures the table.
 - Cells 1 and 2 share one converter (one mux/reference/supply) — a known correlated-failure
   point, compensated by the diluent-flush check and the arming gate, and documented as a reason
   to carry a second independent computer.
@@ -178,6 +194,17 @@ failed to init it emitted ~200 driver error lines that buried the boot banner. A
 be read at the water cannot start by shouting two hundred lines. Stuck-SDA detection runs **before
 `Wire.begin()`** (checking it while the port is live deinits the port — risk 15); if a port will not
 init, that is reported as a bus fault and its devices are reported as "bus dead", never as absent.
+
+**Presence is not identity.** Every converter that ACKs also gets an active check (`checkAdcs()` at
+boot, and again on a presence transition — not on every 5 s re-probe, because it writes the config
+register): one single-shot conversion at the design rate, timed. That is what tells an ADS1115 from
+an ADS1015 (same address, same register map, same field positions, rate tables 100x apart), and the
+ID register cannot do the job — the bench module answers 0x00 there. The outcomes are four codes:
+`ADC_PART_WRONG` (far too fast: another part's rate table), `ADC_CONV_BAD` (no conversion, or
+outside the accepted 20-150 ms window), `ADC_ID_UNKNOWN` (WARN: ID register is not the ADS1115's)
+and `ADC_RATE_MISMATCH` (WARN: measured period is >25% from the datasheet's for the field written).
+The two WARNs are what the bench module raises today; they say out loud that the fitted part is not
+what it is marked, without refusing a dive for it at the water.
 
 Each result: `code`, `severity (FATAL/ERROR/WARN/INFO)`, `detail`, `timestamp`, `attempts`.
 Destinations: serial, `GET /faults` (web System tab), **`faults.json` ring on LittleFS (last 100,
@@ -300,9 +327,12 @@ faults are written into dive-log headers too.
   - `SOLENOID_SLOW_CLICK` — damped/slow signature (fouling, low voltage, failing valve)
   - `SOLENOID_FAIL` — click present but ppO2 unchanged (supply empty, frozen regulator)
 - **Pulse scheduling against the ADC:** never fire the coil while an ADS1115 conversion is
-  integrating (31 ms windows at 32 SPS). The dive task owns the DRDY semaphore, so pulses queue
-  into the gap. Costs a few ms of injection latency, removes a class of correlated ppO2 noise —
-  dangerous specifically because noise looks like cell disagreement and trips voting.
+  integrating. The window is **the measured conversion period, never the datasheet's**: on the fitted
+  module the design's 32 SPS field measures 62 ms, not 31 ms (section 2, risk 16), so a window coded
+  from the datasheet would leave 31 ms of a live conversion unguarded. The dive task owns the DRDY
+  semaphore, so pulses queue into the gap. Costs a few ms of injection latency, removes a class of
+  correlated ppO2 noise — dangerous specifically because noise looks like cell disagreement and trips
+  voting.
 - **Low-voltage lockout:** below ~3.4 V stop injecting automatically, alarm, hand control to manual
   bailout rather than chattering a valve on a dying rail.
 - If a latching valve is chosen: **pulse-then-release in both directions, never hold current** —
@@ -476,6 +506,16 @@ As **primary computer**, these are requirements:
   cal age < 24 h, per-cell air slope >= 30 mV/bar, all three cells agreeing within 20% in air,
   coil click self-test passing, no unresolved FATAL. Bench-only mode (screen/baro absent) is allowed
   on the bench, never for arming.
+- **The gate is table-driven, and an active FATAL blocks on its own** — a code does not have to be
+  listed in `blocksArming()` to refuse arming, so a new fatal code cannot become armable by being
+  forgotten in a table. That was a real hole: `RAIL_3V3_LOW` was FATAL and *not* listed, so the
+  3.3 V brown-out rail did not block arming. OLED (required by this section), `I2C_BUS_STUCK` and
+  `EXTERNAL_WATCHDOG` were also missing and are now listed. `test/test_boot/` pins all of it.
+- `ADC_PART_WRONG` and `ADC_CONV_BAD` block arming (ppO2 cannot be trusted from a converter that is
+  the wrong part or is not sampling). `ADC_ID_UNKNOWN` and `ADC_RATE_MISMATCH` deliberately do
+  **not**: they are true statements about a converter that is working, and refusing a dive at the
+  water for a cosmetic code trains a diver to override the gate. They block nothing and hide nothing
+  — they are printed at boot, in `/api/health`, and in the dive-log header.
 - `FATAL_NO_ADS1115` means: recorded at boot, arming refused, but bench/web/sim/config all work.
   **Mid-dive** dropout of either converter is a fatal alarm + `FAULT_LOCKOUT`.
 - Arm via **two-button physical sequence**, never from the web page. The OLED prints the second-
@@ -573,11 +613,14 @@ First ESP32 link result (`pio run -e esp32`, 2026-11-19): **SUCCESS**, Flash 457
 (VID:PID 10C4:EA60), chip `ESP32-D0WD-V3 (rev v3.0)`, MAC `c0:49:ef:ca:38:28` — matches
 `esp32doit-devkit-v1`. `pio run -e esp32 -t upload` verifies ("Hash of data verified"); RTS-based
 auto-reset works, so no BOOT button is needed, and serial capture via pyserial at 115200 works.
-App now 458,633 B flash (29.2%), 35,552 B RAM (10.8%). Both buses init at the documented pins
+App now ~463.8 KB flash (29.5%) and 35,600 B RAM (10.9%). Both buses init at the documented pins
 (`Wire` 21/22, `Wire1` 18/19 — **I2C1 is usable, the pin map stands**), and with nothing connected
 the boot report is honest: 0 devices on both buses, FATAL ADS1115_U1/U2, ERROR BARO/OLED/INA219,
 `[arm] REFUSED`, solenoid INFO. Bench commands over serial: `s` full sweep, `p` probe table +
-report, `r` raw probe codes (needs `BENCH_RAW_PROBE=1`), `c` 9-clock recovery + port re-init.
+report, `r` raw probe codes (needs `BENCH_RAW_PROBE=1`), `c` 9-clock recovery + port re-init,
+`a` ADS1115 self-test (ID register, config decode, write-verify, DRDY line, one timed conversion),
+`d` ADS1115 rate characterisation — measured conversion period for all eight RATE fields, which is
+what the coil/ADC interlock window and the per-cell sample rate are derived from, not the datasheet.
 Cosmetic only: IDF prints `esp_core_dump_flash: No core dump partition found!` twice per boot
 (there is no core dump partition by design); it is emitted before `setup()` runs, so
 `esp_log_level_set` in `setup()` cannot silence it.
@@ -604,13 +647,17 @@ bench procedure.
 
 ## 16. Test strategy
 
-**Current state (2026-11-19): `pio test -e native` is green — 58 cases across four suites;
-`pio run -e esp32` links **and is flashed and running on the devkit**. The first sensor wired in
-must be an ADS1115, so the probe's positive-ACK path (`err == 0`) can be observed: it has only been
-verified in the negative direction (NACK = 2) on a bare bus.**
+**Current state (2026-11-19): `pio test -e native` is green — 70 cases across five suites
+(`test_voting`, `test_gas`, `test_zhl`, `test_boot`, `test_adc`); `pio run -e esp32` links **and is
+flashed and running on the devkit** with one ADS1115 module and an SSD1306 actually attached. The
+positive-ACK caveat that M0 left open is closed: `I2C1: 1 device(s) [0x48]`, `I2C0: 1 device(s)
+[0x3C]`, and the corresponding faults clear while the missing ones stay raised. Reads and writes on
+the attached converter are verified, not assumed: `a` write-verifies a register and restores it, and
+`d` measures the conversion period field by field — which is how the register-map faults and the
+non-standard rate table in section 2 were found.**
 Layout note: PlatformIO only collects suites from `test/test_<name>/` folders (a bare `test/native/`
 group folder collects nothing), so the suites are `test/test_voting/`, `test/test_gas/`,
-`test/test_zhl/`, `test/test_boot/`. `test_build_src = no` in the `native` env: `src/` is ESP32-only by design and is
+`test/test_zhl/`, `test/test_boot/`, `test/test_adc/`. `test_build_src = no` in the `native` env: `src/` is ESP32-only by design and is
 not built on the host. `lib/core` is built natively and linked into every suite.
 
 Covered now: voting truth tables (agree, outlier, dead cell, two disagreeing -> lowest, three
@@ -628,7 +675,16 @@ tissue + GF-anchor round trip, plan convergence across a 12-profile spread; boot
 (default severities, escalation-only, hot-plug close keeps history, reprobe bumps attempts without
 duplicating, BMP085 range banner, absent solenoid is INFO and must **not** block arming, summary
 line clips to whole codes with a `+...` marker and never writes past its buffer, capacity
-exhaustion keeps the earliest faults).
+exhaustion keeps the earliest faults, **the fault tables walked in full** (every enumerator must have
+a name and a non-INFO default severity, so a code added to the enum and forgotten in a `switch` fails
+immediately — it caught a real omission the day it was written), wrong-ADC-part and bad-conversion
+block arming while a bare unknown-ID warning must **not**, and an unlisted FATAL still blocks.
+`test_adc`: config-register field masks tile 0xFFFF exactly once and the rate field sits below PGA;
+the measured power-on word 0x8583 decodes as single-shot / PGA gain 2 / 8 SPS; the design config
+selects gain 16 + 32 SPS + explicit single-shot; the PGA gain/FSR/LSB tables (7.8125 uV at gain 16);
+9 mV and 13 mV air signals as code counts, with clamping at full scale; conversion periods; mux
+power-down encodings excluded; ADS1115 vs ADS1015 separated 100x by the same rate field; and the
+bench module's measured rate table recorded as *not* the datasheet's).
 
 - `pio test -e native` covers `lib/core/` **and** `lib/sim/` — the same physics models run on the
   host with no hardware. (They live under `lib/`, not `src/core`, so they build natively; `src/` is
@@ -648,7 +704,7 @@ exhaustion keeps the earliest faults).
 | # | Deliverable | Gate | Status (2026-11-19) |
 |---|---|---|---|
 | M0 | installer, build, flash, I2C scan, boot report | `pio run -t upload` works on this Mac | **DONE** — flashed and verified on the devkit (CP2102, ESP32-D0WD-V3): "Hash of data verified", clean boot banner, boot report correct on an empty bench, `[arm] REFUSED`. Section 15 holds the evidence. |
-| M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **boot + bench half verified on hardware**: boots with zero sensors, reports every miss, hot re-probe + bus retry + serial bench commands work (11 native cases). `lib/sim` and the ADS1115 driver not written |
+| M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **boot + bench half verified on hardware, and now verified against a fitted converter**: boots clean, reports every miss, hot re-probe + bus retry + serial bench commands (`s p r c a d`) work; the ADS1115 register layer is written, its reads/writes are write-verified on hardware, and its part identity and rate table are measured, not assumed (9 native cases in `test_adc`, 14 in `test_boot`). Still open at M1: the alternating-mux 16 SPS/cell scheduler (needs cell 2 on AIN2/3), `lib/sim`, and the *measured* rate table applied to the sample-rate design (open item 13). |
 | M2 | air cal + voting + diluent-flush check + alarms | native voting tests pass | voting + diluent-flush + cal sigma gate done natively; on-device wiring not started |
 | M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds 0x3E/0x3B (datasheet 8-bit 0x7C/0x77 corrected) and raises `BARO_RANGE_9M` when only the BMP085 answers; drivers not written |
 | M4 | ZHL-16C 3-gas + GF + ICD + CNS + MOD/END/density | validated natively **before** hardware depends on it | **engine complete and regression-anchored natively** (47 cases); *not* validated against a trusted computer yet — risk 13 |
@@ -707,6 +763,10 @@ Re-open only with the user's explicit agreement.
 | 24 | **The GF-low anchor (`gfLowPressure`) is persisted and restored with the tissue compartments** | It is dive state, not derived state. Tests showed restoring tissues without it re-bases the GF ramp and reports a zero ceiling after a power loss — section 19 risk 8 in a new disguise. |
 | 25 | **I2C presence = address phase of a zero-length write with STOP** (`beginTransmission(a); endTransmission(true)`; `err==0` present, `2` absent). `endTransmission(false)` with no payload, `write(0x00)`-style probes and `requestFrom` probes are all banned. | Measured on the devkit 2026-11-19, Arduino core 4.0.0 / IDF 5.5 driver: the repeated-start form returned **0 at every address** on a bare bus, so the boot report claimed 16 devices per bus and "ALL SENSORS OK" with nothing connected — a silent all-clear on a life-support device. A payload makes the driver wait for a data-phase ACK (error 4 when absent) and **writes** to a present device: 0x00 clears the INA219 calibration register and reprograms the ADS1115 config register. `requestFrom` cannot prove absence (the SSD1306 is write-only) and spams the console. The chosen form is what the driver routes to `i2c_master_probe()`: truthful and non-destructive. |
 | 26 | **Never touch an I2C pin with `pinMode`/`digitalWrite` while its Wire port is initialised**; stuck-SDA detection runs only before `begin()` or after `end()`, and boot probing is bounded to the fitted address table (full sweep = explicit bench command). | Measured: in core 4.x `pinMode` on a driver-claimed pin goes through periman, which **detaches and deinits that bus** — `i2cIsInit()` drops to 0 and every later transaction answers "bus is not initialized". A stuck-line check inside a scan therefore destroyed the bus it was checking. Bounded probing exists because a 112-address sweep on a dead port emitted ~200 driver error lines and buried the boot banner. |
+| 27 | **Hand-rolled ADS1115 driver** (`src/sensors/Ads1115Bus.{h,cpp}`) instead of Adafruit ADS1X15, which stays in `lib_deps` unused for now. | The design needs alternating single-shot conversions with the mux re-written between them, explicit knowledge of when a converter is integrating (for the coil interlock), and register-level checks that distinguish a working part from one that merely ACKs. A continuous-mode Arduino driver does none of those. Also removes the BusIO/SPI dependency from the sensor path. |
+| 28 | **The register map, PGA/RATE tables and cell scaling live in `lib/core/src/AdcRegs.h`** (pure C++), not in the ESP32 driver. | They were wrong twice — the rate field position and the MODE bit polarity — and constants that exist only in `src/` cannot be reached by `pio test -e native`. Moving them is what makes them assertable; `test/test_adc/` now pins them against the word measured on the bench module. |
+| 29 | **Converter identity and sample rate are established by measurement** (one timed single-shot conversion at the design field, plus bench command `d` for the whole rate table), **not by the ID register and not by the datasheet.** | The ID register cannot do the job: the bench module answers 0x00 there, at the pointer register too, while its config register behaves exactly as documented. Timing can: an ADS1015 differs 100x at the same rate field. And the datasheet's timing turned out not to describe the fitted part (62 ms where 31.25 ms is promised), so the interlock window and per-cell rate are derived from measurement — decisions 29 and risk 16 are the same fact seen from the code side and the parts side. |
+| 30 | **Arming refuses on any active FATAL, independently of the `blocksArming()` code table.** | Section 13 says "no unresolved FATAL", and the table contradicted it: `RAIL_3V3_LOW` is FATAL and was not listed, so a 3.3 V brown-out rail did not block arming. OLED, `I2C_BUS_STUCK` and `EXTERNAL_WATCHDOG` were also missing despite section 13 requiring them. The table stays for the ERROR-and-above cases; the FATAL rule is the safety net that a new code cannot fall through. |
 
 ---
 
@@ -750,6 +810,22 @@ Re-open only with the user's explicit agreement.
     18/19/21/22 while the driver is up silently kills every sensor read on that bus — in a CCR that
     means ppO2 and depth both stop. Any bus-recovery path must `end()` the port first and re-init
     after. See decision 26.
+16. **The fitted ADS1115 module is not a genuine ADS1115.** It ACKs, its config register reads and
+    writes correctly and it converts, but the ID and pointer registers answer 0x00 (the pointer does
+    not track writes) and the RATE field implements only four rates via bits 6:5 — 8/16/32/64 SPS
+    measured, where the datasheet promises eight up to 860. Consequences are load-bearing: the design
+    field for 32 SPS yields 16.1 SPS (so 8 SPS per cell, not 16), and the coil/ADC interlock window is
+    62 ms, not 31 ms. Two rules follow. Never size a timing window from the datasheet when a measured
+    value is available (`d` produces it at any time), and treat **sourcing known-genuine TI parts as a
+    safety action**, not a preference: a die whose register map differs from its markings has no
+    characterised noise, timing or power-on behaviour, and this device is primary life support.
+17. **A fault code that is not in a `switch` silently becomes INFO/"UNKNOWN" and stops blocking
+    anything.** Every table in `FaultCode.h` has a `default`, so adding an enumerator without adding
+    it to `defaultSeverity`, `blocksArming` and `faultName` produces a fault that reaches the fault
+    banner as a blank, unclassified line. This happened for real the day the tables-walk test was
+    written. The test enumerates the whole code range against an explicit gap list, so adding a code
+    forces the tables to be updated; keep that gap list current when adding codes, and prefer making
+    the *severity* carry the gate (risk 17 + decision 30) over adding special cases.
 
 ---
 
@@ -769,6 +845,8 @@ Re-open only with the user's explicit agreement.
 | 10 | Second independent computer + hand board selection | Required by section 13, not yet chosen. |
 | 11 | MS5837 mounting (Bar30 M10 bulkhead) and its drying discipline in the maintenance schedule | Part suggested, procedure written, not yet validated. |
 | 12 | **GPIO 33 is assigned to both the vibration motor and the Page button** (section 3) | Found while writing `src/config/Pins.h`. `BTN_PAGE` is left **unassigned (-1)** in code rather than silently sharing a pin with the motor. Needs a free pin chosen (candidates: 35 input-only if it is not used as a button, or move the motor). |
+| 13 | **The fitted ADS1115 module's rate table is not the datasheet's** (risk 16): 4 rates not 8, and the design's 32 SPS field gives 16.1 SPS | Two ways out, and the choice is the user's: (a) source known-genuine TI ADS1115 modules and re-run `d` to confirm, or (b) accept this part and re-derive the per-cell sample rate and control-loop timing from the measured table. (a) is preferred for a primary dive computer; (b) is viable but leaves an uncharacterised die in the ppO2 path. Firmware is written for measurement-driven timing either way. |
+| 14 | **DRDY is wired to GPIO 23 but the line has only ever been read pulled-up and idle** | The driver currently polls the OS bit over I2C (348 us/poll measured). DRDY would cut that to an interrupt and make the coil/ADC interlock exact rather than polled. Needs the module's DRDY actually connected and the polarity/behavior measured (open-drain, needs a pull-up) before the scheduler can depend on it. |
 
 ---
 
@@ -853,3 +931,48 @@ Re-open only with the user's explicit agreement.
 
 
 
+- 2026-11-19 (ADC on hardware): **the first converter is fitted and believed only as far as it was
+  measured.** One ADS1115 module on I2C1 at 0x48 and one SSD1306 on I2C0 at 0x3C. M0's open caveat is
+  closed — `I2C1: 1 device(s) [0x48]`, `I2C0: 1 device(s) [0x3C]`, those faults clear, `ADS1115_U2`
+  stays FATAL, `[arm] REFUSED` stays correct. Written: `src/sensors/Ads1115Bus.{h,cpp}` (hand-rolled
+  register driver — decision 27), `lib/core/src/AdcRegs.h` (register map + PGA/RATE tables + cell
+  scaling, moved where native tests can reach it — decision 28), new suite `test/test_adc/` (9 cases).
+  **`pio test -e native` is 70 green**; app 463,801 B flash (29.5%), 35,600 B RAM (10.9%). Bench
+  commands `a` (converter self-test) and `d` (rate characterisation) added.
+  Faults found by running it — the same "plausible-looking" class as risk 13, now twice outside the
+  deco engine:
+  1. **the RATE field was masked from bits 10:8**, overlapping PGA. A write that looked like 32 SPS
+     set something else, and the config readback decoded as an ordinary-looking rate. Fixed to 6:4;
+     the anchor is the measured power-on word `cfg=0x8583`, which only decodes as the datasheet's
+     documented default (single-shot, PGA gain 2, 8 SPS) with the rate in 6:4.
+  2. **MODE polarity was inverted**: bit 8 = **1 is single-shot**, 0 is continuous. Leaving it clear
+     put the part in continuous mode, which is exactly why the first conversion test reported "OS bit
+     stuck at 0" — and continuous mode locks the mux, so the two-pairs-per-converter scheme of §2
+     would have been impossible. MODE is now always written explicitly.
+  3. **the OLED raised `OLED 0x3D err 2` while a display was answering at 0x3C** — two addresses, one
+     device, and the un-answered strap permanently blocked arming against working hardware. Fixed the
+     way BARO was already handled.
+  4. **an arming hole, not an ADC bug**: `RAIL_3V3_LOW` is FATAL and was *not* in `blocksArming()`,
+     so the 3.3 V brown-out rail did not refuse an arm. §13 says "no unresolved FATAL", so the gate
+     now refuses on any active FATAL regardless of the table (decision 30); OLED, `I2C_BUS_STUCK` and
+     `EXTERNAL_WATCHDOG` were also missing and are listed. `test/test_boot/` grew a test that walks
+     the **whole enum range** against an explicit gap list — it caught a missing `faultName` entry the
+     day it was written (risk 17).
+  **Hardware measurement recorded** (§2, risk 16, open item 13): the fitted module is **not a genuine
+  ADS1115**. It ACKs, its config register reads and writes correctly, and it converts — but the ID
+  register answers 0x00, the pointer register answers 0x00 and does not track writes, and `d` measured
+  the RATE fields at **8.1/8.1/16.1/16.1/31.9/31.9/63.7/63.7 SPS** where the datasheet says
+  8/16/32/64/128/250/475/860: only four rates, selected by bits 6:5, bit 4 ignored, 860 SPS
+  unreachable. So the design's 32 SPS field delivers **16.1 SPS** (8 SPS per cell, not 16) and the
+  coil/ADC interlock window is **62 ms, not 31 ms** (§8). Part identity is therefore established by
+  *measured conversion period*, never by the ID register and never by the datasheet (decision 29) —
+  an ADS1015 shares the address, the register map and every field position, and differs 100x in rate.
+  Four codes carry this: `ADC_PART_WRONG` and `ADC_CONV_BAD` block arming; `ADC_ID_UNKNOWN` and
+  `ADC_RATE_MISMATCH` are WARN and deliberately do **not** (§13) — the fitted unit raises both, and
+  refusing a dive at the water for a cosmetic code trains a diver to override the gate. Current bench
+  banner: `F:1 E:2 W:2 ADS1115_U2 BARO INA219 ADC_ID_UNKNOWN ADC_RATE_MISMATCH`, detail
+  `0x48 62mS DS31mS 98%`. Also measured: config-read granularity 348-352 us/poll (why the scheduler
+  should use DRDY, open item 14), and core version confirmed **Arduino 4.0.0 / IDF 5.5** from
+  `esp_arduino_version.h`, with `esp32-hal-i2c-ng.c` read to source-confirm decision 25 (a
+  zero-length `i2cWrite()` takes the `i2c_master_probe()` branch; any payload takes
+  `i2c_master_transmit()` *and* caches a per-address device handle).

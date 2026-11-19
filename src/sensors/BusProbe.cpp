@@ -41,7 +41,9 @@ bool recoverBus(TwoWire&, int sdaPin, int sclPin) {
 
 ProbeResult probeAddress(TwoWire& wire, uint8_t address) {
     ProbeResult r;
-    // Measured on a bare devkit on 2026-11-19. Four transaction shapes, and only one is usable:
+    // Measured on a bare devkit on 2026-11-19, Arduino core 4.0.0 / IDF 5.5 (the version matters:
+    // core 4.x uses the new esp32-hal-i2c-ng driver, whose probe and periman semantics differ from
+    // the legacy driver's). Four transaction shapes, and only one is usable:
     //
     //   beginTransmission(a); endTransmission(false)   -> **0 at every address**, with nothing
     //       connected. The repeated-start form never completes the address phase in the IDF-5
@@ -61,8 +63,11 @@ ProbeResult probeAddress(TwoWire& wire, uint8_t address) {
     //       absence, and it spams the console. Not used.
     //
     // So: no payload, STOP condition, and `err == 0` means a device acknowledged its address.
-    // Positive ACK has still not been observed on this hardware (no sensors fitted yet); the
-    // first wired ADS1115 must show err=0 here before anything else about it is trusted.
+    // Source-confirmed in esp32-hal-i2c-ng.c: a zero-length i2cWrite() takes the
+    // `i2c_master_probe()` branch (address phase only, writes nothing); any payload takes
+    // `i2c_master_transmit()` **and** caches a per-address device handle, so a probing write also
+    // leaves state behind. Addresses >=128 are rejected outright.
+    // Positive ACK was confirmed on 2026-11-19 with the first ADS1115 module on I2C1 at 0x48.
     wire.beginTransmission(address);
     r.err = wire.endTransmission(true);
     r.ok = (r.err == 0);
