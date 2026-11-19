@@ -844,8 +844,10 @@ Re-open only with the user's explicit agreement.
   toolchain versions to reinstall, board identity and the working serial-capture recipe, the measured
   I2C probe/periman semantics table, expected empty-bench boot output, the resume point (wire one
   ADS1115 to I2C1 first, so a positive ACK is finally observed), and which files hold load-bearing
-  state. It also flags that this tree is **not a git repo**, so it is the only copy — commit or copy
-  before switching machines.
+  state. The tree is now a git repo pushed to `git@github.com:ReLiCRSA/espRebreatherController.git`
+  (branch `master`, initial commit `1f12e13`); `.pio/` is ignored. A fresh clone will not contain the
+  planned-but-empty directories from §14 (`docs/`, `data/display/`, `src/dive/`, `src/ui/`,
+  `src/web/`) — git does not track empty directories; they appear when the next file is written.
 
 
 

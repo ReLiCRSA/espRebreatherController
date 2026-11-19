@@ -17,9 +17,18 @@ empty bench, hot re-probe every 5 s, serial bench commands. **M0 is DONE. M1 is 
 bench verified on hardware; `lib/sim` and the ADS1115 driver not written). Nothing is wired yet —
 the devkit is bare, and the probe has only ever seen *negative* ACK (NACK = 2).
 
-**Transfer caveat:** `/Users/wvanghent/esp32` is **not a git repo**, so this directory is the only
-copy. If the other machine is to be the working copy, either copy the whole tree (including `.pio/`
-if you want the build cache) or, better, `git init && git add -A && git commit` here first.
+**Transfer: the tree is now a git repo, pushed to GitHub.** Clone on the new machine rather than
+copying the directory:
+
+```
+git clone git@github.com:ReLiCRSA/espRebreatherController.git    # or the https form
+cd espRebreatherController
+```
+
+`.pio/` is gitignored (build cache, ~72 MB) — the new machine rebuilds it on first `pio run`. The
+initial commit is `1f12e13`, branch `master`, and it contains exactly the state described in this
+file: 28 files, 4,379 insertions. Nothing else is on the remote; if `git status` is not clean on
+this machine, uncommitted work exists only here.
 
 ---
 
