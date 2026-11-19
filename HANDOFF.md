@@ -250,7 +250,7 @@ behaviour on pads with nothing wired. Measured on this board 2026-11-19:
 | GPIO 24, 28–31 | **do not exist on the ESP32-D0WD-V3 die**: periman answers `Invalid pin`. `g` does not even ask, because the table knows |
 | GPIO 20, 37, 38 | real die pads that **WROOM-32 does not bond out** — a different reason, kept separate in the table (`kDieOnly`) |
 | GPIO 6–11 | inside the module's SPI flash path |
-| Spare budget | after the map, **exactly one spare output-capable pad: GPIO 17** (asserted as a number in the test, so freeing a pin forces the §3 budget to be re-derived) |
+| Spare budget | after the map, **exactly one spare output-capable pad: GPIO 17** (asserted as a number in the test, so freeing a pin forces the §3 budget to be re-derived). `g` also lists 34–36 and 39 as "spare (input-only)" — reachable, but they cannot drive anything, which is the trap the test closes |
 
 Two consequences worth remembering: **an output role on 34–39 fails silently** (the haptic alarm simply
 never fires — now a test failure), and **the core's default SPI pins are 18/19/23**, which collide with
@@ -317,8 +317,9 @@ bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (dest
 
   `err 5` is **timeout**, not `err 2` (NACK): the bus was being held rather than the address being
   unanswered. `c` did not free it, and the next boot was healthy with nothing touched — a flaky
-  jumper. Action before any further timing work: re-seat and positively secure the module's
-  VDD/GND/SDA/SCL jumpers (or solder / pin-lock them).
+  jumper. It has since come back and gone by itself again, so it is **intermittent**, which is worse
+  than a dead connection: it will not reproduce on demand. Action before any further timing work:
+  re-seat and positively secure the module's VDD/GND/SDA/SCL jumpers (or solder / pin-lock them).
 
 ## 7. Resume point — the next steps, in order
 
