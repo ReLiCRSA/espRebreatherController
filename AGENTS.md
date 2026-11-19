@@ -912,7 +912,7 @@ Re-open only with the user's explicit agreement.
 | 13 | **The fitted ADS1115 module's rate table is not the datasheet's** (risk 16): 4 rates not 8, and the design's 32 SPS field gives 16.1 SPS | **DECIDED 2026-11-19** (decision 31): option (a) — source known-genuine TI ADS1115s; the fitted module stays on the bench for timing work only. Outstanding action, not an open question: order the parts, then re-run `d` (must measure 8/16/32/64/128/250/475/860 SPS) and `a` (must read ID 0x85) and confirm `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` clear by themselves. Until then every timing figure in the firmware is derived from the measured table, so both parts work and neither is trusted from its label. |
 | 14 | **DRDY is wired to GPIO 23 but the line has only ever been read pulled-up and idle** | The driver currently polls the OS bit over I2C (348 us/poll measured). DRDY would cut that to an interrupt and make the coil/ADC interlock exact rather than polled. Needs the module's DRDY actually connected and the polarity/behavior measured (open-drain, needs a pull-up) before the scheduler can depend on it. |
 | 15 | **Display panel vs the pin budget** (new, from closing item 12): a SPI panel needs four pads (SCK/MOSI/DC/CS) and after the current map **only GPIO 17 is spare and output-capable** | The core's own SPI defaults (18/19/23) collide with I2C1 and ADS_U1_DRDY, so a panel cannot simply take `SPI.begin()` defaults. Options, none free: free the two DRDY pads by polling the OS bit instead (costs 348 us/poll and an exact interlock, item 14), take strapping pins against the §3 policy, or keep the panel on I2C and accept the frame-time cost (§12 says a >128x64 panel must not go on I2C). Must be argued with item 6 when the panel is chosen — not during bring-up at the water. |
-| 16 | **The ADS1115 module intermittently stopped answering on I2C1** (seen 2026-11-19, more than once: `SDA held low before init`, probes returning **err 5 = timeout**, nine clocks + port re-init did not free it; healthy again at later boots with nothing changed) | Reported honestly by the boot report each time, which is the correct behaviour, but a flaky I2C1 connection on a CCR is a maintenance finding, not a firmware bug — and **intermittent is worse than dead**: it will not reproduce on demand, and a converter that drops out mid-dive is a `FAULT_LOCKOUT` by design. Action: re-seat and then positively secure the module's VDD/GND/SDA/SCL jumpers (or solder/pin-lock them) before any further timing work. |
+| 16 | **The ADS1115 module stopped answering on I2C1** (`SDA held low before init`, probes returning **err 5 = timeout**, nine clocks + port re-init did not free it) | **CLOSED 2026-11-19 — not a fault.** The user confirms the dropouts were **their own intervention on the bench** (the module being unplugged/re-fitted), not a flaky connection. Nothing to fix and no maintenance action. What the episode is kept for is the diagnostic it produced: `err 5` (bus being held) vs `err 2` (address unanswered) are different hardware stories, and **a converter that has lost its supply clamps SDA/SCL through its protection diodes** — that is exactly what a disconnected or unpowered module looks like, and exactly what a converter failing mid-dive will look like in the log. Securing jumpers for the dive build stays good practice (§20 item 9, enclosure/connector work), but it is not a corrective action for anything seen so far. |
 
 ---
 
@@ -1069,13 +1069,28 @@ Re-open only with the user's explicit agreement.
      together, in advance.
   Also read out of `Wire.cpp` rather than guessed, and recorded in `BusProbe.cpp`: probe return codes
   **2 = NACK on address (nothing there)** vs **5 = timeout (the bus is being held)**. The difference
-  earned its keep the same day — the ADS1115 module once booted with `I2C1 SDA held low`, both
-  converters `err 5`, `I2C_BUS_STUCK` raised, nine clocks and a port re-init not freeing it, and it
-  was normal again at the next boot: a flaky jumper, truthfully reported (open item 16, a maintenance
-  action, not a firmware bug). `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` and the 62 ms conversion period
+  earned its keep the same day — the ADS1115 module booted once with `I2C1 SDA held low`, both
+  converters `err 5`, `I2C_BUS_STUCK` raised, nine clocks and a port re-init not freeing it. The boot
+  report was truthful and the probe codes were read correctly; the conclusion drawn from them was
+  wrong (item 16 — bench intervention, not a flaky jumper, closed in the entry below).
+  `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` and the 62 ms conversion period
   reproduced unchanged on the module after it came back (`0x48 61mS DS31mS 98%`).
   App now 466,973 B flash (29.7%), 35,600 B RAM (10.9%); flashed and running. §2/§3/§14/§15/§16
   updated, decisions 31–33, risk 18, open items 12/13 closed with their resolutions and 15/16 added.
   Verified afterwards on the board: the converter answered again at the next boot (`0x48`, ID `0x00`,
   `61979 us` at the 32 SPS field, `98% off` — the clone's behaviour unchanged) and `g` reproduced the
-  whole pad table, so the item-16 dropout is **intermittent**, which is recorded against it.
+  whole pad table.
+
+- 2026-11-19 (correction, logged because the wrong inference is the lesson): **open item 16 was a
+  misdiagnosis and is closed as not-a-fault.** I read the `err 5` / `SDA held low` episodes as an
+  intermittent jumper and wrote up a maintenance action ("re-seat and secure the jumpers"). The user
+  confirms the dropouts were **their own intervention** — the module being unplugged and re-fitted
+  while working on the bench. Nothing is wrong with that hardware and there is nothing to fix.
+  The same class of defect as risk 13, in a new place: **an inference that fits the evidence is not a
+  finding.** The boot report was right, the probe codes were read right, and the conclusion was still
+  wrong because the one variable that mattered — a hand on the bench — was never in the record. What
+  the episode is kept for is the diagnostic that is real: `err 5` (bus being held) vs `err 2` (address
+  unanswered) is a genuine distinction, and an unpowered device clamping the bus through its
+  protection diodes is what a disconnected module looks like — and what a converter failing mid-dive
+  will look like in a dive log. Going forward: when a fault report could be caused by operator action,
+  say so in the report rather than assigning a defect.

@@ -150,8 +150,12 @@ leaves state behind. Addresses >= 128 are rejected outright.
 2026-11-19 the ADS1115 module booted once with `I2C1 SDA held low before init`, both converters
 reporting `err 5`, `I2C_BUS_STUCK` raised, and nine clocks + a port re-init not freeing it — that is a
 line being held (most often a device that lost its supply and is clamping SDA/SCL through its
-protection diodes), and it looked completely different from an absent device. It was healthy at the
-next boot without anyone touching anything: a flaky jumper (AGENTS.md §20 open item 16).
+protection diodes), and it looked completely different from an absent device. **The episode turned out
+to be the user unplugging and re-fitting the module — bench intervention, not a fault** (AGENTS.md §20
+item 16, closed). Keep the `2`-vs-`5` reading anyway: it is the difference between "nothing at that
+address" and "something there is holding the bus", and an unpowered or unplugged device clamping
+SDA/SCL through its diodes is exactly what a converter failing mid-dive will look like in the log.
+Just do not diagnose a defect from it without knowing what happened at the bench.
 
 The positive direction is **no longer a caveat**: `0x48` (ADS1115 module) and `0x3C` (SSD1306) both
 ACK, `I2C1: 1 device(s) [0x48]`, `I2C0: 1 device(s) [0x3C]`, and the matching faults clear while the
@@ -303,9 +307,10 @@ bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (dest
   on pads with nothing wired — the source of every claim in §5d).
   `a` and `d` write the config register, so they are bench actions, not something the dive loop runs.
 
-- **The one non-healthy boot seen so far**, recorded because the fault detail is what made it
-  diagnosable and because it is a maintenance finding, not a firmware bug (AGENTS.md §20 open
-  item 16). The ADS1115 module once came up like this:
+- **A non-healthy boot, for reference** — the module had been **removed from the bench by hand**, which
+  is what the user confirms happened. It is recorded because it is the one time the fault report was
+  exercised against a real converter-sized problem, and because the reading in its detail is the
+  useful part. What the boot looked like:
 
 ```
 [i2c] I2C1 SDA held low before init — 9-clock recovery
@@ -315,11 +320,12 @@ bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (dest
 [boot] F:2 E:2 W:0 ADS1115_U1 ADS1115_U2 BARO INA219
 ```
 
-  `err 5` is **timeout**, not `err 2` (NACK): the bus was being held rather than the address being
-  unanswered. `c` did not free it, and the next boot was healthy with nothing touched — a flaky
-  jumper. It has since come back and gone by itself again, so it is **intermittent**, which is worse
-  than a dead connection: it will not reproduce on demand. Action before any further timing work:
-  re-seat and positively secure the module's VDD/GND/SDA/SCL jumpers (or solder / pin-lock them).
+  `err 5` is **timeout**, not `err 2` (NACK): the bus was being held, not the address unanswered — an
+  unpowered device clamping SDA/SCL through its protection diodes. `c` did not free it, which is also
+  what a physically absent module looks like. **Not a hardware fault**: an earlier version of this file
+  called it a flaky jumper and asked for re-seating; that was a wrong inference, and AGENTS.md §20
+  item 16 is closed with the correction. Treat this block as "what a converter that has gone missing
+  looks like", useful for recognising the same signature mid-dive, and do not chase it.
 
 ## 7. Resume point — the next steps, in order
 
@@ -330,7 +336,6 @@ bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (dest
    derived from the measured table, so both parts work and neither is trusted from its label. The sample
    rate decides the control-loop deadband and the coil/ADC interlock window, so **do not write the
    scheduler around 32 SPS as though it were real.**
-   Alongside that: re-seat and secure the I2C1 jumpers (§6, open item 16) before any more timing work.
 2. **`lib/sim`**: `SimBaro`, `SimCells`, `LoopModel`, `FaultInjector`, `ProfileRunner` — pure C++ in
    `lib/` so `pio test -e native` covers it, implementing the same `Barometer`/`CellArray` source
    interfaces as the real drivers (AGENTS.md §11: simulate at the sensor layer, closed loop against
@@ -384,8 +389,8 @@ mistake).
   I2C1 and `ADS_U1_DRDY`. Argue this with the panel choice (item 6) before buying anything — the
   options are freeing the DRDY pads (item 14's other side), taking a strapping pin against the §3
   policy, or keeping the panel on I2C and accepting the frame-time cost.
-- **Open item 16** (new): the ADS1115 module intermittently held I2C1 low (§6). Maintenance action:
-  re-seat and secure those jumpers before further timing work.
+- **Open item 16 is closed** (§6): the `err 5` / `SDA held low` boot was the module being unplugged by
+  hand, not a fault. No action. The `2`-vs-`5` reading is still worth knowing.
 - **Open item 12 is closed** (decision 32): 33 = Page button, motor on 16, `test/test_pins/` asserts
   the class of defect is gone.
 - Everything else in AGENTS.md §20 (valve choice, pulse volumes, metabolic rate, display panel,
@@ -408,3 +413,8 @@ mistake).
   override the gate. Say it out loud, log it, and only block on things that truly break trust.
 - Pure C++ goes in `lib/` (host-buildable); anything touching a pin, peripheral or socket goes in
   `src/` and is not compiled natively.
+- **Record what happened at the bench alongside what the board reported.** A fault code cannot tell
+  "the user unplugged this" from "this failed on its own", and the firmware should not have to guess.
+  When you write up an anomaly, say which parts are measured and which are inference — this session
+  mislabelled a hand-unplugged module as an intermittent connection, and the correction cost a second
+  pass over three documents.

@@ -65,10 +65,12 @@ ProbeResult probeAddress(TwoWire& wire, uint8_t address) {
     //   there) · 3 NACK on data · 4 other failure · **5 timeout**.
     // The 2-vs-5 difference is worth reading in the fault detail, because they are different
     // hardware stories: 2 says the address was not acknowledged, 5 says the bus could not even
-    // complete a transaction. Measured 2026-11-19 when the ADS1115 module came off the bench:
-    // `0x48 err 5` with "I2C1 SDA held low before init" — a line being held, most often an unpowered
-    // device clamping SDA/SCL through its protection diodes, not an absent device. Nine clocks plus a
-    // re-init did not free it, which is also what a physically disconnected module looks like.
+    // complete a transaction. Measured 2026-11-19 with the ADS1115 module off the bench: `0x48 err 5`
+    // with "I2C1 SDA held low before init" — a line being held, most often an unpowered device
+    // clamping SDA/SCL through its protection diodes, not an absent device. Nine clocks plus a
+    // re-init did not free it, which is what any disconnected or unpowered module looks like. (That
+    // particular episode was the module being unplugged by hand, not a fault — do not diagnose a
+    // defect from err 5 without knowing what happened at the bench.)
     //
     // So: no payload, STOP condition, and `err == 0` means a device acknowledged its address.
     // Source-confirmed in esp32-hal-i2c-ng.c: a zero-length i2cWrite() takes the
