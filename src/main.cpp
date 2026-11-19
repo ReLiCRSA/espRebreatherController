@@ -17,6 +17,9 @@
 #include <Arduino.h>
 #include <esp_log.h>
 #include <Wire.h>
+// perimanGetPinBusType(): which peripheral the core has routed to a pad. This is the observable
+// behind decision 26 — the reason a stuck-line check or a re-purposed pin can silently deinit a bus.
+#include <esp32-hal-periman.h>
 
 // src/ is on the include path via `-Isrc`, so headers are addressed project-relative.
 #include "config/Features.h"
@@ -306,6 +309,143 @@ bool initBus(BusState& b) {
     return ok;
 }
 
+// Which peripheral the Arduino core thinks it has routed to a pad. This is the thing that makes
+// decision 26 measurable: pinMode() on a pad a live Wire port owns detaches that port, so before
+// anyone bit-bangs or re-purposes a pin, this is the question to ask. Values are compared to the
+// enum names, never to numbers — the enum is compiled conditionally per SoC and its numbering is
+// not stable across cores.
+const char* padOwner(int p) {
+    switch (perimanGetPinBusType(p)) {
+        case ESP32_BUS_TYPE_INIT:          return "free";
+        case ESP32_BUS_TYPE_GPIO:          return "GPIO";
+        case ESP32_BUS_TYPE_UART_RX:       return "UART-RX";
+        case ESP32_BUS_TYPE_UART_TX:       return "UART-TX";
+        case ESP32_BUS_TYPE_UART_CTS:      return "UART-CTS";
+        case ESP32_BUS_TYPE_UART_RTS:      return "UART-RTS";
+        case ESP32_BUS_TYPE_I2C_MASTER_SDA: return "I2C-SDA";
+        case ESP32_BUS_TYPE_I2C_MASTER_SCL: return "I2C-SCL";
+        case ESP32_BUS_TYPE_ADC_ONESHOT:   return "ADC";
+        case ESP32_BUS_TYPE_LEDC:          return "LEDC";
+        case ESP32_BUS_TYPE_TOUCH:         return "TOUCH";
+        default:                           return "other";
+    }
+}
+
+bool padOwnedByLiveBus(int p) {
+    const int t = perimanGetPinBusType(p);
+    return t == ESP32_BUS_TYPE_I2C_MASTER_SDA || t == ESP32_BUS_TYPE_I2C_MASTER_SCL ||
+           t == ESP32_BUS_TYPE_I2C_SLAVE_SDA || t == ESP32_BUS_TYPE_I2C_SLAVE_SCL;
+}
+
+// Bench command 'g': the pad table, plus the two things the table cannot answer by itself — what the
+// core has actually claimed, and whether a pad's internal pulls and output path work on this die.
+// The table in lib/core/src/PinMap.h is asserted natively, but it is still a claim about a module;
+// this is the measurement next to it.
+//
+// Safety, in order of how badly getting it wrong hurts:
+//  - never touch a pad the console owns (GPIO1/3 here): that silences the report printing it, and
+//    on a dive computer a lost console during bring-up costs the diagnosis;
+//  - never touch a pad a live Wire port owns (decision 26 / risk 15) — pinMode() would deinit I2C
+//    and every sensor read would stop, which is the exact failure this command exists to prevent;
+//  - never drive a pad that has a load on it. The probe list below is only pads with nothing wired
+//    on this bench; the solenoid, buzzer and watchdog heartbeat are excluded by name.
+// What is proven here is reachability and switching. Drive strength into a real load is a meter
+// measurement at the header, and this command says so rather than implying otherwise.
+void gpioMapReport() {
+    Serial.println(F("[gpio] pad map for ESP32-WROOM-32 (caps = PinMap.h claim, owner = core periman)"));
+    for (int p = 0; p < pins::kGpioCount; ++p) {
+        const uint32_t c = pins::caps(p);
+        char cap[8] = "------";
+        cap[0] = (c & pins::kBonded)  ? 'b' : '-';
+        cap[1] = (c & pins::kOutput)  ? 'o' : '-';
+        cap[2] = (c & pins::kInput)   ? 'i' : '-';
+        cap[3] = (c & pins::kPull)    ? 'p' : '-';
+        cap[4] = (c & pins::kAdc1) ? '1' : ((c & pins::kAdc2) ? '2' : '-');
+        cap[5] = (c & pins::kStrap) ? 'S' : ((c & pins::kConsole) ? 'U' : '-');
+        // Assigned pads show their role; unclaimed pads show why they are unusable, or "spare".
+        const pins::Assignment* a = pins::findAssignment(p);
+        const char* note = a ? a->role : pins::unusableReason(p);
+        if (!note) note = pins::outputCapable(p) ? "spare" : "spare (input-only)";
+        // Asking the core who owns a pad that does not exist emits a driver ERROR line per pad
+        // (measured: "Invalid pin: 24"), which is the console-spam failure mode decision 26 exists to
+        // avoid. The capability table already knows, so ask it instead.
+        const char* owner = (pins::noSuchPad(p) || pins::dieOnlyPad(p)) ? "n/a" : padOwner(p);
+        Serial.printf("  %2d  [%s] %-9s %s%s\n", p, cap, owner, note,
+                      p == pins::SPARE_OUT ? " — declared spare (SPI panel clock)" : "");
+    }
+
+    // Pads with nothing wired on this bench, plus 34/35 to confirm the input-only claim instead of
+    // trusting it. Add to this list only after checking what is actually connected.
+    static const int kProbe[] = {16, 17, 32, 33, 34, 35};
+    Serial.println(F("[gpio] pad behaviour, measured (only pads with nothing wired):"));
+    for (int p : kProbe) {
+        if (pins::consolePad(p) || pins::flashPad(p)) {
+            Serial.printf("  %2d  skipped — %s\n", p, pins::unusableReason(p));
+            continue;
+        }
+        if (padOwnedByLiveBus(p)) {
+            Serial.printf("  %2d  skipped — owned by a live I2C port (pinMode would kill it)\n", p);
+            continue;
+        }
+        if (!pins::inputCapable(p)) {
+            Serial.printf("  %2d  skipped — not input-capable on this die\n", p);
+            continue;
+        }
+        if (!pins::pullCapable(p)) {
+            // The table already knows these pads have no pulls; asking for one costs a driver ERROR
+            // line and proves nothing. Measured once on 34/35 and it is recorded in PinMap.h.
+            Serial.printf("  %2d  no internal pull-up/pull-down (input-only pad) — a button or "
+                          "switch here needs an external resistor, which is a BOM item\n", p);
+            continue;
+        }
+        pinMode(p, INPUT_PULLUP);
+        delayMicroseconds(200);
+        const int hi = digitalRead(p);
+        pinMode(p, INPUT_PULLDOWN);
+        delayMicroseconds(200);
+        const int lo = digitalRead(p);
+        if (pins::outputCapable(p)) {
+            Serial.printf("  %2d  pull-up read %d, pull-down read %d -> internal pulls %s\n", p, hi, lo,
+                          (hi && !lo) ? "work" : "DO NOT WORK as documented");
+            // Read-back after driving: the input path is off while a pad is a pure output on this
+            // core, so re-open it as a high-Z input and see whether the pad kept the level.
+            pinMode(p, OUTPUT);
+            digitalWrite(p, HIGH);
+            delayMicroseconds(50);
+            pinMode(p, INPUT);
+            delayMicroseconds(50);
+            const int keptHi = digitalRead(p);
+            pinMode(p, OUTPUT);
+            digitalWrite(p, LOW);
+            delayMicroseconds(50);
+            pinMode(p, INPUT);
+            delayMicroseconds(50);
+            const int keptLo = digitalRead(p);
+            Serial.printf("      driven hi -> hi-Z reads %d, driven lo -> hi-Z reads %d (a floating "
+                          "pad keeps what it was driven to)", keptHi, keptLo);
+            Serial.println((keptHi && !keptLo) ? " — switches both ways" : " — SUSPECT");
+            Serial.println(F("      (drive strength into a real load is a meter measurement, not this)"));
+        } else {
+            Serial.printf("  %2d  pull-up read %d, pull-down read %d -> input-only pad, and internal "
+                          "pulls are %s on it (34..39 have none: external resistor required)\n",
+                          p, hi, lo, (hi && !lo) ? "present" : "absent");
+        }
+        // Put every probed pad back the way its owner expects it.
+        const pins::Assignment* a = pins::findAssignment(p);
+        if (a && a->needsOutput) {
+            pinMode(p, OUTPUT);
+            digitalWrite(p, LOW);
+        } else if (a) {
+            pinMode(p, INPUT_PULLUP);
+        } else {
+            pinMode(p, INPUT_PULLDOWN);  // a spare pad must not be left floating
+        }
+    }
+    Serial.println(F("[gpio] never wire to these: 24, 28-31 (no such pad on the ESP32-D0WD-V3 die); "
+                     "20, 37, 38 (die pads this module does not bond out); 6-11 (inside the module's "
+                     "SPI flash path)"));
+}
+
 void handleCommand(char c) {
     switch (c) {
         case 's':
@@ -342,11 +482,14 @@ void handleCommand(char c) {
                 initBus(b);
             }
             break;
+        case 'g':
+            gpioMapReport();
+            break;
         case 'h':
         default:
             Serial.println(F("bench commands: s=full bus scan  p=probe table + report  "
                              "r=raw probe codes (destructive, bench only)  c=bus recovery  "
-                             "a=ADC self-test  d=ADC rate characterisation"));
+                             "a=ADC self-test  d=ADC rate characterisation  g=pad map + pad test"));
             break;
     }
 }

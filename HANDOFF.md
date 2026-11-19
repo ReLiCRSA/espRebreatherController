@@ -11,16 +11,23 @@ resume point. Read `AGENTS.md` first, this second.
 ## 1. Project state in one paragraph
 
 ESP32 classic CCR rebreather dive computer. `lib/core` (deco engine, voting, gas model, boot report,
-**and now the ADC register map**) is complete and regression-anchored: **70 native cases green**
-across five suites. `src/` boots on the board: safe-state pins first, bounded I2C presence probing,
-**active converter checks**, honest boot fault report, arming refusal, hot re-probe every 5 s, serial
-bench commands (`s p r c a d`). **M0 is DONE. M1 is closer than it was** — the boot/bench half is
-verified against *fitted* hardware, and the ADS1115 register layer is written and write-verified on
-hardware. Still open at M1: the alternating-mux 16 SPS/cell scheduler, `lib/sim`, and the baro/INA219
+**the ADC register map, and now the GPIO pin map**) is complete and regression-anchored:
+**80 native cases green** across six suites. `src/` boots on the board: safe-state pins first, bounded
+I2C presence probing, **active converter checks**, honest boot fault report, arming refusal, hot
+re-probe every 5 s, serial bench commands (`s p r c a d g`). **M0 is DONE. M1 is closer than it was** —
+the boot/bench half is verified against *fitted* hardware, and the ADS1115 register layer is written
+and write-verified on hardware. Still open at M1: the alternating-mux scheduler (per-cell rate derived
+from the measured conversion period, not from the datasheet's 16 SPS), `lib/sim`, and the baro/INA219
 drivers. **One ADS1115 module (0x48) and one SSD1306 (0x3C) are wired; the second converter (0x49),
 the baro and the INA219 are not.**
 
-The single most important thing learned: **the fitted "ADS1115" module is not a genuine ADS1115.**
+Two decisions were taken with the user on 2026-11-19 and are now binding (AGENTS.md §18): the ppO2
+converters **shall be genuine TI ADS1115s** (decision 31 — the fitted clone stays on the bench for
+timing work only), and **GPIO 33 is the Page button while the vibration motor moves to GPIO 16**
+(decision 32). The pin map itself moved to `lib/core/src/PinMap.h` under native test (decision 33),
+because it had been wrong twice as an untestable paragraph.
+
+The single most important hardware lesson: **the fitted "ADS1115" module is not a genuine ADS1115.**
 Everything about timing in this firmware is derived from measurement, not from the datasheet. Details
 in §5, consequences in AGENTS.md §2/§8/risk 16/open item 13.
 
@@ -33,10 +40,11 @@ cd espRebreatherController
 ```
 
 `.pio/` is gitignored (build cache, ~72 MB) — the new machine rebuilds it on first `pio run`.
-Branch `master`; last pushed commit at the time of writing is `8dacb0d`, and **everything described in
-this file is one uncommitted commit beyond it** — if §1 says something the remote does not contain,
-that is the gap. A fresh clone will not contain the planned-but-empty directories from AGENTS.md §14
-(`docs/`, `data/display/`, `src/dive/`, `src/ui/`, `src/web/`): git does not track empty directories.
+Branch `master`. The ADC work is commit `086c917`; the pin-map/pin-measurement work described in §5d
+follows it. **Check `git log --oneline -3` rather than trusting any commit hash written here** — if §1
+or §5 says something the remote does not contain, that is the gap. A fresh clone will not contain the
+planned-but-empty directories from AGENTS.md §14 (`docs/`, `data/display/`, `src/dive/`, `src/ui/`,
+`src/web/`): git does not track empty directories.
 
 ---
 
@@ -65,8 +73,8 @@ If `pyserial` is missing on the new machine: `pip install pyserial` inside the v
 Commands (all from the project root, venv sourced):
 
 ```
-pio test -e native            # 70 cases, five suites, ~3 s, no hardware needed
-pio run -e esp32              # links; ~463.8 KB flash (29.5%), 35,600 B RAM (10.9%)
+pio test -e native            # 80 cases, six suites, ~4 s, no hardware needed
+pio run -e esp32              # links; 466,973 B flash (29.7%), 35,600 B RAM (10.9%)
 pio run -e esp32 -t upload    # flashes; verify "Hash of data verified"
 pio device monitor            # or the python capture recipe in §4
 pio run -t uploadfs           # LittleFS assets, when data/ exists (web UI, not yet written)
@@ -136,6 +144,15 @@ leaves state behind. Addresses >= 128 are rejected outright.
 | `beginTransmission(a); write(0x00); endTransmission(true)` | 4 | **banned**: writes 0x00 to a fitted device (INA219 calibration cleared, ADS1115 config reprogrammed) |
 | `requestFrom(a, 1)` | 0 bytes + driver error line | cannot prove absence (SSD1306 is write-only), spams the console |
 
+**What the returned number means**, read out of `Wire.cpp` (core 4.0.0) rather than guessed:
+`0` ok · `1` data too long · **`2` NACK on the address — nothing there** · `3` NACK on data ·
+`4` other failure · **`5` timeout — the bus is being held**. `2` vs `5` is a diagnosis, not noise: on
+2026-11-19 the ADS1115 module booted once with `I2C1 SDA held low before init`, both converters
+reporting `err 5`, `I2C_BUS_STUCK` raised, and nine clocks + a port re-init not freeing it — that is a
+line being held (most often a device that lost its supply and is clamping SDA/SCL through its
+protection diodes), and it looked completely different from an absent device. It was healthy at the
+next boot without anyone touching anything: a flaky jumper (AGENTS.md §20 open item 16).
+
 The positive direction is **no longer a caveat**: `0x48` (ADS1115 module) and `0x3C` (SSD1306) both
 ACK, `I2C1: 1 device(s) [0x48]`, `I2C0: 1 device(s) [0x3C]`, and the matching faults clear while the
 missing ones stay raised.
@@ -189,8 +206,11 @@ Fitted at 0x48 on I2C1 (ADDR -> GND), measured 2026-11-19 with bench commands `a
   per-cell rate after walking both pairs is **8 SPS, not 16**. The **coil/ADC interlock window is
   62 ms, not 31 ms** — a window coded from the datasheet would leave half of a live conversion
   unguarded, and coil noise looks exactly like cell disagreement, which trips voting. 860 SPS is
-  unreachable. AGENTS.md open item 13 is the choice: source known-genuine TI parts (preferred) or
-  accept this die and re-derive timing from the measured table.
+  unreachable. **Decided 2026-11-19 (AGENTS.md decision 31): source known-genuine TI ADS1115s** and
+  keep this module for bench timing work only. Outstanding action, not an open question: when new parts
+  arrive, `d` must measure 8/16/32/64/128/250/475/860 SPS and `a` must read ID `0x85`, and
+  `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` must clear by themselves. Note that **"ADS1115S" has no
+  datasheet** — so identity here is always a measurement claim, never a part-name claim.
 - **Config-register read granularity: 348–365 us per poll.** That is the polling cost of watching the
   OS bit, and it is why DRDY (open item 14) matters: with DRDY wired, the interlock becomes an
   interrupt instead of a 350 us poll loop.
@@ -212,6 +232,30 @@ Fix and prevention: the constants moved to `lib/core/src/AdcRegs.h` (pure C++, r
 `pio test -e native`) and `src/sensors/Ads1115Bus.h` aliases them — decision 28. `test/test_adc/`
 tiles the config register's masks, decodes `0x8583`, and pins the LSB tables (**7.8125 uV at gain
 16**, not the 0.125 mV often quoted, which is the gain-1 figure).
+
+### 5d. GPIO pads — measured by bench command `g`, and now a tested table (decision 33)
+
+The pin map lived as a paragraph in `src/config/Pins.h` and was wrong twice. It now lives in
+**`lib/core/src/PinMap.h`** (pure C++, capability word per pad + the role assignment), `Pins.h` is an
+alias, and `test/test_pins/` (10 cases) walks it. Bench command **`g`** prints, for every pad, what the
+table claims and what the core actually owns (`perimanGetPinBusType`), plus measured pull and output
+behaviour on pads with nothing wired. Measured on this board 2026-11-19:
+
+| Claim | Measurement |
+|---|---|
+| Console pads | **GPIO1 = UART-TX, GPIO3 = UART-RX**, both reported owned by UART0. The old §3 note "16/17 are UART0 on most devkits" is **false on this board** (the core's own `doitESP32devkitV1` variant header says `TX = 1; RX = 3`) |
+| GPIO 16 / 17 | free before use, **output-capable, internal pull-up/pull-down work** (pull-up reads 1, pull-down reads 0), driven level retained when left high-Z. On a WROVER these two are PSRAM CS/clock — this build is WROOM-32 |
+| GPIO 32 / 33 | output-capable, pulls work. 33 is now **BTN_PAGE**; the vibrator moved to 16 (decision 32) |
+| GPIO 34–39 | **input-only and no internal pull-up/pull-down** (driver: `GPIO number error`). A switch there needs an external resistor — a BOM item |
+| GPIO 24, 28–31 | **do not exist on the ESP32-D0WD-V3 die**: periman answers `Invalid pin`. `g` does not even ask, because the table knows |
+| GPIO 20, 37, 38 | real die pads that **WROOM-32 does not bond out** — a different reason, kept separate in the table (`kDieOnly`) |
+| GPIO 6–11 | inside the module's SPI flash path |
+| Spare budget | after the map, **exactly one spare output-capable pad: GPIO 17** (asserted as a number in the test, so freeing a pin forces the §3 budget to be re-derived) |
+
+Two consequences worth remembering: **an output role on 34–39 fails silently** (the haptic alarm simply
+never fires — now a test failure), and **the core's default SPI pins are 18/19/23**, which collide with
+I2C1 and `ADS_U1_DRDY`, so a SPI display panel cannot be added by calling `SPI.begin()` with defaults.
+That is AGENTS.md open item 15, and it has to be argued together with the panel choice (item 6).
 
 ## 6. What is on the bench right now
 
@@ -237,12 +281,13 @@ CCR dive computer — boot (never fatal), entering BENCH
 [boot] F:1 E:2 W:2 ADS1115_U2 BARO INA219 ADC_ID_UNKNOWN ADC_RATE_MISMATCH
 [arm] REFUSED — see faults above
 [o2] solenoid disabled — GPIO 26 will not be driven
-bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (destructive, bench only)  c=bus recovery  a=ADC self-test  d=ADC rate characterisation
+bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (destructive, bench only)  c=bus recovery  a=ADC self-test  d=ADC rate characterisation  g=pad map + pad test
 ```
 
   Two numbers to watch on any future boot: the **conversion period** (~62 ms on this part) and
-  **`98% off`**. If a genuine TI module is fitted, expect ~31 ms and the `ADC_RATE_MISMATCH` warn to
-  clear — that is the test that open item 13 is resolved.
+  **`98% off`**. If a genuine TI module is fitted, expect ~31 ms, `ID 0x85`, and both
+  `ADC_ID_UNKNOWN` and `ADC_RATE_MISMATCH` gone from the banner — that is the test that decision 31's
+  parts arrived.
   If instead something shows `ADC_CONV_BAD`, `ADC_PART_WRONG`, phantom devices, `ALL SENSORS OK` with
   nothing wired, or `bus is not initialized` spam, something regressed: start at
   `src/sensors/BusProbe.cpp`, then `checkAdcs()` in `src/main.cpp`.
@@ -253,20 +298,43 @@ bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (dest
   `r` raw four-shape diagnostic (needs `-DBENCH_RAW_PROBE=1`, **writes 0x00** to whatever ACKs — bare
   bus only) · `c` 9-clock bus recovery + port re-init · `a` ADC self-test (ID, config decode,
   write-verify + restore, DRDY line, one timed conversion) · `d` ADC rate characterisation (measured
-  period for all eight RATE fields, plus the poll cost).
+  period for all eight RATE fields, plus the poll cost, ~6 s) · `g` pad map + pad test (~48 lines:
+  per-pad capability word from `PinMap.h`, the core's periman owner, and measured pull/output behaviour
+  on pads with nothing wired — the source of every claim in §5d).
   `a` and `d` write the config register, so they are bench actions, not something the dive loop runs.
+
+- **The one non-healthy boot seen so far**, recorded because the fault detail is what made it
+  diagnosable and because it is a maintenance finding, not a firmware bug (AGENTS.md §20 open
+  item 16). The ADS1115 module once came up like this:
+
+```
+[i2c] I2C1 SDA held low before init — 9-clock recovery
+  I2C1: 0 device(s)  []
+  FATAL ADS1115_U1             x1  0x48 err 5
+  FATAL ADS1115_U2             x1  0x49 err 5
+[boot] F:2 E:2 W:0 ADS1115_U1 ADS1115_U2 BARO INA219
+```
+
+  `err 5` is **timeout**, not `err 2` (NACK): the bus was being held rather than the address being
+  unanswered. `c` did not free it, and the next boot was healthy with nothing touched — a flaky
+  jumper. Action before any further timing work: re-seat and positively secure the module's
+  VDD/GND/SDA/SCL jumpers (or solder / pin-lock them).
 
 ## 7. Resume point — the next steps, in order
 
-1. **Ask the user to decide AGENTS.md open item 13** (source genuine TI ADS1115 modules, or accept
-   this die and re-derive per-cell rate and control timing from the measured table). This decides the
-   sample-rate design, and therefore the control-loop deadband and the interlock window, before the
-   scheduler is written. Do not design the scheduler around 32 SPS as though it were real.
+1. **Order known-genuine TI ADS1115 modules** (AGENTS.md decision 31 — decided 2026-11-19, this is now
+   an outstanding action, not a question). On arrival: `d` must measure
+   8/16/32/64/128/250/475/860 SPS and `a` must read ID `0x85`, with `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH`
+   clearing by themselves (~31 ms conversion, not 62). Until then every timing figure in the firmware is
+   derived from the measured table, so both parts work and neither is trusted from its label. The sample
+   rate decides the control-loop deadband and the coil/ADC interlock window, so **do not write the
+   scheduler around 32 SPS as though it were real.**
+   Alongside that: re-seat and secure the I2C1 jumpers (§6, open item 16) before any more timing work.
 2. **`lib/sim`**: `SimBaro`, `SimCells`, `LoopModel`, `FaultInjector`, `ProfileRunner` — pure C++ in
    `lib/` so `pio test -e native` covers it, implementing the same `Barometer`/`CellArray` source
    interfaces as the real drivers (AGENTS.md §11: simulate at the sensor layer, closed loop against
    the firmware's own commanded pulses, stamp everything `SIM`). This needs no hardware and no
-   decisions, so it can proceed regardless of (1).
+   decisions, so it can proceed right now.
 3. **Alternating-mux scheduler** in `src/sensors/Ads1115Bus`: walk AIN0/1 -> AIN2/3 with
    single-shot conversions, **using the measured conversion period**, per-channel `invert`, and
    DRDY on 23/4 once it is actually wired (open item 14). Then wire cell 2 into AIN2/3 so the
@@ -282,32 +350,43 @@ mistake).
 
 | File | What it pins down |
 |---|---|
-| `AGENTS.md` | binding design record; §16 milestone status, §18 decisions 1–30, §19 risks 1–17, §20 open items 1–14 |
+| `AGENTS.md` | binding design record; §16 milestone status, §18 decisions 1–33, §19 risks 1–18, §20 open items 1–16 |
 | `HANDOFF.md` (this file) | machine + bench state, measured I2C and ADC semantics, resume point |
 | `lib/core/src/AdcRegs.h` | **the ADS1115 register map, PGA/RATE tables, LSB and mV scaling, and the measured bench-module rate table.** Pure C++ so it can be asserted; it was wrong twice while it lived only in `src/` |
 | `src/sensors/Ads1115Bus.{h,cpp}` | register driver: single-shot start (MODE written explicitly), `checkPart()` identity-by-timing, `measureAdcRates()`, `selfTest()`. The accepted conversion window (20–150 ms) and why it is wider than the datasheet figure |
 | `src/sensors/BusProbe.cpp` | the measured four-shape probe table and the periman trap, in comments; the only probe form that is truthful and non-destructive |
 | `src/sensors/BusProbe.h` | probe contract, 7-bit address warning, "port must be down" rule for line checks |
-| `src/main.cpp` | boot order (solenoid safe-state first), bounded probing, `checkAdcs()` (presence is not identity), two-address device selection for baro and OLED, bus dead-vs-absent reporting, 5 s hot re-probe and bus retry, bench command REPL |
+| `src/main.cpp` | boot order (solenoid safe-state first), bounded probing, `checkAdcs()` (presence is not identity), two-address device selection for baro and OLED, bus dead-vs-absent reporting, 5 s hot re-probe and bus retry, bench command REPL (`s p r c a d g`), `gpioMapReport()` |
 | `lib/core/src/FaultCode.h` | the fault enum plus `defaultSeverity`/`blocksArming`/`faultName`. `ADC_PART_WRONG`/`ADC_CONV_BAD` block arming; `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` deliberately do not |
 | `lib/core/src/BootReport.h` | `blocksArming()` refuses on **any active FATAL**, not only on listed codes |
-| `src/config/Pins.h` | pin map; **`BTN_PAGE = -1`** because AGENTS.md §20 open item 12 is unresolved (GPIO 33 claimed by both the vibration motor and the Page button) — needs the user's choice, do not silently share a pin |
+| `lib/core/src/PinMap.h` | **the GPIO capability table (one word per pad, 0..39) and the role assignment.** Pure C++, asserted natively — it was a paragraph in a header before and was wrong twice. Carries `noSuchPad` (24, 28–31: no such pad on the ESP32-D0WD-V3 die) and `kDieOnly` (20, 37, 38: die pads WROOM-32 does not bond out) as separate claims, `unusableReason()`, and `SPARE_OUT = 17` |
+| `src/config/Pins.h` | **an alias of `PinMap.h`, not a second copy of the numbers.** `BTN_PAGE = 33`, `VIBRATOR_OUT = 16` (moved off 33, decision 32), `SPARE_OUT = 17`. Drivers must still check `>= 0` before `pinMode`: a role may be unassigned on purpose |
 | `src/config/Features.h` | defaults: `HAVE_SOLENOID 0`, `BENCH_MODE 1`, `WIFI_DURING_DIVE 0`, `BENCH_RAW_PROBE 0`, `POWER_RAIL "1S2P"` |
 | `platformio.ini` | pioarduino `stable` platform (never the stock `espressif32`), `lib_ldf_mode = deep` + `lib_extra_dirs` + explicit core libs in `lib_deps`, `native` env with `test_build_src = no` |
 | `partitions.csv` | 64 KB-aligned app slots, `data, littlefs, 0x320000, 0xC0000` |
 | `lib/core/src/Zhl16c.cpp` | deco engine: ZH-L16A coefficients + Subsurface GF/ceiling form, plan search in depth/grid space, `bounded` flag, GF anchor in restorable state. **Do not change without native tests and a trusted-computer cross-check** (risk 13) |
 | `test/test_adc/test_adc.cpp` | config-field masks tile 0xFFFF once; `0x8583` decodes as the DS default; design config = gain 16 + 32 SPS + explicit single-shot; LSB tables; air-signal code counts; the measured non-datasheet rate table |
 | `test/test_boot/test_boot.cpp` | fault severities; absent solenoid is INFO and must **not** block arming; the whole-enum table walk (gap list — keep it current when adding codes); unlisted FATAL still blocks |
+| `test/test_pins/test_pins.cpp` | no two roles share a GPIO (33 was the motor *and* the Page button); no output role on an input-only pad; no role on a strapping pin; the no-such-pad / die-only / flash sets each asserted separately; 34–39 input-only with no pulls; button pads have internal pull-ups; **the spare output budget is asserted to be exactly one pad (17)**, so freeing a pin forces the AGENTS.md §3 budget to be re-derived |
 
 ## 9. Open items that block code, not just BOM
 
-- **Open item 13** (the fitted converter's rate table is not the datasheet's): blocks the sample-rate
-  and control-loop design, hence the scheduler. Ask before writing the scheduler.
+- **Open item 13 is decided** (AGENTS.md decision 31: genuine TI ADS1115s) and no longer blocks the
+  scheduler — but the **parts are not yet fitted**, so the per-cell rate is still 8 SPS on the bench
+  module and 16 SPS on a real one. Write the scheduler against a measured period read from the part,
+  not a constant.
 - **Open item 14** (DRDY never actually wired, only read pulled-up and idle): the scheduler can be
   written to poll the OS bit, but at 348–365 us a poll it is not the design in AGENTS.md §8. Wire
   DRDY before certifying the interlock.
-- **Open item 12** (GPIO 33 double-assignment): blocks the button/motor drivers. Needs a free pin
-  chosen (35 is input-only and could work if it is not used as a button) or the motor moved.
+- **Open item 15** (new): a SPI display panel needs four pads (SCK/MOSI/DC/CS) and **only GPIO 17 is
+  spare and output-capable** after the current map; the core's default SPI pins 18/19/23 collide with
+  I2C1 and `ADS_U1_DRDY`. Argue this with the panel choice (item 6) before buying anything — the
+  options are freeing the DRDY pads (item 14's other side), taking a strapping pin against the §3
+  policy, or keeping the panel on I2C and accepting the frame-time cost.
+- **Open item 16** (new): the ADS1115 module intermittently held I2C1 low (§6). Maintenance action:
+  re-seat and secure those jumpers before further timing work.
+- **Open item 12 is closed** (decision 32): 33 = Page button, motor on 16, `test/test_pins/` asserts
+  the class of defect is gone.
 - Everything else in AGENTS.md §20 (valve choice, pulse volumes, metabolic rate, display panel,
   enclosure) blocks BOM/calibration but not the next code steps.
 
@@ -316,9 +395,10 @@ mistake).
 - This is **primary dive life-support firmware**, uncertified. Prefer explicit failure, no silent
   fallbacks. Boot is never fatal; fatality applies at the arming gate and to mid-dive ADC dropout.
 - The failure mode of this codebase is **plausible-looking numbers** (risk 13). It is not confined to
-  the deco engine: the register-field masks, the MODE bit and the arming-gate table all produced
-  wrong behaviour that read sensibly. Remedy that has worked: put the constants where native tests
-  can pin them, anchor tests to a *measured* value, and walk whole tables rather than trusting a
+  the deco engine: the register-field masks, the MODE bit, the arming-gate table and the **pin table**
+  all produced wrong behaviour that read sensibly (GPIO 33 assigned to two roles at once; "free" pads
+  at 20/24/28–31 that do not exist on this die). Remedy that has worked: put the constants where native
+  tests can pin them, anchor tests to a *measured* value, and walk whole tables rather than trusting a
   `default`.
 - **Measure before you size a timing window.** Datasheet tables describe a part, not the part on the
   desk (`d` produces the measured numbers at any time).

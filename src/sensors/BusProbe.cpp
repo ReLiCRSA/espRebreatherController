@@ -49,18 +49,26 @@ ProbeResult probeAddress(TwoWire& wire, uint8_t address) {
     //       connected. The repeated-start form never completes the address phase in the IDF-5
     //       driver, so the error never surfaces. This is what made the first boot report
     //       "ALL SENSORS OK" on an empty bench — it must never be used as a probe.
-    //   beginTransmission(a); endTransmission(true)    -> 2 (ESP_ERR_INVALID_RESPONSE, NACK on
-    //       the address phase) when absent. This is the probe: the driver runs
-    //       i2c_master_probe() for a zero-length write, evaluates the address phase, and writes
-    //       nothing to the device.
+    //   beginTransmission(a); endTransmission(true)    -> 2 when absent. This is the probe: the
+    //       driver runs i2c_master_probe() for a zero-length write, evaluates the address phase, and
+    //       writes nothing to the device.
     //   beginTransmission(a); write(0x00); endTransmission(true)
-    //                                                  -> 4 (ESP_ERR_INVALID_STATE / timeout) on
-    //       an absent address, and a **real write** to a present one: 0x00 into the INA219 config
-    //       register clears its calibration, into the ADS1115 config register reprograms
-    //       mux/gain/PS1. Banned as a probe.
+    //                                                  -> 4 ("other error") on an absent address, and
+    //       a **real write** to a present one: 0x00 into the INA219 config register clears its
+    //       calibration, into the ADS1115 config register reprograms mux/gain/PS1. Banned as a probe.
     //   requestFrom(a, 1)                              -> 0 bytes plus a driver error line; the
     //       SSD1306 is write-only and never answers a read even when present. Cannot prove
     //       absence, and it spams the console. Not used.
+    //
+    // What the returned code means, read out of Wire.cpp (core 4.0.0) rather than guessed:
+    //   0 ok · 1 data too long · 2 NACK on the **address** (ESP_FAIL / ESP_ERR_NOT_FOUND — nothing
+    //   there) · 3 NACK on data · 4 other failure · **5 timeout**.
+    // The 2-vs-5 difference is worth reading in the fault detail, because they are different
+    // hardware stories: 2 says the address was not acknowledged, 5 says the bus could not even
+    // complete a transaction. Measured 2026-11-19 when the ADS1115 module came off the bench:
+    // `0x48 err 5` with "I2C1 SDA held low before init" — a line being held, most often an unpowered
+    // device clamping SDA/SCL through its protection diodes, not an absent device. Nine clocks plus a
+    // re-init did not free it, which is also what a physically disconnected module looks like.
     //
     // So: no payload, STOP condition, and `err == 0` means a device acknowledged its address.
     // Source-confirmed in esp32-hal-i2c-ng.c: a zero-length i2cWrite() takes the

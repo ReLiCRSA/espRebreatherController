@@ -62,7 +62,9 @@ ESP32 classic (WROOM-32 devkit). Two cores are load-bearing: dive loop on core 0
   **alternate single-shot conversions** AIN0/1 -> AIN2/3 at **SPS 32**, giving 16 SPS per cell.
   SPS 32 is what the design asks for; what the fitted part actually delivers at that field is
   measured, not assumed (see the measured rate table below — the bench module gives 16.1 SPS there,
-  so the real per-cell rate is 8 SPS until the part or the field is changed).
+  so the real per-cell rate is 8 SPS until the part or the field is changed). **Decision 31: the part
+  gets replaced** with a known-genuine TI ADS1115 (open item 13 is decided); the fitted module stays
+  on the bench for timing work and never goes near a dive.
 - **LSB 7.8125 uV at gain 16** (FSR/32768 — not the 0.125 mV often quoted, which is the *gain 1*
   figure). A galvanic cell in air (~9-13 mV) is therefore ~1150-1660 counts of a +/-32767 range:
   ample headroom for the bias network, ample resolution. `lib/core/src/AdcRegs.h` holds the register
@@ -125,7 +127,12 @@ use **SPI**, keeping I2C0 free for baro/INA219.
 
 ---
 
-## 3. Pin map (`src/config/Pins.h`)
+## 3. Pin map (`lib/core/src/PinMap.h`, aliased by `src/config/Pins.h`)
+
+This table is **asserted by `test/test_pins/`** (decision 33). It used to be a paragraph in a header
+nobody could test, and it was wrong twice — GPIO 33 was assigned to both the vibration motor and the
+Page button, and whole groups of pads were either written off or assumed free based on the die rather
+than on this module.
 
 | Function | GPIO |
 |---|---|
@@ -133,16 +140,37 @@ use **SPI**, keeping I2C0 free for baro/INA219.
 | I2C1 SDA / SCL (2x ADS1115) | 18 / 19 |
 | ADS1115 U1 / U2 DRDY | 23 / 4 |
 | Solenoid drive (10k pulldown + flyback) | 26 |
-| Arm button | 27 |
+| Arm buttons A / B (two-button sequence; B is "Select") | 27 / 32 |
 | Manual inject (hardware bypass) | 13 |
+| Page button | 33 |
 | Buzzer (>=90 dB) | 25 |
-| Vibration motor | 33 |
-| Select / Page buttons | 32 / **33 — conflicts with the vibration motor, see open item 12** |
+| Vibration motor | **16** — moved off 33 (decision 32); drive it through a transistor with a gate pulldown |
 | External watchdog heartbeat out | 14 |
+| Declared spare (see the budget note below) | 17 |
 | Battery sense | INA219 (I2C0) |
 
-Avoided: 0/2/5/12/15 (strapping), 6–11 (flash), 16/17 (UART0 on most devkits), 34–39 (input-only).
-ADC2 pins cannot be used while WiFi is active — hence INA219 instead of ESP32 ADC.
+Measured on this board with bench command `g` (2026-11-19) rather than assumed:
+
+* **The console is UART0 on GPIO 1 (TX) / 3 (RX)**: periman reports both pads as owned by UART0, and
+  the boot log and bench RX both work there. The old note "avoid 16/17 (UART0 on most devkits)" is
+  **false for this board** — 16 and 17 are real, free, output-capable pads and their internal
+  pull-up/pull-down work (measured: pull-up reads 1, pull-down reads 0, driven level retained when
+  left high-Z). On a WROVER module 16/17 are PSRAM CS/clock; this build is WROOM-32.
+* **GPIO 24 and 28–31 do not exist on the ESP32-D0WD-V3 die** (the core answers `Invalid pin`), and
+  **20, 37, 38** are die pads that the WROOM-32 module does not bond out. Any spare list computed by
+  counting 0..39 is a phantom, and chasing one costs an evening.
+* **34–39 are input-only and have no internal pull-up or pull-down** (the driver answers
+  `GPIO number error`). A switch there needs an external resistor — a BOM item, not a detail.
+* After the map above, **exactly one spare output-capable pad remains: GPIO 17.** The test asserts
+  that count, so freeing a pin (dropping DRDY interrupts for OS-bit polling, open item 14) is a
+  deliberate change with the budget re-derived, not an accident discovered at the water. **A SPI
+  display (open items 6 and 15) needs four pads and cannot be added without moving something** — that
+  argument belongs here, in advance, not in a bring-up panic.
+* Still avoided: 0/2/5/12/15 (boot strapping: a load or a held button changes how the unit starts —
+  the test asserts no role sits on one), 6–11 (inside the module's SPI flash path), 1/3 (console).
+* ADC2 pads cannot be used for **analog** reads while WiFi is active — hence INA219 rather than the
+  ESP32 ADC. Digital I/O on an ADC2 pad (4/13/25/26/27) is unaffected.
+* 32/33 are also the 32.768 kHz crystal pads: using them for buttons precludes adding that crystal later.
 
 ---
 
@@ -537,22 +565,25 @@ As **primary computer**, these are requirements:
 platformio.ini  partitions.csv  README.md  AGENTS.md
 lib/            host-buildable pure C++, no Arduino headers — this is what `pio test -e native`
   core/src/     covers. (Moved out of src/core deliberately: src/ can never compile natively.)
-                FaultCode  BootReport  GasMix  GasModel  Voting  O2Toxicity  Zhl16c
+                FaultCode  BootReport  GasMix  GasModel  Voting  O2Toxicity  Zhl16c  AdcRegs  PinMap
   sim/          SimBaro  SimCells  LoopModel  FaultInjector  ProfileRunner  (to do)
 src/            ESP32-only (Arduino/ESP-IDF headers allowed here)
-  main.cpp                     setup(), boot probe, hot re-probe loop
-  config/  Pins.h  Features.h  RuntimeConfig.{h,cpp}
+  main.cpp                     setup(), boot probe, hot re-probe loop, bench command REPL
+  config/  Pins.h (alias of core/PinMap.h)  Features.h  RuntimeConfig.{h,cpp}
   sensors/ BusProbe  Ads1115Bus  CellArray  Barometer(iface)  Ms5837  Bmp085  Depth  Ina219
   dive/    CcrControl  SolenoidDrive  BreathingState  Alarms  DiveLog  TissuePersist
   ui/      DisplayDriver(iface)  Ssd1306I2C  TemplateEngine  FieldRegistry  Scenes  Buttons
   web/     WebServer  Api  assets/(index.html app.js style.css)
-test/      test_voting/  test_gas/  test_zhl/  test_boot/   native Unity suites (test_* required)
+test/      test_voting/ test_gas/ test_zhl/ test_boot/ test_adc/ test_pins/
+           native Unity suites (test_* required)
 docs/      TUNING.md   (README.md holds wiring + BOM + bench procedure)
 data/      LittleFS: index.html app.js style.css display/templates/*.txt
 ```
 
-Note: `GasModel` (inspired-gas resolution) and `BootReport` are in `lib/core`, not `src/dive` —
-both are pure C++ and both are under native test, which `src/` cannot be.
+Note: `GasModel` (inspired-gas resolution), `BootReport`, `AdcRegs` **and `PinMap`** are in `lib/core`,
+not in `src/` — all are pure C++ and all are under native test, which `src/` cannot be. `PinMap.h`
+carries the GPIO capability table and the role assignment; `src/config/Pins.h` includes it rather than
+holding a second copy of the numbers (decision 33).
 
 ---
 
@@ -613,14 +644,19 @@ First ESP32 link result (`pio run -e esp32`, 2026-11-19): **SUCCESS**, Flash 457
 (VID:PID 10C4:EA60), chip `ESP32-D0WD-V3 (rev v3.0)`, MAC `c0:49:ef:ca:38:28` — matches
 `esp32doit-devkit-v1`. `pio run -e esp32 -t upload` verifies ("Hash of data verified"); RTS-based
 auto-reset works, so no BOOT button is needed, and serial capture via pyserial at 115200 works.
-App now ~463.8 KB flash (29.5%) and 35,600 B RAM (10.9%). Both buses init at the documented pins
+App now 466,973 B flash (29.7%) and 35,600 B RAM (10.9%). Both buses init at the documented pins
 (`Wire` 21/22, `Wire1` 18/19 — **I2C1 is usable, the pin map stands**), and with nothing connected
 the boot report is honest: 0 devices on both buses, FATAL ADS1115_U1/U2, ERROR BARO/OLED/INA219,
 `[arm] REFUSED`, solenoid INFO. Bench commands over serial: `s` full sweep, `p` probe table +
 report, `r` raw probe codes (needs `BENCH_RAW_PROBE=1`), `c` 9-clock recovery + port re-init,
 `a` ADS1115 self-test (ID register, config decode, write-verify, DRDY line, one timed conversion),
 `d` ADS1115 rate characterisation — measured conversion period for all eight RATE fields, which is
-what the coil/ADC interlock window and the per-cell sample rate are derived from, not the datasheet.
+what the coil/ADC interlock window and the per-cell sample rate are derived from, not the datasheet,
+and `g` pad map + pad test — who owns each GPIO according to the core (periman), plus measured
+pull-up/pull-down and output behaviour on pads with nothing wired. `g` is what settled §3.
+Probe error codes mean different hardware stories and are worth reading: **2** = NACK on the address
+(nothing there), **5** = timeout (the bus is being held — measured when an ADS1115 module lost its
+supply and clamped SDA through its protection diodes; nine clocks did not free it).
 Cosmetic only: IDF prints `esp_core_dump_flash: No core dump partition found!` twice per boot
 (there is no core dump partition by design); it is emitted before `setup()` runs, so
 `esp_log_level_set` in `setup()` cannot silence it.
@@ -647,18 +683,20 @@ bench procedure.
 
 ## 16. Test strategy
 
-**Current state (2026-11-19): `pio test -e native` is green — 70 cases across five suites
-(`test_voting`, `test_gas`, `test_zhl`, `test_boot`, `test_adc`); `pio run -e esp32` links **and is
-flashed and running on the devkit** with one ADS1115 module and an SSD1306 actually attached. The
-positive-ACK caveat that M0 left open is closed: `I2C1: 1 device(s) [0x48]`, `I2C0: 1 device(s)
-[0x3C]`, and the corresponding faults clear while the missing ones stay raised. Reads and writes on
-the attached converter are verified, not assumed: `a` write-verifies a register and restores it, and
-`d` measures the conversion period field by field — which is how the register-map faults and the
-non-standard rate table in section 2 were found.**
+**Current state (2026-11-19): `pio test -e native` is green — 80 cases across six suites
+(`test_voting`, `test_gas`, `test_zhl`, `test_boot`, `test_adc`, `test_pins`); `pio run -e esp32`
+links **and is flashed and running on the devkit** with one ADS1115 module and an SSD1306 actually
+attached. The positive-ACK caveat that M0 left open is closed: `I2C1: 1 device(s) [0x48]`,
+`I2C0: 1 device(s) [0x3C]`, and the corresponding faults clear while the missing ones stay raised.
+Reads and writes on the attached converter are verified, not assumed: `a` write-verifies a register
+and restores it, `d` measures the conversion period field by field — which is how the register-map
+faults and the non-standard rate table in section 2 were found — and `g` measures who owns each GPIO
+and what its pads can do, which is how the pin map in section 3 was settled.**
 Layout note: PlatformIO only collects suites from `test/test_<name>/` folders (a bare `test/native/`
 group folder collects nothing), so the suites are `test/test_voting/`, `test/test_gas/`,
-`test/test_zhl/`, `test/test_boot/`, `test/test_adc/`. `test_build_src = no` in the `native` env: `src/` is ESP32-only by design and is
-not built on the host. `lib/core` is built natively and linked into every suite.
+`test/test_zhl/`, `test/test_boot/`, `test/test_adc/`, `test/test_pins/`. `test_build_src = no` in the
+`native` env: `src/` is ESP32-only by design and is not built on the host. `lib/core` is built
+natively and linked into every suite.
 
 Covered now: voting truth tables (agree, outlier, dead cell, two disagreeing -> lowest, three
 disagreeing -> DRIFT_ONE on the median, stuck-high, railed input, aged cell, zero-ppO2 tolerance
@@ -685,6 +723,14 @@ selects gain 16 + 32 SPS + explicit single-shot; the PGA gain/FSR/LSB tables (7.
 9 mV and 13 mV air signals as code counts, with clamping at full scale; conversion periods; mux
 power-down encodings excluded; ADS1115 vs ADS1015 separated 100x by the same rate field; and the
 bench module's measured rate table recorded as *not* the datasheet's).
+`test_pins`: no two roles share a GPIO (the defect that started it — 33 was the motor *and* the Page
+button); every output role sits on a pad that can actually drive (34–39 cannot, and an alarm that
+never actuates is silent); no role on a boot strapping pin; the no-such-pad set (24, 28–31), the
+die-pads-not-bonded-out set (20, 37, 38) and the flash set (6–11) each asserted as their own claim;
+34–39 input-only and without internal pulls; button pads asserted to have internal pull-ups; every
+pad number 0..39 has a decided capability word; the ADC/bus wiring matches the §3 table; and the
+spare output budget is asserted to be exactly one pad (17), so freeing a pin forces the §3 budget to
+be re-derived on purpose.
 
 - `pio test -e native` covers `lib/core/` **and** `lib/sim/` — the same physics models run on the
   host with no hardware. (They live under `lib/`, not `src/core`, so they build natively; `src/` is
@@ -704,7 +750,7 @@ bench module's measured rate table recorded as *not* the datasheet's).
 | # | Deliverable | Gate | Status (2026-11-19) |
 |---|---|---|---|
 | M0 | installer, build, flash, I2C scan, boot report | `pio run -t upload` works on this Mac | **DONE** — flashed and verified on the devkit (CP2102, ESP32-D0WD-V3): "Hash of data verified", clean boot banner, boot report correct on an empty bench, `[arm] REFUSED`. Section 15 holds the evidence. |
-| M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **boot + bench half verified on hardware, and now verified against a fitted converter**: boots clean, reports every miss, hot re-probe + bus retry + serial bench commands (`s p r c a d`) work; the ADS1115 register layer is written, its reads/writes are write-verified on hardware, and its part identity and rate table are measured, not assumed (9 native cases in `test_adc`, 14 in `test_boot`). Still open at M1: the alternating-mux 16 SPS/cell scheduler (needs cell 2 on AIN2/3), `lib/sim`, and the *measured* rate table applied to the sample-rate design (open item 13). |
+| M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **boot + bench half verified on hardware, and now verified against a fitted converter**: boots clean, reports every miss, hot re-probe + bus retry + serial bench commands (`s p r c a d g`) work; the ADS1115 register layer is written, its reads/writes are write-verified on hardware, and its part identity and rate table are measured, not assumed (9 native cases in `test_adc`, 14 in `test_boot`). Still open at M1: the alternating-mux scheduler at the **measured** per-cell rate (8 SPS on the fitted clone, not the designed 16 — needs cell 2 on AIN2/3), and `lib/sim`. Open item 13 is decided (decision 31: genuine TI parts), so the sample-rate design waits on parts, not on a decision. |
 | M2 | air cal + voting + diluent-flush check + alarms | native voting tests pass | voting + diluent-flush + cal sigma gate done natively; on-device wiring not started |
 | M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds 0x3E/0x3B (datasheet 8-bit 0x7C/0x77 corrected) and raises `BARO_RANGE_9M` when only the BMP085 answers; drivers not written |
 | M4 | ZHL-16C 3-gas + GF + ICD + CNS + MOD/END/density | validated natively **before** hardware depends on it | **engine complete and regression-anchored natively** (47 cases); *not* validated against a trusted computer yet — risk 13 |
@@ -767,6 +813,9 @@ Re-open only with the user's explicit agreement.
 | 28 | **The register map, PGA/RATE tables and cell scaling live in `lib/core/src/AdcRegs.h`** (pure C++), not in the ESP32 driver. | They were wrong twice — the rate field position and the MODE bit polarity — and constants that exist only in `src/` cannot be reached by `pio test -e native`. Moving them is what makes them assertable; `test/test_adc/` now pins them against the word measured on the bench module. |
 | 29 | **Converter identity and sample rate are established by measurement** (one timed single-shot conversion at the design field, plus bench command `d` for the whole rate table), **not by the ID register and not by the datasheet.** | The ID register cannot do the job: the bench module answers 0x00 there, at the pointer register too, while its config register behaves exactly as documented. Timing can: an ADS1015 differs 100x at the same rate field. And the datasheet's timing turned out not to describe the fitted part (62 ms where 31.25 ms is promised), so the interlock window and per-cell rate are derived from measurement — decisions 29 and risk 16 are the same fact seen from the code side and the parts side. |
 | 30 | **Arming refuses on any active FATAL, independently of the `blocksArming()` code table.** | Section 13 says "no unresolved FATAL", and the table contradicted it: `RAIL_3V3_LOW` is FATAL and was not listed, so a 3.3 V brown-out rail did not block arming. OLED, `I2C_BUS_STUCK` and `EXTERNAL_WATCHDOG` were also missing despite section 13 requiring them. The table stays for the ERROR-and-above cases; the FATAL rule is the safety net that a new code cannot fall through. |
+| 31 | **The ppO2 converters shall be genuine TI ADS1115s.** The fitted module stays on the bench for timing work only; it does not go near a dive. Resolves open item 13 as option (a). | User's call, 2026-11-19 ("use the ADS1115, not the ADS1115S"). Risk 16 already said sourcing known-genuine parts is a safety action, not a preference; this makes it the plan. Note for honesty: **"ADS1115S" has no findable datasheet**, so part identity here stays a *measurement* claim (decision 29: timed conversion at the design RATE field, `d` for the whole table), never a part-name claim. Independent corroboration that generic breakouts carry non-TI dies with off-datasheet rate tables: Hackaday 2025-10-15 "How Bad Can A Cheap Knockoff ADS1115 ADC Be?" and excamera.substack.com "How bad can a $2.97 ADC be?" (which reports relabelled ADS1015 dies). Acceptance test when new parts arrive: `d` must measure 8/16/32/64/128/250/475/860 SPS, `a` must read ID 0x85, and `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` must clear on their own. |
+| 32 | **GPIO 33 is the Page button; the vibration motor moves to GPIO 16.** Resolves open item 12. | User's call, 2026-11-19. The old note "avoid 16/17 (UART0 on most devkits)" was measured false on this board — bench command `g` shows the console is UART0 on **GPIO1(TX)/GPIO3(RX)**, periman confirms both, and the core's own `doitESP32devkitV1` variant header says `TX = 1; RX = 3`. 16/17 are free, output-capable, and their internal pulls work (measured). 33 is kept for the button because it has an internal pull-up (34–39 do not) and reading a button is what that pad is for. The motor keeps an external gate pulldown either way — an internal pull is not a fail-safe. 17 is declared the spare. |
+| 33 | **The GPIO capability table and the role assignment live in `lib/core/src/PinMap.h`** (pure C++, asserted by `test/test_pins/`); `src/config/Pins.h` is an alias, not a second copy. | Same remedy as decision 28, applied to a different class of defect. The pin map was a paragraph nobody could test, and it was wrong twice: GPIO 33 assigned to two functions, and pad groups assumed free or unusable based on the die instead of the module (measured: 24 and 28–31 do not exist on the ESP32-D0WD-V3 die at all; 20/37/38 exist but WROOM-32 does not bond them out). A duplicate pin or an output on an input-only pad is now a test failure rather than a bench-chase. |
 
 ---
 
@@ -819,6 +868,12 @@ Re-open only with the user's explicit agreement.
     value is available (`d` produces it at any time), and treat **sourcing known-genuine TI parts as a
     safety action**, not a preference: a die whose register map differs from its markings has no
     characterised noise, timing or power-on behaviour, and this device is primary life support.
+    **Decision 31 has now made that the plan**: genuine TI parts go in the ppO2 path, this module stays
+    on the bench for timing work. Generic "ADS1115" breakouts carrying non-TI dies is a documented,
+    independently-measured phenomenon (Hackaday 2025-10-15; excamera "How bad can a $2.97 ADC be?",
+    which also reports relabelled ADS1015 dies), so the acceptance test on arrival is measurement, not
+    the label: `d` measuring the eight datasheet rates and `a` reading ID 0x85. There is **no datasheet
+    for "ADS1115S"** — identity remains a measurement claim (decision 29), never a part-name claim.
 17. **A fault code that is not in a `switch` silently becomes INFO/"UNKNOWN" and stops blocking
     anything.** Every table in `FaultCode.h` has a `default`, so adding an enumerator without adding
     it to `defaultSeverity`, `blocksArming` and `faultName` produces a fault that reaches the fault
@@ -826,6 +881,15 @@ Re-open only with the user's explicit agreement.
     written. The test enumerates the whole code range against an explicit gap list, so adding a code
     forces the tables to be updated; keep that gap list current when adding codes, and prefer making
     the *severity* carry the gate (risk 17 + decision 30) over adding special cases.
+18. **A pin table can be wrong in a way that only shows up as a dead actuator or a phantom spare.**
+    This one table managed both: GPIO 33 was assigned to the vibration motor *and* the Page button at
+    the same time (a motor back-biasing a button read, found only by touching hardware), 16/17 were
+    written off as the console when this board's console is GPIO1/GPIO3, and the "free pins" a careful
+    reader computes from the die — 20, 24, 28–31 — do not exist on this die or are not bonded out by
+    this module. An output role on an input-only pad (34–39) fails **silently**: the haptic alarm just
+    never fires. The pin map therefore lives in `lib/core/src/PinMap.h` under `test/test_pins/`
+    (decision 33) and the pad claims/pulls are measured by bench command `g`. When adding a role, edit
+    the table and let the test say whether the pad exists, can drive, and is free.
 
 ---
 
@@ -844,9 +908,11 @@ Re-open only with the user's explicit agreement.
 | 9 | Enclosure, potting, moisture management, connector scheme | Not designed. Humidity kills this hardware; must be scheduled. |
 | 10 | Second independent computer + hand board selection | Required by section 13, not yet chosen. |
 | 11 | MS5837 mounting (Bar30 M10 bulkhead) and its drying discipline in the maintenance schedule | Part suggested, procedure written, not yet validated. |
-| 12 | **GPIO 33 is assigned to both the vibration motor and the Page button** (section 3) | Found while writing `src/config/Pins.h`. `BTN_PAGE` is left **unassigned (-1)** in code rather than silently sharing a pin with the motor. Needs a free pin chosen (candidates: 35 input-only if it is not used as a button, or move the motor). |
-| 13 | **The fitted ADS1115 module's rate table is not the datasheet's** (risk 16): 4 rates not 8, and the design's 32 SPS field gives 16.1 SPS | Two ways out, and the choice is the user's: (a) source known-genuine TI ADS1115 modules and re-run `d` to confirm, or (b) accept this part and re-derive the per-cell sample rate and control-loop timing from the measured table. (a) is preferred for a primary dive computer; (b) is viable but leaves an uncharacterised die in the ppO2 path. Firmware is written for measurement-driven timing either way. |
+| 12 | **GPIO 33 is assigned to both the vibration motor and the Page button** (section 3) | **RESOLVED 2026-11-19** (decision 32): 33 stays the Page button, the motor moves to GPIO 16. Measured by bench command `g`: this board's console is GPIO1/GPIO3, not 16/17. `test/test_pins/` now asserts no two roles share a pad, so the class of defect is closed too, not just this instance. |
+| 13 | **The fitted ADS1115 module's rate table is not the datasheet's** (risk 16): 4 rates not 8, and the design's 32 SPS field gives 16.1 SPS | **DECIDED 2026-11-19** (decision 31): option (a) — source known-genuine TI ADS1115s; the fitted module stays on the bench for timing work only. Outstanding action, not an open question: order the parts, then re-run `d` (must measure 8/16/32/64/128/250/475/860 SPS) and `a` (must read ID 0x85) and confirm `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` clear by themselves. Until then every timing figure in the firmware is derived from the measured table, so both parts work and neither is trusted from its label. |
 | 14 | **DRDY is wired to GPIO 23 but the line has only ever been read pulled-up and idle** | The driver currently polls the OS bit over I2C (348 us/poll measured). DRDY would cut that to an interrupt and make the coil/ADC interlock exact rather than polled. Needs the module's DRDY actually connected and the polarity/behavior measured (open-drain, needs a pull-up) before the scheduler can depend on it. |
+| 15 | **Display panel vs the pin budget** (new, from closing item 12): a SPI panel needs four pads (SCK/MOSI/DC/CS) and after the current map **only GPIO 17 is spare and output-capable** | The core's own SPI defaults (18/19/23) collide with I2C1 and ADS_U1_DRDY, so a panel cannot simply take `SPI.begin()` defaults. Options, none free: free the two DRDY pads by polling the OS bit instead (costs 348 us/poll and an exact interlock, item 14), take strapping pins against the §3 policy, or keep the panel on I2C and accept the frame-time cost (§12 says a >128x64 panel must not go on I2C). Must be argued with item 6 when the panel is chosen — not during bring-up at the water. |
+| 16 | **The ADS1115 module intermittently stopped answering on I2C1** (seen once 2026-11-19: `SDA held low before init`, probes returning **err 5 = timeout**, nine clocks + port re-init did not free it; it was normal again at the next boot without any change) | Reported honestly by the boot report at the time, which is the correct behaviour, but a flaky I2C1 connection on a CCR is a maintenance finding, not a firmware bug. Action: re-seat and then positively secure the module's VDD/GND/SDA/SCL jumpers (or solder/pin-lock them) before any further timing work, since a converter that drops out mid-dive is a `FAULT_LOCKOUT` by design. |
 
 ---
 
@@ -976,3 +1042,37 @@ Re-open only with the user's explicit agreement.
   `esp_arduino_version.h`, with `esp32-hal-i2c-ng.c` read to source-confirm decision 25 (a
   zero-length `i2cWrite()` takes the `i2c_master_probe()` branch; any payload takes
   `i2c_master_transmit()` *and* caches a per-address device handle).
+
+- 2026-11-19 (pin map + sourcing): two user decisions taken and logged — **the ppO2 converters shall
+  be genuine TI ADS1115s** (decision 31, closes open item 13 as option (a): the fitted variant stays
+  bench-only for timing work) and **GPIO 33 stays the Page button, the vibration motor moves to
+  GPIO 16** (decision 32, closes open item 12).
+  Chasing item 12 exposed that the "free pins" list in §3 was fiction, so the pin map was moved into
+  `lib/core/src/PinMap.h` as an asserted table (decision 33, the decision-28 remedy applied to a
+  different defect class) and `src/config/Pins.h` became an alias. New suite `test/test_pins/`:
+  **80 native cases green** across six suites.
+  **Measured on hardware, all of it by the new bench command `g`** (pad map + pad test):
+  1. **the console is UART0 on GPIO1(TX)/GPIO3(RX)** — periman reports both as UART-owned, and the §3
+     note "avoid 16/17, they are UART0 on most devkits" is **false on this board**. The core's own
+     `doitESP32devkitV1` variant header says `TX = 1; RX = 3`. So 16/17 are genuine free pads, which
+     is what made the motor move possible.
+  2. **16 and 17 are output-capable and their internal pull-up/pull-down work** (pull-up reads 1,
+     pull-down reads 0, driven level retained when left high-Z); **34–39 have no pulls at all** (the
+     driver answers `GPIO number error`) — a switch there is an external-resistor BOM item.
+  3. **GPIO 24 and 28–31 do not exist on the ESP32-D0WD-V3 die** (periman: `Invalid pin`), and
+     **20, 37, 38** are die pads the WROOM-32 module does not bond out. The capability table now keeps
+     those two reasons separate (`noSuchPad` vs `kDieOnly`) instead of calling both "not bonded".
+  4. **After the map there is exactly one spare output-capable pad (GPIO 17)** — asserted as a number,
+     so the next pin freed forces the §3 budget to be re-derived. That immediately surfaced a new open
+     item (15): a SPI display needs four pads and the core's default SPI pins (18/19/23) collide with
+     I2C1 and `ADS_U1_DRDY`, so the panel decision (item 6) and the pin budget have to be argued
+     together, in advance.
+  Also read out of `Wire.cpp` rather than guessed, and recorded in `BusProbe.cpp`: probe return codes
+  **2 = NACK on address (nothing there)** vs **5 = timeout (the bus is being held)**. The difference
+  earned its keep the same day — the ADS1115 module once booted with `I2C1 SDA held low`, both
+  converters `err 5`, `I2C_BUS_STUCK` raised, nine clocks and a port re-init not freeing it, and it
+  was normal again at the next boot: a flaky jumper, truthfully reported (open item 16, a maintenance
+  action, not a firmware bug). `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` and the 62 ms conversion period
+  reproduced unchanged on the module after it came back (`0x48 61mS DS31mS 98%`).
+  App now 466,973 B flash (29.7%), 35,600 B RAM (10.9%); flashed and running. §2/§3/§14/§15/§16
+  updated, decisions 31–33, risk 18, open items 12/13 closed with their resolutions and 15/16 added.
