@@ -416,6 +416,15 @@ void baroIdentity() {
                                       "ROM, no number\n",
                                       (int)g_bmp085.lastStatus(), g_bmp085.calRomBadIndex());
                     } else {
+                        // All 11 trim words, Table 5 order. Both compensation implementations read
+                        // these same words, so driver-vs-library agreement proves the arithmetic —
+                        // absolute pressure can only be as good as the trim. Printed so an
+                        // absolute-offset finding is diagnosable from the capture alone.
+                        const baro::Cal& c = g_bmp085.calRom();
+                        Serial.printf("    cal ROM: AC1=%d AC2=%d AC3=%d AC4=%u AC5=%u AC6=%u "
+                                      "B1=%d B2=%d MB=%d MC=%d MD=%d\n",
+                                      c.ac1, c.ac2, c.ac3, c.ac4, c.ac5, c.ac6, c.b1, c.b2,
+                                      c.mb, c.mc, c.md);
                         float a1 = 0, a2 = 0, t1 = 0, t2 = 0;
                         if (g_bmp085.read(&a1, &t1) && g_bmp085.read(&a2, &t2)) {
                             Serial.printf("    driver (oss=2): %.2f mbar -> %.2f mbar  %.1f C   "

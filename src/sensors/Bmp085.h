@@ -42,6 +42,11 @@ class Bmp085 : public Barometer {
     uint16_t lastUt() const { return lastUt_; }
     uint32_t lastUp() const { return lastUp_; }
     int32_t lastB5() const { return lastB5_; }
+    // Cal ROM after a successful init(): bench 'b' prints all 11 words. An absolute-pressure
+    // error can only come from the part's trim or its analog front end — the words are what
+    // distinguish those, and both compensation implementations read the same words, so
+    // their agreement proves the arithmetic, never the trim.
+    const baro::Cal& calRom() const { return cal_; }
 
     bool init() override {
         calBadIdx_ = -1;

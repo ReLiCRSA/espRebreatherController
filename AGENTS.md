@@ -152,10 +152,35 @@ the Adafruit product page and the Adafruit 4-Channel ADC Breakouts guide (2026-1
   decision 37. The remembered "AC1=7295, UT=27898, UP=23843" constants appear in no source and
   are banned as anchors. Driver `src/sensors/Bmp085.h` + `checkBaro()` do CHIPID + cal-ROM + one
   real conversion at boot and on presence transitions; a failure raises `BARO_CONV_BAD` (ERROR,
-  blocks arming — a baro that ACKs but cannot measure is not a depth source). **Built and
-  linking, not yet measured on the part**: the devkit is not enumerating on USB; the acceptance
-  run (bench `b` showing ~1013 mbar, moving when squeezed, agreeing with the Adafruit library)
-  is open.
+  blocks arming — a baro that ACKs but cannot measure is not a depth source).
+- **Measured on the part (M3, 2026-11-20 — flashed and captured).** Boot:
+  `BARO @0x77 BMP180: 977.72 mbar  25.2 C  (UT=28474 UP=162080 B5=4034 oss=2) — fallback, 9 m
+  clamp`, no `BARO_CONV_BAD`, `[arm] checklist: sensors ok` unchanged. Bench `b` cross-checks two
+  independent implementations on the same module: driver 977.75/977.78 vs Adafruit library 977.76
+  mbar at rest (**0.02 mbar**; 0.00–0.15 settled, worst 0.5 from reads 0.5 s apart during a fast
+  thermal transient), and a **host hand recompute** from the cal ROM + raw wire words the bench
+  now dumps (UT=28580 UP=161865 → B5=4136, T=25.9 °C, p=97786 Pa) reproduces the on-target
+  driver — xtensa arithmetic == host arithmetic on real words. Full trim set: `AC1=8604
+  AC2=-1137 AC3=-14532 AC4=32654 AC5=24782 AC6=19804 B1=5498 B2=60 MB=-32768 MC=-11075 MD=2432`.
+  Stimulus: finger-squeeze drove die temp 25.2→31.0 °C (UT 28474→29438, B5 4034→4953) while the
+  reading stayed inside ±0.4 mbar — the compensation rejects temperature; pressing the port
+  moved it coherently (977.7→978.4). This closes item 17's second half (conversion behaviour
+  proven on the die).
+- **Open finding (item 18): the module's absolute pressure is far out of spec.** The bench is at
+  0–100 m elevation (user-confirmed) and today's Cape Town sea-level pressure is **1017 hPa**
+  (yr.no hourly 1017–1018, NOAA FCW corroborates) — expected station pressure 1005–1017 hPa,
+  measured **977.7 mbar**, reproduced to ±0.2 mbar across three `b` captures and two USB
+  sessions. The BMP180 DS's own table: "Absolute accuracy pressure VDD = 3.3V 300 . . . 1100 hPa
+  0 . . . +65 °C **-4.0** -1.0* +2.0 hPa" (Min/Typ/Max) — the offset is 7–10x worse than the
+  worst case. Arithmetic is ruled out three ways (driver, deployed library, hand recompute all
+  agree to 0.1 mbar on the same words), so the error is **in the part**: its trim, its analog
+  front end, or a die emulating the BMP180 map — CHIPID 0x55 is necessary, not sufficient
+  (decision 36's lesson inverted: an emulated fingerprint is possible even when the map works).
+  Design impact is bounded because depth uses **learned Psurf** + relative accuracy (DS:
+  "Relative accuracy 950 . . . 1050 hPa @25 °C ±0.12 hPa ±1.0 m"), and the 900–1100 mbar
+  air-cal gate passes at 977.7; what is **not** yet discriminated is offset (harmless under
+  learned Psurf) vs ~3.8% gain error (~0.4 m depth error at 10 m). Item 18 holds the trend test
+  that discriminates them, and this makes the MS5837 primary procurement more load-bearing.
 - Depth = `(Pamb - Psurf) * k`; `Psurf` is **learned at boot** (only relative accuracy matters,
   +/-2 mbar ~ 2 cm, not the +/-200 mbar absolute spec). Salinity configurable (fresh 1.000,
   salt 1.025). Learned Psurf also gates air calibration.
@@ -776,14 +801,16 @@ bench procedure.
 (`test_voting`, `test_gas`, `test_zhl`, `test_boot`, `test_adc`, `test_pins`, `test_sim`,
 `test_baro`); `pio run -e esp32` links **and is flashed and running on the devkit** with two
 ADS1115 modules, an SSD1306 and an Adafruit BMP085 actually attached (the converters measure as
-clones — risk 16, decision 31; the BMP085 measures as genuine — decision 36). **Caveat on the
-Bosch baro path (M3, same day):** `Bmp085`/`BaroBosch`/`checkBaro()`/extended bench `b` are
-built and link, but **not yet flashed or captured** — the devkit stopped enumerating on USB
-(no `/dev/cu.usbserial-*` node; recorded as a fact, no defect inferred, §20 item 16's lesson).
-The acceptance test that closes item 17's second half — a real ~1013 mbar conversion on the
-fitted module, moving when squeezed, agreeing with the Adafruit library — is **still open** until
-the board comes back and `b` is captured. The claims below are from the previously flashed
-image.** The
+clones — risk 16, decision 31; the BMP085 measures as genuine — decision 36). **The M3 Bosch
+baro path (`Bmp085`/`BaroBosch`/`checkBaro()`/extended bench `b`) is now flashed and measured on
+the part** — the USB dropout cleared by itself (port reappeared; two flashes verified, recorded
+as a fact, no defect inferred, item 16's lesson). The acceptance conversion is captured §2:
+driver-vs-Adafruit-library agreement 0.02 mbar, stimulus response proven, hand recompute of the
+dumped words matches the on-target driver — item 17's second half **closed**. The same capture
+**opened item 18: the module reads ~27–39 hPa below the weather reference at a near-sea-level
+bench, 7–10x the DS absolute-accuracy worst case — a part-level offset, arithmetic exonerated
+three ways.** The ADC/pin claims below were captured on the pre-M3 image; nothing in M3 touches
+them, and the baro numbers are from the current image.** The
 positive-ACK caveat that M0 left open is closed: `I2C1: 2 device(s) [0x48 0x49]`,
 `I2C0: 2 device(s) [0x77 0x3C]`, and the corresponding faults clear while the missing ones stay
 raised — including the designed fallback behaviour: with only the BMP085 answering,
@@ -885,7 +912,7 @@ corrupt cal ROM refused before any arithmetic (`converted=false`, no divide-by-z
 | M0 | installer, build, flash, I2C scan, boot report | `pio run -t upload` works on this Mac | **DONE** — flashed and verified on the devkit (CP2102, ESP32-D0WD-V3): "Hash of data verified", clean boot banner, boot report correct on an empty bench, `[arm] REFUSED`. Section 15 holds the evidence. |
 | M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **DONE (2026-11-19).** Boot/bench and the simulator were verified earlier; the last open item, the **alternating-mux scheduler**, is now implemented and measured: `AdcPairWalker` in `src/sensors/Ads1115Bus` — non-blocking pair-step state machine, sized from the boot-measured conversion period (never the datasheet), polled OS bit at 10 ms cadence (DRDY still unwired, open item 14), I2C-error backoff, and a coil/ADC interlock window carried per converter. Bench `t` measures it: **7.2 SPS per cell achieved** on the fitted clones (design 16, clone-sized 8), in-walk periods 65.5-67.1 ms, interlock busy duty **95-96%** → decision 34: M5 must carve explicit pulse slots. `lib/sim` runs the fixed 26-min profile headless on the board (bench `v`) at hand-computed pulse demand; **94 native cases green** in seven suites. Open item 13's outstanding action (order two Adafruit #1085 breakouts — decision 35 — and re-run `d`/`a`/`t`) stands — the walker re-sizes itself from the new parts' own measurement at boot. |
 | M2 | air cal + voting + diluent-flush check + alarms | native voting tests pass | voting + diluent-flush + cal sigma gate done natively; on-device wiring not started |
-| M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds **0x76/0x77** (datasheet 7-bit forms, decision 36 — the old 0x3E/0x3B were phantoms) and raises `BARO_RANGE_9M` when only the BMP085 answers — **measured on the bench 2026-11-20: the fitted Adafruit BMP085 is found at 0x77 and `BARO_RANGE_9M depth clamps 9 m` fires**. **BMP085 driver now written** (2026-11-20): `lib/core/src/BaroBosch.h` (register map + cal-ROM rule + compensation, pinned by 8 native cases in `test/test_baro/`) + `src/sensors/Bmp085.h` + `checkBaro()` active identity check + bench `b` extended with a live conversion and an Adafruit-library cross-check — **built and linking, not yet flashed: the devkit is not enumerating on USB**. M3's remaining work: flash + capture `b` (real ~1013 mbar, moves when squeezed, agrees with the library — closes item 17's second half), `Ms5837` driver (waits for the part; PROM read confirms identity), `Depth` (learned Psurf, salinity, 9 m clamp), README wiring |
+| M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds **0x76/0x77** (datasheet 7-bit forms, decision 36 — the old 0x3E/0x3B were phantoms) and raises `BARO_RANGE_9M` when only the BMP085 answers — **measured on the bench 2026-11-20: the fitted Adafruit BMP085 is found at 0x77 and `BARO_RANGE_9M depth clamps 9 m` fires**. **BMP085 driver now written** (2026-11-20): `lib/core/src/BaroBosch.h` (register map + cal-ROM rule + compensation, pinned by 8 native cases in `test/test_baro/`) + `src/sensors/Bmp085.h` + `checkBaro()` active identity check + bench `b` extended with a live conversion, a full cal-ROM dump, and an Adafruit-library cross-check — **flashed and proven on the part 2026-11-20**: boot prints `BARO @0x77 BMP180: 977.72 mbar 25.2 C (UT=28474 UP=162080 B5=4034 oss=2)` with no `BARO_CONV_BAD`; `b`: driver 977.75/977.78 vs library 977.76 mbar (0.02 mbar), hand recompute from the dumped words reproduces the on-target arithmetic, squeeze/port stimulus moves the reading and T tracks — **item 17's second half closed**. The capture also raised **item 18: absolute pressure −27…−39 hPa vs the weather reference at a near-sea-level bench, ~7–10x the DS absolute-accuracy spec; arithmetic ruled out three ways, the offset is in the part**. M3's remaining work: `Ms5837` driver (waits for the part — item 18 makes it more load-bearing; PROM read confirms identity), `Depth` (learned Psurf, salinity, 9 m clamp), `Ina219`, README wiring |
 | M4 | ZHL-16C 3-gas + GF + ICD + CNS + MOD/END/density | validated natively **before** hardware depends on it | **engine complete and regression-anchored natively** (47 cases); *not* validated against a trusted computer yet — risk 13 |
 | M5 | pulse-driven solenoid + click verification + breathing-state machine + bailout | three-way solenoid fault taxonomy + ADC-window interlock | not started |
 | M6 | web + WS + settings + cal UI + dive-log graphs | phone on SoftAP, all tabs, offline graphs render | not started (deps resolve and compile) |
@@ -1095,6 +1122,7 @@ Re-open only with the user's explicit agreement.
 | 15 | **Display panel vs the pin budget** (new, from closing item 12): a SPI panel needs four pads (SCK/MOSI/DC/CS) and after the current map **only GPIO 17 is spare and output-capable** | The core's own SPI defaults (18/19/23) collide with I2C1 and ADS_U1_DRDY, so a panel cannot simply take `SPI.begin()` defaults. Options, none free: free the two DRDY pads by polling the OS bit instead (costs 348 us/poll and an exact interlock, item 14), take strapping pins against the §3 policy, or keep the panel on I2C and accept the frame-time cost (§12 says a >128x64 panel must not go on I2C). Must be argued with item 6 when the panel is chosen — not during bring-up at the water. |
 | 16 | **The ADS1115 module stopped answering on I2C1** (`SDA held low before init`, probes returning **err 5 = timeout**, nine clocks + port re-init did not free it) | **CLOSED 2026-11-19 — not a fault.** The user confirms the dropouts were **their own intervention on the bench** (the module being unplugged/re-fitted), not a flaky connection. Nothing to fix and no maintenance action. What the episode is kept for is the diagnostic it produced: `err 5` (bus being held) vs `err 2` (address unanswered) are different hardware stories, and **a converter that has lost its supply clamps SDA/SCL through its protection diodes** — that is exactly what a disconnected or unpowered module looks like, and exactly what a converter failing mid-dive will look like in the log. Securing jumpers for the dive build stays good practice (§20 item 9, enclosure/connector work), but it is not a corrective action for anything seen so far. |
 | 17 | **"The fitted BMP085 is a Bosch-family clone" (ACKs 0x77, silent 0x3B; `0xD1=0x02` not 0x43, AC1=8604 not 7295) — recorded 2026-11-20 by bench `b`** | **CLOSED 2026-11-20 — misdiagnosis, the module is fine.** All three "disagreements" were the *report's* errors, not the part's: 0x3B was a phantom produced by halving the datasheet's 0x77 (Bosch DS Table 7: bits `1110111`+R/W = 7-bit **0x77**, which is where the module correctly answers); 0xD1 is undefined in the BMP180 datasheet, so its readback 0x02 proves nothing (0x43 is BMP085-only); the 0xAA–0xBF cal block is per-chip factory trim, 8604 is normal, 7295 is the DS's worked example. The module is an Adafruit BMP085 (BMP180 die) behaving exactly as specified. The real defect was in the probe table — fixed to 0x76/0x77 (decision 36), and boot now finds it: `I2C0: [0x77 0x3C]`, `BARO_RANGE_9M depth clamps 9 m`, correct fallback behaviour. The fallback part question is therefore **resolved: the fitted module is the fallback**. What stays open in miniature: the MS5837 (0x76) is still unprocured/unfitted, so its side of the table is datasheet-derived until one is measured; and the BMP180's conversion behaviour is trusted only once `Bmp085.cpp` makes it produce a real, sane pressure (identity by register reads is necessary, not sufficient). |
+| 18 | **The fitted BMP180's absolute pressure is far out of spec**: it reads 977.7 mbar at a bench user-confirmed at 0–100 m elevation, while Cape Town sea-level pressure that day is 1017 hPa (yr.no hourly 1017–1018; NOAA FCW corroborates) — an offset of **−27…−39 hPa** against the DS's own "Absolute accuracy pressure VDD = 3.3V 300 . . . 1100 hPa 0 . . . +65 °C −4.0 / −1.0* / +2.0 hPa". Reproduced to ±0.2 mbar across three `b` captures and two USB sessions | **OPEN, diagnosed as far as the evidence goes.** Arithmetic is exonerated three ways — firmware driver, deployed Adafruit library on the same module, and a host hand recompute from the dumped cal ROM + raw wire words all agree within 0.1 mbar — so the offset lives in the part: its trim (all 11 words dumped and sane against the DS validity rule), its analog front end, or a die wearing an emulated BMP180 map (CHIPID 0x55 is necessary, not sufficient — decision 36 inverted). The T channel is sane (25.2–25.9 °C at rest, tracks to 31.0 under a finger; ±0.4 mbar rejection across a 5.8 °C die rise) and port-press moves it coherently, so it is measuring. **Design impact bounded:** depth uses learned `Psurf`, so a pure static offset is invisible to depth (the ±0.12 hPa relative spec is what matters, corroborated by the T-rejection data), and the 900–1100 mbar air-cal gate passes at 977.7. **Not yet discriminated:** pure offset (harmless) vs ~3.8% gain error (~0.4 m depth error at 10 m, ~1.9 m at 50 m). Closing test: trend correlation — module delta vs the published pressure trend over hours (that day's yr.no curve: 1018→1014); Δmodule ≈ Δreference ⇒ gain ≈ 1, offset-only. Actions: this **elevates MS5837 procurement** (0–30 bar, PROM-confirmed identity; the fallback's absolute channel is untrusted until quantified); cross-compare against a second known-good barometer if one is handy; do **not** firmware-compensate an unquantified offset — learned `Psurf` already absorbs whatever is static. |
 
 ---
 
@@ -1502,3 +1530,37 @@ Re-open only with the user's explicit agreement.
   tables). The acceptance test that closes item 17's second half — ~1013 mbar at the surface,
   moving when squeezed, driver agreeing with the Adafruit library on the same silicon — runs the
   moment the board enumerates again.
+
+- 2026-11-20 (M3 flashed + acceptance captured + new finding): **the Bosch fallback ran on the
+  part — and the capture found something no test could: the module's absolute pressure is out of
+  spec.** The devkit re-enumerated on USB by itself (`/dev/cu.usbserial-0001` back; recorded as a
+  fact, no cause assigned — item 16's lesson); two flashes verified ("Hash of data verified").
+  Boot now prints `BARO @0x77 BMP180: 977.72 mbar  25.2 C  (UT=28474 UP=162080 B5=4034 oss=2) —
+  fallback, 9 m clamp`, no `BARO_CONV_BAD`, `[arm] checklist: sensors ok` unchanged. Bench `b`
+  gained a full cal-ROM dump (`calRom()` getter + printf) so an absolute-offset finding is
+  diagnosable from the capture alone: `AC1=8604 AC2=-1137 AC3=-14532 AC4=32654 AC5=24782
+  AC6=19804 B1=5498 B2=60 MB=-32768 MC=-11075 MD=2432` — all sane against the DS's own 0/0xFFFF
+  validity rule. **Item 17's second half closed on three independent agreements:** firmware
+  driver 977.75/977.78 vs deployed Adafruit library 977.76 mbar (0.02 mbar at rest; 0.00–0.15
+  settled; worst 0.5 from reads 0.5 s apart during a fast thermal transient), and a host hand
+  recompute from the dumped words (UT=28580 UP=161865 → B5=4136, T=25.9 °C, 97786 Pa) that
+  reproduces the on-target driver — xtensa == host arithmetic on real words. **Stimulus
+  proven:** finger-squeeze drove die temp 25.2→31.0 °C (UT 28474→29438, B5 4034→4953) with the
+  reading held inside ±0.4 mbar (compensation rejects temperature), and port-press moved it
+  coherently (977.7→978.4).
+  **The finding (new §20 item 18):** the bench is at 0–100 m (user-confirmed) and Cape Town's
+  sea-level pressure that day is 1017 hPa (yr.no hourly; NOAA FCW corroborates), yet the module
+  reads 977.7 mbar — −27…−39 hPa against the DS's own absolute-accuracy table ("Absolute
+  accuracy pressure VDD = 3.3V 300 . . . 1100 hPa 0 . . . +65 °C −4.0 / −1.0* / +2.0 hPa"),
+  i.e. 7–10x the worst case, reproduced to ±0.2 mbar across three captures and two sessions.
+  Arithmetic is exonerated three ways (driver, deployed library, hand recompute all agree on the
+  same wire words), so the offset is **in the part** — trim, analog front end, or an emulated
+  BMP180 map (CHIPID 0x55 is necessary, not sufficient: decision 36's lesson inverted, an
+  emulated fingerprint is possible even when the map works). Risk 21 in a new currency again:
+  **the expectation "~1013 mbar at the surface" was itself unverified** — a plausible number,
+  not a measured one; acceptance needed a *measured local reference*, not a nominal one. Design
+  impact bounded: learned `Psurf` makes a static offset invisible to depth, the ±0.12 hPa
+  relative spec is corroborated by the T-rejection data, and the air-cal 900–1100 mbar gate
+  passes at 977.7; offset-vs-gain is discriminated by a trend correlation the item spells out.
+  The MS5837 primary procurement is now more load-bearing. `pio test -e native` re-run:
+  **102 green**. Code + docs committed.

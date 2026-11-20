@@ -9,8 +9,12 @@
 // example's documented 15.0 C EXACTLY; under the (wrong) first transcription it gave 431.6 C.
 // Self-consistency at the documented result was the discriminator — see the PROVENANCE block in
 // BaroBosch.h. This suite pins the arithmetic against accidental future edits; belief in the
-// algorithm still comes from hardware: bench 'b' must show ~1013 mbar, a value that moves when
-// squeezed, and agreement with the Adafruit library on the same physical module.
+// algorithm still comes from hardware: bench 'b' must show a real local-station mbar that moves
+// when the port is stimulated, and agreement with the Adafruit library on the same physical
+// module. (Captured 2026-11-20: agreement 0.02 mbar, stimulus proven, hand recompute from the
+// dumped words matches the on-target driver. The absolute value read 977.7 mbar at a near-sea-
+// level bench against a 1017 hPa weather reference — an open part-level finding, AGENTS.md
+// §20 item 18 — so ~1013 was the wrong expectation to state here; arithmetic is exonerated.)
 #include "BaroBosch.h"
 #include "unity.h"
 
