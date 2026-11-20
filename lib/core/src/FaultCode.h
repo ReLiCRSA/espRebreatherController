@@ -10,11 +10,12 @@ enum class FaultCode : uint16_t {
     ADS1115_U1 = 10,
     ADS1115_U2 = 11,
     BARO = 12,
-    BARO_RANGE = 13, // fitted baro cannot cover the design depth range: BMP085 fallback
-                     // saturates at 1.1 bar abs — under 1 m of water at sea level (~1.2 m at
-                     // a 978 mbar bench), NOT the "~9 m" the early design record asserted
-                     // (decision 38; test/test_depth pins the arithmetic). The banner quotes
-                     // the computed ceiling from depth::ceilingMeters(), never a recited figure.
+    BARO_RANGE = 13, // fitted baro cannot cover the design depth range (decision 39 tiering):
+                     // the BMP085/180 fallback saturates at 1.1 bar abs — under 1 m of water —
+                     // and the LPS28DFW tier-2 at 4.06 bar abs — ~31 m at this bench. Neither
+                     // figure is recited: the banner quotes the COMPUTED ceiling from
+                     // depth::ceilingMeters() against the learned Psurf (decision 38;
+                     // test/test_depth pins the hydrostatics, test/test_lps28 the tier-2 case).
     OLED = 14,
     INA219 = 15,
     I2C_BUS_STUCK = 16,
@@ -55,6 +56,13 @@ enum class FaultCode : uint16_t {
     // when it does not. Same logic as ADC_CONV_BAD one register over: a depth input that does not
     // measure must refuse an arm, not silently report an extrapolation (risk 1).
     BARO_CONV_BAD = 26,
+
+    // The only depth source that passed identity is the BMP085/180 — a BENCH sensor since
+    // decision 39 (300-1100 hPa = a water column under 1.3 m; MS5837 is primary, LPS28DFW
+    // tier 2). Bench mode works fully with it, and it is a fine cross-check, but it must never
+    // be what a dive arms on. Takes the previously-unassigned value 27 deliberately: fault
+    // values are stable once shipped, and test_boot's walk keeps the gap list honest.
+    BARO_BENCH_ONLY = 27,
 
     // Power
     VBAT_LOW = 30,
@@ -124,6 +132,10 @@ inline Severity defaultSeverity(FaultCode c) {
         // The baro equivalent: ACKs, but its cal ROM is corrupt, its conversion did not complete,
         // or its result is outside the part's own range. Depth cannot be trusted either way.
         case FaultCode::BARO_CONV_BAD:
+        // The only depth source that passed identity is the bench-only BMP180 (decision 39):
+        // ERROR at boot like the range banner, but this one DOES refuse an arm — a dive computer
+        // with no depth source that reaches dive depth is not a dive computer.
+        case FaultCode::BARO_BENCH_ONLY:
         case FaultCode::OLED:
         case FaultCode::INA219:
         case FaultCode::LITTLEFS:
@@ -172,6 +184,7 @@ inline bool blocksArming(FaultCode c) {
         case FaultCode::ADC_CONV_BAD:
         case FaultCode::BARO:
         case FaultCode::BARO_CONV_BAD:   // a baro that ACKs but cannot measure is not a depth source
+        case FaultCode::BARO_BENCH_ONLY: // decision 39: BMP180-class sole depth source is bench-only
         case FaultCode::OLED:              // AGENTS.md 13: the in-water display is required to arm
         case FaultCode::I2C_BUS_STUCK:    // a bus that failed to init carries ppO2 and depth
         case FaultCode::EXTERNAL_WATCHDOG:
@@ -206,6 +219,7 @@ inline const char* faultName(FaultCode c) {
         // should be read as this same code with the corrected ceiling.
         case FaultCode::BARO_RANGE: return "BARO_RANGE_CLAMP";
         case FaultCode::BARO_CONV_BAD: return "BARO_CONV_BAD";
+        case FaultCode::BARO_BENCH_ONLY: return "BARO_BENCH_ONLY";
         case FaultCode::OLED: return "OLED";
         case FaultCode::INA219: return "INA219";
         case FaultCode::I2C_BUS_STUCK: return "I2C_BUS_STUCK";

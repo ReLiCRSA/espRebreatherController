@@ -1,7 +1,13 @@
 # HANDOFF.md — session transfer snapshot
 
 **Written:** 2026-11-19, after the headless dive simulator was written and run on real hardware.
-**Updated:** 2026-11-20 (late, second pass), after **M3's code completed**: `Depth.h` + learned
+**Updated:** 2026-11-20 (late, third pass), after **decision 39: three-tier depth sensing** —
+MS5837-30BA primary → LPS28DFW (mode 2) armable fallback → BMP180 bench-only. `BaroLps28.h` +
+`Lps28dfw.h` + `checkLps28()` + bench `b`'s LPS28 section written (part unprocured, ST vendor
+driver anchored), `BARO_BENCH_ONLY = 27` raised when the BMP is the sole depth source, and the
+**on-target baseline changed as intended: the BMP-only bench now prints "bench-only tier" +
+`BARO_BENCH_ONLY` + `[arm] REFUSED`**. 123 native cases, 12 suites; flashed 506,989 B (32.2%).
+Earlier the same day (second pass), after **M3's code completed**: `Depth.h` + learned
 Psurf (proven on-target: 977.89 mbar σ 0.06), MS5837 + INA219 drivers written and natively pinned
 (**parts unprocured/unfitted — written-not-measured**), identity-based baro selection, bench `w`,
 `README.md` written — and after **decision 38 corrected the record's "~9 m" fallback ceiling to
@@ -22,9 +28,10 @@ ESP32 classic CCR rebreather dive computer. `lib/core` (deco engine, voting, gas
 the ADC register map, the GPIO pin map, the **source interfaces** in `SensorIf.h`, the
 **Bosch baro map + compensation** in `BaroBosch.h`, and since 2026-11-20 late the **depth math**
 (`Depth.h`: learned Psurf, salinity, computed range clamp), the **MS5837 map + compensation**
-(`BaroMs5837.h`) and the **INA219 map** (`PwrRegs.h`)) plus
+(`BaroMs5837.h`), the **INA219 map** (`PwrRegs.h`) and the **LPS28DFW map + scaling**
+(`BaroLps28.h`, decision 39 tier-2)) plus
 **`lib/sim`** (SimBaro, SimCells, LoopModel, ValveModel, CcrControlLaw, SimRunner) are complete and
-regression-anchored: **117 native cases green** across eleven suites. `src/` boots on the board:
+regression-anchored: **123 native cases green** across twelve suites. `src/` boots on the board:
 safe-state pins first, bounded I2C presence probing, active converter checks, honest boot fault
 report, arming refusal, hot re-probe every 5 s, two alternating-mux pair walkers running in `loop()`,
 serial bench commands (`s p r c a d t b w g v`).
@@ -44,7 +51,20 @@ saturates ~9 m" was **10x wrong** — the part's whole gauge range is ~87 mbar �
 water** (~1.2 m at this bench). The banner now prints a *computed* ceiling (`BARO_RANGE_CLAMP
 clamps 1.2m@978mbar`) instead of a recited figure. Consequence: **the fitted fallback is not a
 dive depth source — the MS5837 procurement is load-bearing, and M3's gate ("fallback verified by
-removing the MS5837") cannot close until a Bar30 is fitted.** Bench `v` runs the fixed 26-min profile **headless on the board**, closed
+removing the MS5837") cannot close until a Bar30 is fitted.** **Later the same day, decision 39
+(user-directed) made the depth path three tiers: MS5837-30BA primary → LPS28DFW (mode 2, FS
+4060 hPa ABSOLUTE ⇒ ~30.7 m computed gauge ceiling at this bench, NOT the marketing "40 m")
+armable fallback → BMP180 BENCH-ONLY.** `BaroLps28.h` + `src/sensors/Lps28dfw.h` + `checkLps28()`
+are written (identity = WHO_AM_I 0xB4 + SWRESET self-clear + **FS_MODE latched on readback** + a
+real conversion — no PROM on this silicon, so the capability chain carries the identity; ST's own
+vendor driver is the transcription anchor per decision 37) — **written-not-measured: #6067 is
+unprocured**. New fault `BARO_BENCH_ONLY = 27` (ERROR, blocks arming) fires when the BMP is the
+only depth source that passed identity, and the **on-target baseline changed as intended**: the
+BMP-only bench boots `BARO @0x77 BMP180: … — bench-only tier, clamps 0.9m SL1013mbar` +
+`ERROR BARO_BENCH_ONLY BMP180 sole: bench only` + **`[arm] REFUSED`** (was: `[arm] checklist:
+sensors ok`). Integration also found and fixed a real defect: fallback success paths used to clear
+`BARO_CONV_BAD` unconditionally, erasing a 0x76-squatter's arming block; clears are now gated on a
+per-pass squatter flag. Bench `v` runs the fixed 26-min profile **headless on the board**, closed
 loop through the real voter/gas/ZHL stack, mole-balanced against hand calculations (136 pulses /
 20.40 amb L, 2 pulses/min at the 30 m bottom — risk 20), SIM-stamped, ~30 s wall, worst tick
 **41.5 ms measured on-target** (risk 19 — this was the "hang" that turned out to be cost). M1's last
@@ -53,7 +73,8 @@ and measured (bench `t`): **7.2 SPS per cell achieved** on the fitted clones, in
 **95-96%** — decision 34: M5's pulse scheduler must carve explicit conversion-free slots, the
 incidental gap is only ~2-3 ms. **Fitted today: two ADS1115-class modules (0x48 + 0x49, the
 clones — bench parts only, decision 31) on I2C1, and an SSD1306 (0x3C) plus the Adafruit BMP085
-(0x77) on I2C0. Outstanding hardware, not code: the MS5837-30BA (Bar30) and the
+(0x77) on I2C0. Outstanding hardware, not code: the MS5837-30BA (Bar30), the **LPS28DFW breakout
+(Adafruit #6067, decision 39 tier-2 — open item 19)** and the
 INA219 are unprocured, and the 2x Adafruit #1085 converters have not arrived** — each has its
 arrival acceptance test ready and named (§7). The
 "BMP085" module on the bench is a genuine part at 0x77 — the earlier "clone" verdict was a
@@ -486,19 +507,25 @@ as `a`/`d`), at I2C0, after the fix:
   0x77, §5g) on I2C0.** These two ADC
   modules are the clones of §5b: fitted for timing work only, to be replaced by 2x Adafruit #1085
   (decision 35, §7 step 1). Not wired: the
-  MS5837 (still unprocured), the INA219, the solenoid, all buttons, buzzer, motor, watchdog.
+  MS5837 (still unprocured), the LPS28DFW #6067 (decision 39 tier-2, also unprocured — open item
+  19), the INA219, the solenoid, all buttons, buzzer, motor, watchdog.
   Cell inputs floating, DRDY
   lines not connected (open item 14).
-- Firmware flashed = current `src/` at HEAD of this session, **including all of M3's code**
-  (BaroBosch/Bmp085, Depth/SurfaceLearner, BaroMs5837/Ms5837/checkMs5837, PwrRegs/Ina219/
-  checkPower, new bench `w`, the decision-38 computed clamp banner) — flashed 2026-11-20 (late),
-  uploads verified ("Hash of data verified"). Boot now learns Psurf and prints the **computed**
-  clamp: `BARO @0x77 BMP180: 978.07 mbar 25.2 C (…) — fallback, clamps 0.9m SL1013mbar` then
-  `[psurf] learned 977.89 mbar … depth = gauge pressure x 9.948 m/bar (SG 1.025)`, with no
+- Firmware flashed = current `src/` at HEAD of this session, **including all of M3's code and the
+  decision-39 three-tier baro path**
+  (BaroBosch/Bmp085, Depth/SurfaceLearner, BaroMs5837/Ms5837/checkMs5837, BaroLps28/Lps28dfw/
+  checkLps28, PwrRegs/Ina219/
+  checkPower, new bench `w`, the decision-38 computed clamp banner, the decision-39 tiering +
+  `BARO_BENCH_ONLY`) — flashed 2026-11-20 (late), uploads verified ("Hash of data verified"). Boot now learns Psurf and prints the **computed**
+  clamp: `BARO @0x77 BMP180: 977.95 mbar 25.1 C (…) — bench-only tier, clamps 0.9m SL1013mbar` then
+  `[psurf] learned 977.93 mbar … depth = gauge pressure x 9.948 m/bar (SG 1.025)`, with no
   `BARO_CONV_BAD`. (977.7–978.1, not the ~1013 previously assumed here — that nominal
   expectation was never verified; and the item-18 "anomaly" computed against it was a wrong-city
   reference, corrected the same day — Stockholm's own SLP is 984–987 hPa, see §5g.)
-  Captured boot output with exactly the above fitted, verbatim:
+  Captured boot output with exactly the above fitted, verbatim (**the decision-39 baseline —
+  note the "bench-only tier" label, the `BARO_BENCH_ONLY` line, and `[arm] REFUSED`; this replaced
+  the previous `[arm] checklist: sensors ok` and that change is intended policy, not a
+  regression**):
 
 ```
 CCR dive computer — boot (never fatal), entering BENCH
@@ -507,31 +534,36 @@ CCR dive computer — boot (never fatal), entering BENCH
   I2C0: 2 device(s)  [0x77 0x3C]
   I2C1: 2 device(s)  [0x48 0x49]
   ADS @0x48 ID 0x00 — not the documented ADS1115 ID
-  ADS @0x48 converts: 62166 us for the 32 SPS field (DS 31250 us) = 98% off
+  ADS @0x48 converts: 62113 us for the 32 SPS field (DS 31250 us) = 98% off
   ADS @0x49 ID 0x00 — not the documented ADS1115 ID
-  ADS @0x49 converts: 61801 us for the 32 SPS field (DS 31250 us) = 97% off
-  BARO @0x77 BMP180: 978.07 mbar  25.2 C  (UT=28468 UP=162140 B5=4028 oss=2) — fallback, clamps 0.9m SL1013mbar
-[psurf] learned 977.89 mbar (sigma 0.06 mbar over 16 samples, 25.2 C) — depth = gauge pressure x 9.948 m/bar (SG 1.025)
+  ADS @0x49 converts: 62102 us for the 32 SPS field (DS 31250 us) = 98% off
+  BARO @0x77 BMP180: 977.95 mbar  25.1 C  (UT=28459 UP=162145 B5=4019 oss=2) — bench-only tier, clamps 0.9m SL1013mbar
+[psurf] learned 977.93 mbar (sigma 0.06 mbar over 16 samples, 25.1 C) — depth = gauge pressure x 9.948 m/bar (SG 1.025)
   ERROR INA219                 x1  0x40 err 2
   WARN  ADC_ID_UNKNOWN         x2  0x49 ID 0x00 not 0x85
-  WARN  ADC_RATE_MISMATCH      x2  0x49 61mS DS31mS 97%
+  WARN  ADC_RATE_MISMATCH      x2  0x49 62mS DS31mS 98%
   ERROR BARO_RANGE_CLAMP       x2  clamps 1.2m@978mbar
-[boot] F:0 E:2 W:2 INA219 ADC_ID_UNKNOWN ADC_RATE_MISMATCH BARO_RANGE_CLAMP 
-[arm] checklist: sensors ok
+  ERROR BARO_BENCH_ONLY        x1  BMP180 sole: bench only
+[boot] F:0 E:3 W:2 INA219 ADC_ID_UNKNOWN ADC_RATE_MISMATCH BARO_RANGE_CLAMP BARO_BENCH_ONLY 
+[arm] REFUSED — see faults above
 [adc] alternating-mux pair walkers running — bench 't' prints the achieved per-cell rate and the coil/ADC interlock window, measured
 [o2] solenoid disabled — GPIO 26 will not be driven
 bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (destructive, bench only)  c=bus recovery  a=ADC self-test  d=ADC rate characterisation  t=pair-walker rate + interlock window  b=baro identity + live mbar/C reading  w=INA219 battery rail + raw registers  g=pad map + pad test  v=headless sim profile (SIM-stamped, touches no hardware)
 ```
 
-  The BMP085 at 0x77 is found, selected as the fallback, and raises the permanent clamp banner —
-  now with the **computed** ceiling and its reference (`clamps 0.9m SL1013mbar` at check time,
-  before Psurf is learned and the reference is standard atmosphere; `clamps 1.2m@978mbar` in the
-  report after `learnSurface()` learned 977.89 mbar — decision 38 replaced the old
-  `BARO_RANGE_9M depth clamps 9 m` string, which was 10x wrong). `BARO_RANGE_CLAMP` is ERROR but
-  deliberately does **not** block arming (§13: fallback allowed with
-  the banner), and neither does absent-INA219; that is why `[arm]` says `checklist: sensors ok`
-  while still printing the two ERRORs. If a boot shows `ERROR BARO … no MS5837/BMP085` while the
-  module is wired, suspect an address-table regression first (§5g), then the wiring.
+  The BMP085 at 0x77 is found, verified (CHIPID + cal ROM + real conversion), selected as the
+  **bench tier**, and raises two banners — the permanent clamp with the **computed** ceiling and
+  its reference (`clamps 0.9m SL1013mbar` at check time, before Psurf is learned and the reference
+  is standard atmosphere; `clamps 1.2m@978mbar` in the report after `learnSurface()` learned
+  977.93 mbar — decision 38 replaced the old
+  `BARO_RANGE_9M depth clamps 9 m` string, which was 10x wrong) — **and since decision 39
+  `BARO_BENCH_ONLY`, which does block: `[arm] REFUSED` is this bench's correct baseline while no
+  dive-capable tier (MS5837 at 0x76 or LPS28DFW at 0x5C/0x5D) is fitted.** `BARO_RANGE_CLAMP`
+  itself is ERROR but deliberately still does **not** block (§13); absent-INA219 does not either.
+  If a boot shows `ERROR BARO … no MS5837/LPS28/BMP085` while the module is wired, suspect an
+  address-table regression first (§5g), then the wiring. If `[arm]` says `checklist: sensors ok`
+  with only the BMP fitted, the decision-39 gate regressed — `test_boot`'s
+  `test_bench_only_baro_blocks_arming_but_range_banner_does_not` should be failing.
 
   (The conversion microseconds vary slightly boot to boot — 61.8-62.1 ms so far; it is the ~97%
   offset and the `x2` clone warnings that are the invariant.)
@@ -557,7 +589,10 @@ bench commands: s=full bus scan  p=probe table + report  r=raw probe codes (dest
   through the firmware driver and the Adafruit BMP085 library on the same module (writes ctrl_meas —
   bench only, same class as `a`/`d`; the M3 acceptance run, §7 step 0), **plus the MS5837 identity
   chain on anything answering 0x76** — PROM read + CRC-4 + C1 band + D1/D2 at OSR4096 with the
-  DS-MAX waits (runs the dive driver; that is the Bar30 arrival acceptance, §7) ·
+  DS-MAX waits (runs the dive driver; that is the Bar30 arrival acceptance, §7) — **and the
+  LPS28DFW chain on 0x5C/0x5D** — WHO_AM_I, driver init() with FS_MODE latch readback, two live
+  10 Hz conversions, plus the computed depth ceiling (the #6067 arrival acceptance, open item 19;
+  today 0x5C/0x5D honestly answer nothing) ·
   `w` INA219 battery rail: CONFIG write-verify + raw register dump through the dive driver
   (writes CONFIG/CAL — bench only); today it prints the honest "no INA219 at 0x40" plus the
   meter cross-check recipe ·
@@ -604,10 +639,13 @@ SIM tick cost: worst 41492us at t=1081s (plan search saturating its step budget 
 M0 and M1 are **done**: the alternating-mux scheduler (`AdcPairWalker`, bench `t`) is implemented and
 measured — 7.2 SPS/cell achieved, sized from the boot-measured period, interlock duty 95-96%
 (§5f). **M3's code is done (2026-11-20 late)** — BMP180 fallback proven on the part, `Depth` +
-`learnSurface()` proven on-target (Psurf 977.89 mbar), MS5837 + INA219 drivers written and
+`learnSurface()` proven on-target (Psurf 977.93 mbar), MS5837 + INA219 + LPS28DFW drivers written and
 natively pinned but **not yet measured on parts** (unprocured/unfitted), `README.md` written.
 Decision 38 corrected the fallback's depth ceiling from "~9 m" to **under 1 m** — read it before
-trusting any depth number. Next, in order:
+trusting any depth number — and **decision 39 then made the depth path three tiers (MS5837-30BA
+primary → LPS28DFW mode-2 armable fallback → BMP180 bench-only), so the BMP-only bench baseline is
+now `[arm] REFUSED` with `BARO_BENCH_ONLY` (§6's current verbatim capture — intended policy, not a
+regression). Next, in order:
 
 0. **[DONE 2026-11-20] Flash + capture the M3 acceptance run.** The port reappeared on its own
    (§3), two flashes verified, and the run passed with one expectation corrected:
@@ -632,13 +670,21 @@ trusting any depth number. Next, in order:
    ID `0x85`, with `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` clearing by themselves (~31 ms conversion,
    not 62), and `t` re-derived (expect ~16 SPS/cell, a few ms of OS-poll lag on top). The walker
    re-begins from each part's own measurement at boot — no code change needed.
-2. **Order the MS5837-30BA (Bar30, M10 bulkhead) and an INA219 breakout (#904 class, 0.1 Ω).**
-   Both drivers are written, natively pinned and integrated (`checkMs5837()`/`checkPower()`,
-   identity-based selection, bench `b` MS5837 section, bench `w`) — **arrival acceptance, per
+2. **Order the MS5837-30BA (Bar30, M10 bulkhead), an INA219 breakout (#904 class, 0.1 Ω), and the
+   Adafruit LPS28DFW breakout #6067** (decision 39 tier-2, AGENTS.md open item 19 — $12.50; SA0
+   default 0 → 7-bit 0x5C, solder jumper → 0x5D; VDD/GND/SDA/SCL to I2C0, coexists with everything
+   there). All three drivers are written, natively pinned and integrated (`checkMs5837()`/`checkPower()`/`checkLps28()`,
+   identity-based selection, bench `b` MS5837 + LPS28 sections, bench `w`) — **arrival acceptance, per
    part**: Bar30 → `b` shows PROM CRC VERIFIED + C1 in the 30BA band + D1/D2 conversions landing
    at a Stockholm-station mbar (named place/hour/source, §6 — expect ~975–990 mbar at the bench,
-   not ~1013) and the mbar MUST move when the port is squeezed; then `BARO_RANGE_CLAMP` clears by
-   itself and M3's gate (fallback verified by removing the MS5837) can finally run. INA219 →
+   not ~1013) and the mbar MUST move when the port is squeezed; then `BARO_RANGE_CLAMP` and
+   `BARO_BENCH_ONLY` clear by themselves and M3's gate (fallback verified by removing the MS5837)
+   can finally run. LPS28DFW → `b` shows WHO_AM_I 0xB4 + SWRESET self-clear + **FS_MODE=1 latched
+   on readback** + two agreeing live conversions in the surface window + the computed ceiling
+   (~30.7 m at this bench — the check that the ceiling comes from the latched mode, not the
+   "40 m underwater" marketing), and it moves when squeezed; that makes the bench armable-with-
+   banner while the Bar30 is still out. Adafruit's LPS2X library does **not** support the LPS28DFW
+   — the hand-rolled driver here is the only path anyway. INA219 →
    `w` write-verifies CONFIG, reads a real V_BAT, and a **meter cross-check** (meter across V_BAT
    and in series with a known load) retires the 0.1 Ω assumption before any ampere figure is
    believed. Wire the INA219 on I2C0; the cell bias networks
@@ -657,7 +703,7 @@ update it when hardware changes what it teaches.
 
 | File | What it pins down |
 |---|---|
-| `AGENTS.md` | binding design record; §16 milestone status, §18 decisions 1–38, §19 risks 1–21, §20 open items 1–18 |
+| `AGENTS.md` | binding design record; §16 milestone status, §18 decisions 1–39, §19 risks 1–21, §20 open items 1–19 |
 | `HANDOFF.md` (this file) | machine + bench state, measured I2C and ADC semantics, resume point |
 | `lib/core/src/AdcRegs.h` | **the ADS1115 register map, PGA/RATE tables, LSB and mV scaling, and the measured bench-module rate table.** Pure C++ so it can be asserted; it was wrong twice while it lived only in `src/` |
 | `lib/core/src/BaroBosch.h` | **the BMP085/BMP180 register map, the DS cal-ROM validity rule (no word 0/0xFFFF — the only check the DS states), the command/timing table, `assembleUp`/`assembleUt`, `b5FromUt`, `compensate`.** The compensation is a deliberate int32/uint32-faithful transcription of the deployed Adafruit BMP085 library — the PROVENANCE block at the top lists the four transcription faults the cross-check caught and the example anchor (B5=2400, 15.0 °C, 69964 Pa) that discriminates right from wrong arithmetic. Decision 37; pinned by `test/test_baro/`. Do not "tidy" the types or widen them — the bench cross-check depends on bit-for-bit agreement with the reference |
@@ -665,12 +711,13 @@ update it when hardware changes what it teaches.
 | `src/sensors/Bmp085.h` | header-only BMP085/180 driver implementing `Barometer`: CHIPID gate, cal-ROM read + DS rule, blocking T+P cycle with DS waits (`delayMicroseconds(conv+500)`), oss=2, XLSB always read (at oss>0 the 0xF6/0xF7 pair is only the top 16 bits), `Status` enum + raw UT/UP/B5 exposed for bench `b`, `rangeCeilingBar()` = 1.1 bar so `Depth` can clamp — which against a ~1013 mbar surface is **under 1 m of water**, decision 38; the header says so |
 | `lib/core/src/Depth.h` | **the depth math as pure C++, pinned by `test/test_depth/`: `ceilingMeters()`/`metersPerBar()` (salt 9.9484, fresh 10.1972 m/bar at g=9.80665) and `depth::SurfaceLearner`** (16-sample window, lock at σ ≤ 2 mbar, 24-sample/120 ms budget — a drifting or breathed-on module must not lock). The decision-38 correction lives here: any behaviour-gating range is **computed from primary specs and printed with its reference**, never recited |
 | `lib/core/src/BaroMs5837.h` | **MS5837-30BA PROM map, CRC-4, C1-band model classification (30BA/02BA/outside), compensation.** PROVENANCE: compensation transcribed from the deployed BlueRobotics library (decision 37's pattern); the ≤1 LSB floor-vs-truncate difference against the DS worked example is stated, not hidden; W0 type bits reported, never gated (DS C6 vs C2 revisions contradict). Written-not-measured: Bar30 unprocured |
+| `lib/core/src/BaroLps28.h` + `src/sensors/Lps28dfw.h` | **decision 39 tier-2 (LPS28DFW, Adafruit #6067, unprocured):** register map, dual-FS scaling (4096 LSB/hPa FS1260 / 2048 FS4060, left-aligned assembly matched to the vendor shape on a grid), in-range windows, `rangeCeilingBar()` 4.06 bar ABS — the ~30.7 m ceiling is computed by `Depth.h` from the **latched** mode, never taken from the marketing "40 m". PROVENANCE: ST's own vendor driver `lps28dfw_reg.h/.c` ((c) 2024) — WHO_AM_I 0xB4, CTRL_REG2 ONESHOT0/SWRESET2/BDU3/FS_MODE6/BOOT7 (an earlier remembered 0xB8 WHO_AM_I was caught at source). Driver identity chain: WHO_AM_I → SWRESET self-clear **polled** → CTRL_REG1/2 write + readback with **FS_MODE latched** → real conversions, P_OR/`inRangeBar` flagged; `setAddress()` for the 0x5C/0x5D SA0 strap. Pinned by `test/test_lps28/`; written-not-measured until bench `b` runs it (open item 19) |
 | `src/sensors/Ms5837.h` | header-only `Barometer` driver at 0x76: RESET → PROM → CRC verify → C1 band → D1/D2 at OSR4096 with the DS-MAX 9.04 ms waits ("maximum values must be used"), `identityVerified()`, raw D1/D2/PROM exposed for bench `b`, model-aware `rangeCeilingBar()` (an 02BA squatter with a valid CRC is a ~10 m part and says so). **Never run on silicon yet — every claim is datasheet-derived until `b` measures it** |
 | `lib/core/src/PwrRegs.h` + `src/sensors/Ina219.h` | INA219 register map, presets (assume the 0.1 Ω #904-class shunt — stated, not assumed silently) and **exact-integer `calRegister`** (the float form truncated the datasheet's exact 4096 anchor to 4095; `test/test_power/` pins it). Driver identity = CONFIG write-verify + CAL read-back + real bus-voltage read (no CHIPID exists); CONFIG+CAL re-written before every current read (sharp-load defence — matters with solenoid pulses). Part not fitted |
 | `src/sensors/BusProbe.cpp` | the measured four-shape probe table and the periman trap, in comments; the only probe form that is truthful and non-destructive |
 | `src/sensors/BusProbe.h` | probe contract, 7-bit address warning, "port must be down" rule for line checks |
-| `src/main.cpp` | boot order (solenoid safe-state first), bounded probing, `checkAdcs()` (presence is not identity), `checkBaro()` (same rule at the depth sensor: CHIPID + cal ROM + one real conversion at boot and on BARO presence transitions; raises/clears `BARO_CONV_BAD`), `g_bmp085(Wire, 0x77, oss=2)` global, two-address device selection for baro and OLED, bus dead-vs-absent reporting, 5 s hot re-probe and bus retry, bench command REPL (`s p r c a d t b w g v` — `b`/`baroIdentity()` now reads Bosch CHIPID/cal-ROM **and** runs a live conversion through the firmware driver plus the Adafruit BMP085 library on the same module: the §5g fingerprint and the M3 acceptance run; since M3 `b` also runs the full MS5837 identity chain — PROM/CRC/C1 + OSR4096 conversion — on anything at 0x76), **M3 integration: `g_ms5837`/`g_ina219`/`g_activeBaro` globals, identity-based baro selection (`checkMs5837()` before the BMP180 fallback; a 0x76 squatter gets `BARO_CONV_BAD` + blocks arming while a working fallback keeps its clamp banner), `learnSurface()` (learns Psurf via `depth::SurfaceLearner`, no lock ⇒ `BARO_CONV_BAD`), `checkPower()`, `baroRangeBanner()`/`raiseRangeBanner()` (the decision-38 computed clamp — `clamps %.1fm SL%.0fmbar` pre-Psurf, `clamps %.1fm@%.0fmbar` after), hot-plug `powerChanged`, bench `w`**, `gpioMapReport()`, `benchRunSim()` (static `SimRunner`, per-tick cost measurement, `SIM SLOW` line, history stride 16); walker globals `g_walk1`/`g_walk2` (begin after `checkAdcs()`, re-begin on converter hot-plug), and `loop()`'s heartbeat as **service windows** — walkers + REPL run inside the HIGH-20/LOW-30 shape so the converters pace the sampling, not the loop delay |
-| `lib/core/src/FaultCode.h` | the fault enum plus `defaultSeverity`/`blocksArming`/`faultName`. `ADC_PART_WRONG`/`ADC_CONV_BAD` block arming; `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` deliberately do not; `BARO_CONV_BAD` (26) is ERROR and blocks, `BARO_RANGE` (13) deliberately does not (§13 fallback rule) — its `faultName` is `BARO_RANGE_CLAMP` since decision 38 (was `BARO_RANGE_9M`; the enum value never changed, so old logs with the old name read as this same code) |
+| `src/main.cpp` | boot order (solenoid safe-state first), bounded probing, `checkAdcs()` (presence is not identity), `checkBaro()` (same rule at the depth sensor: CHIPID + cal ROM + one real conversion at boot and on BARO presence transitions; raises/clears `BARO_CONV_BAD`), `g_bmp085(Wire, 0x77, oss=2)` global, two-address device selection for baro and OLED, bus dead-vs-absent reporting, 5 s hot re-probe and bus retry, bench command REPL (`s p r c a d t b w g v` — `b`/`baroIdentity()` now reads Bosch CHIPID/cal-ROM **and** runs a live conversion through the firmware driver plus the Adafruit BMP085 library on the same module: the §5g fingerprint and the M3 acceptance run; since M3 `b` also runs the full MS5837 identity chain — PROM/CRC/C1 + OSR4096 conversion — on anything at 0x76), **M3 integration: `g_ms5837`/`g_ina219`/`g_activeBaro` globals, identity-based baro selection (`checkMs5837()` before the BMP180 fallback; a 0x76 squatter gets `BARO_CONV_BAD` + blocks arming while a working fallback keeps its clamp banner), `learnSurface()` (learns Psurf via `depth::SurfaceLearner`, no lock ⇒ `BARO_CONV_BAD`), `checkPower()`, `baroRangeBanner()`/`raiseRangeBanner()` (the decision-38 computed clamp — `clamps %.1fm SL%.0fmbar` pre-Psurf, `clamps %.1fm@%.0fmbar` after), hot-plug `powerChanged`, bench `w`**, **decision 39: three-tier baro selection (`checkMs5837()` returns bool; new `checkLps28()` — WHO_AM_I + SWRESET-polled + FS_MODE-latch readback + real conversion; `selectBaroFallback()` also raises `BARO_BENCH_ONLY`; probe table 0x76/0x5C/0x5D/0x77; `g_lps28` global with `setAddress()` strap resolution; `g_baroSquatter` per-pass flag gating every `BARO_CONV_BAD` clear — found defect: fallback success used to erase a squatter's arming block; bench `b`'s LPS28 section prints identity + ceiling + the "40 m is ABS-FS-as-gauge" note)**, `gpioMapReport()`, `benchRunSim()` (static `SimRunner`, per-tick cost measurement, `SIM SLOW` line, history stride 16); walker globals `g_walk1`/`g_walk2` (begin after `checkAdcs()`, re-begin on converter hot-plug), and `loop()`'s heartbeat as **service windows** — walkers + REPL run inside the HIGH-20/LOW-30 shape so the converters pace the sampling, not the loop delay |
+| `lib/core/src/FaultCode.h` | the fault enum plus `defaultSeverity`/`blocksArming`/`faultName`. `ADC_PART_WRONG`/`ADC_CONV_BAD` block arming; `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` deliberately do not; `BARO_CONV_BAD` (26) is ERROR and blocks, `BARO_RANGE` (13) deliberately does not (§13 fallback rule) — its `faultName` is `BARO_RANGE_CLAMP` since decision 38 (was `BARO_RANGE_9M`; the enum value never changed, so old logs with the old name read as this same code); **`BARO_BENCH_ONLY` (27, decision 39) is ERROR and blocks** — the BMP085/180 as sole depth source refuses an arm |
 | `lib/core/src/BootReport.h` | `blocksArming()` refuses on **any active FATAL**, not only on listed codes |
 | `lib/core/src/PinMap.h` | **the GPIO capability table (one word per pad, 0..39) and the role assignment.** Pure C++, asserted natively — it was a paragraph in a header before and was wrong twice. Carries `noSuchPad` (24, 28–31: no such pad on the ESP32-D0WD-V3 die) and `kDieOnly` (20, 37, 38: die pads WROOM-32 does not bond out) as separate claims, `unusableReason()`, and `SPARE_OUT = 17` |
 | `src/config/Pins.h` | **an alias of `PinMap.h`, not a second copy of the numbers.** `BTN_PAGE = 33`, `VIBRATOR_OUT = 16` (moved off 33, decision 32), `SPARE_OUT = 17`. Drivers must still check `>= 0` before `pinMode`: a role may be unassigned on purpose |
@@ -685,9 +732,10 @@ update it when hardware changes what it teaches.
 | `test/test_sim/test_sim.cpp` | hand-computed loop physics: depth-independent sag + 276 s floor, closed-loop hold asserted in pulse quanta, click taxonomy, cell faults through the real voter, flush agreement from the other side, source stamping, bit-identical repeats, ring/NO-DATA harness honesty |
 | `test/test_adc/test_adc.cpp` | config-field masks tile 0xFFFF once; `0x8583` decodes as the DS default; design config = gain 16 + 32 SPS + explicit single-shot; LSB tables; air-signal code counts; the measured non-datasheet rate table |
 | `test/test_baro/test_baro.cpp` | DS command/timing table; the cal-ROM rule as the **datasheet's 0/0xFFFF check, not a value check** (bench AC1=0x219C passes; every Table-5 position poisoned at its own index); the `assembleUp` oss truncation chain (34321/68643/137286/274572); the "use datasheet numbers!" example reproduced exactly (B5=2400, 15.0 °C, 69964 Pa); a 64-point grid match against a second copy of the deployed reference; monotonicity + oss scale invariance; out-of-range flagged; corrupt ROM refused before arithmetic |
-| `test/test_boot/test_boot.cpp` | fault severities; absent solenoid is INFO and must **not** block arming; the whole-enum table walk (gap list `{27,29}`, walked count 44 — keep it current when adding codes); unlisted FATAL still blocks; `BARO_RANGE_CLAMP` name + computed-clamp detail asserted |
+| `test/test_boot/test_boot.cpp` | fault severities; absent solenoid is INFO and must **not** block arming; the whole-enum table walk (gap list `{28,29}`, walked count 45 — keep it current when adding codes); unlisted FATAL still blocks; `BARO_RANGE_CLAMP` name + computed-clamp detail asserted; **decision 39: `BARO_BENCH_ONLY` blocks arming while the range banner does not — the two baro ERRORs gate-tested apart** |
 | `test/test_depth/test_depth.cpp` | the water-hydrostatics anchors (1 mbar ≈ 1.02 cm; salt 9.9484 / fresh 10.1972 m/bar) and **the decision-38 conclusion itself** (BMP180 gauge range < 1 m at sea level, ~1.2 m at the bench Psurf); `SurfaceLearner` lock at σ ≤ 2 mbar, refusal on a drifting series, no half-learned state |
 | `test/test_ms5837/test_ms5837.cpp` | CRC-4 against a verbatim copy of the DS C6 published example; C1-band classification; compensation against a verbatim BlueRobotics `br_pressure` copy (pins truncation semantics — code 1982/2381323465/1145816756 vs the DS's floor columns, ≤1 LSB); W0/W7 field extraction |
+| `test/test_lps28/test_lps28.cpp` | decision 39 tier-2: vendor sensitivity anchors both FS modes (0x3E8000/0x1F4000 at 1000 hPa, both FS ends), left-aligned assembly vs a second vendor-shape copy across a grid, mode-scaling non-interchangeability (the silent 2x error the latch gate prevents), negative two's-complement branch, temp LSB/100 both signs, WHO_AM_I 0xB4 + 0x5C/0x5D, CTRL_REG1/2 bit positions (FS_MODE=bit 6, not BOOT bit 7), range-window edges, and the **derived ~30.7 m tier-2 ceiling** asserted < the "40 m" marketing figure and >10x the BMP tier |
 | `test/test_power/test_power.cpp` | `pwr::calRegister` exact integer math (the 0.1 Ω/32 A preset lands the **exact 4096** — the float form gave 4095), LSB conversions, preset table vs the deployed Adafruit constants |
 | `test/test_pins/test_pins.cpp` | no two roles share a GPIO (33 was the motor *and* the Page button); no output role on an input-only pad; no role on a strapping pin; the no-such-pad / die-only / flash sets each asserted separately; 34–39 input-only with no pulls; button pads have internal pull-ups; **the spare output budget is asserted to be exactly one pad (17)**, so freeing a pin forces the AGENTS.md §3 budget to be re-derived |
 
@@ -732,6 +780,14 @@ update it when hardware changes what it teaches.
   (`BARO_RANGE_CLAMP clamps 1.2m@978mbar`); old logs saying `BARO_RANGE_9M` are the same enum (13).
   Consequence for the bench: the fitted fallback is a cross-check, **not a dive depth source** —
   the Bar30 (M3's gate) is load-bearing (AGENTS.md risk 1, decision 38, §21 entry).
+  **Decision 39 (same day, user-directed) made that mechanical:** three tiers — MS5837-30BA primary,
+  LPS28DFW (mode 2, ~30.7 m computed gauge ceiling, NOT the marketing "40 m") armable fallback,
+  BMP180 **bench-only** — and `BARO_BENCH_ONLY` (ERROR, blocks arming) now fires when the BMP is the
+  sole depth source that passed identity, so the fitted bench's `[arm] REFUSED` baseline is correct
+  behaviour until a dive-capable tier arrives (open item 19: order #6067; §7 step 2 has its
+  acceptance chain). Tier identity: no PROM on LPS28 silicon, so the identity is the capability
+  chain — WHO_AM_I 0xB4 + SWRESET self-clear + **FS_MODE latched on readback** + a real conversion;
+  the ceiling comes from the latched mode, never the write request.
 - **Open item 16 is closed** (§6): the `err 5` / `SDA held low` boot was the module being unplugged by
   hand, not a fault. No action. The `2`-vs-`5` reading is still worth knowing.
 - **Open item 12 is closed** (decision 32): 33 = Page button, motor on 16, `test/test_pins/` asserts

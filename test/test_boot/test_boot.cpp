@@ -148,7 +148,7 @@ void test_highest_severity_reports_the_worst_active_fault() {
 // ...), so walking the value range needs the gaps spelled out: a new code that is missing from a
 // table lands outside this list and fails. If you add a code, this test tells you to name it.
 void test_every_fault_code_has_a_name_and_a_default_severity() {
-    static const int kGaps[][2] = {{1, 9}, {27, 29}, {32, 39}, {45, 49}, {55, 59}, {69, 79}};
+    static const int kGaps[][2] = {{1, 9}, {28, 29}, {32, 39}, {45, 49}, {55, 59}, {69, 79}};
     auto isGap = [](int v) {
         for (const auto& g : kGaps)
             if (v >= g[0] && v <= g[1]) return true;
@@ -170,7 +170,32 @@ void test_every_fault_code_has_a_name_and_a_default_severity() {
         TEST_ASSERT_TRUE_MESSAGE(intentionalInfo || defaultSeverity(c) != Severity::INFO, msg);
         ++checked;
     }
-    TEST_ASSERT_EQUAL_INT_MESSAGE(44, checked, "the walk no longer covers every enumerator");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(45, checked, "the walk no longer covers every enumerator");
+}
+
+// Decision 39's tiering gate: BARO_RANGE (the computed clamp banner) stays a non-blocking ERROR —
+// "arm shallow or not at all" — but BARO_BENCH_ONLY, the BMP085/180 being the only depth source
+// that passed identity, DOES refuse an arm. A depth input that cannot reach dive depth is not a
+// depth input; the bench tier exists for bring-up, not for diving.
+void test_bench_only_baro_blocks_arming_but_range_banner_does_not() {
+    boot::Report r;
+    r.raise(FaultCode::BARO_RANGE, T0, "clamps 1.2m@978mbar");
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Severity::ERROR),
+                          static_cast<int>(r.findEntry(FaultCode::BARO_RANGE)->severity));
+    TEST_ASSERT_FALSE_MESSAGE(r.blocksArming(),
+                              "the computed range banner blocked arming — decision 38's gate is "
+                              "\"arm shallow or not at all\", the block belongs to BARO_BENCH_ONLY");
+    r.clear(FaultCode::BARO_RANGE, T0 + 1);
+
+    r.raise(FaultCode::BARO_BENCH_ONLY, T0 + 2, "BMP180 sole: bench only");
+    TEST_ASSERT_NOT_EQUAL_MESSAGE(0, strcmp(faultName(FaultCode::BARO_BENCH_ONLY), "UNKNOWN"),
+                                  "BARO_BENCH_ONLY has no faultName entry");
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Severity::ERROR),
+                          static_cast<int>(r.findEntry(FaultCode::BARO_BENCH_ONLY)->severity));
+    TEST_ASSERT_TRUE_MESSAGE(r.blocksArming(),
+                             "a bench-only depth source passed the arming gate — decision 39 says no");
+    r.clear(FaultCode::BARO_BENCH_ONLY, T0 + 3);
+    TEST_ASSERT_FALSE(r.blocksArming());
 }
 
 void test_wrong_adc_part_blocks_arming() {
@@ -233,5 +258,6 @@ int main() {
     RUN_TEST(test_every_fault_code_has_a_name_and_a_default_severity);
     RUN_TEST(test_wrong_adc_part_blocks_arming);
     RUN_TEST(test_display_and_bus_faults_block_arming);
+    RUN_TEST(test_bench_only_baro_blocks_arming_but_range_banner_does_not);
     return UNITY_END();
 }

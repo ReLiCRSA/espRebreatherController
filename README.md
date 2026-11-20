@@ -20,12 +20,15 @@ power math, valve guidance, maintenance and the pre-water bench procedure.
 
 **Build status (2026-11-20):** M0 (flash/boot/bench report) and M1 (sim + bench + alternating-mux
 ADC scheduler) are done and measured on hardware. M3 (barometers, depth, power monitor) is in
-progress: the BMP180 fallback is fitted and proven; the MS5837 and INA219 drivers are written and
-natively tested but the parts are not fitted. The dive loop, display scenes and web server are not
-written yet. Today's firmware boots into BENCH and reports hardware honestly; it does not dive.
+progress: the depth path is **three tiers by decision 39 — MS5837-30BA primary, LPS28DFW (mode 2)
+armable fallback, BMP180 bench-only**; the BMP180 is fitted, proven, and now *refuses* arming as
+the sole depth source (correct for this bench), while the MS5837, LPS28DFW and INA219 drivers are
+written and natively tested but the parts are not fitted. The dive loop, display scenes and web
+server are not written yet. Today's firmware boots into BENCH and reports hardware honestly; it
+does not dive.
 
 ```
-pio test -e native            # 117 cases, 11 suites, no hardware needed
+pio test -e native            # 123 cases, 12 suites, no hardware needed
 pio run -e esp32              # builds
 pio run -e esp32 -t upload    # flash (auto-reset via RTS, no BOOT button needed)
 pio device monitor            # 115200 baud
@@ -37,8 +40,9 @@ pio device monitor            # 115200 baud
 
 | Item | Part / spec | Notes |
 |---|---|---|
-| Depth sensor (primary) | **TE MS5837-30BA** (Bar30 bulkhead sensor, M10) | 0–30 bar, 0.2 mbar @ OSR4096, gel-filled — immersion limit §7. **Unprocured as of 2026-11-20.** 7-bit I2C **0x76** |
-| Depth sensor (fallback) | **Adafruit BMP085 breakout** (BMP180 die) | 300–1100 hPa absolute ⇒ **under 1 m of usable water column** at sea level (~1.2 m at a 978 mbar bench) — fallback for shallow/monitoring use only, never a dive depth source. 7-bit I2C **0x77**. Measured genuine on this bench (CHIPID 0x55) |
+| Depth sensor (primary) | **TE MS5837-30BA** (Bar30 bulkhead sensor, M10) | Tier 1. 0–30 bar, 0.2 mbar @ OSR4096, gel-filled — immersion limit §7. **Unprocured as of 2026-11-20.** 7-bit I2C **0x76** |
+| Depth sensor (fallback, armable) | **Adafruit LPS28DFW breakout #6067** | Tier 2 (decision 39). Dual full scale; this design latches **mode 2 = 4060 hPa ABSOLUTE** ⇒ **~31 m computed gauge ceiling** (§3b) — survives 10 bar but *measures* only 4.06. Better in-range accuracy than the 30BA, no gel-immersion limit. **Unprocured.** 7-bit I2C **0x5C** (SA0=0) / **0x5D** (SA0=1) |
+| Depth sensor (bench tier) | **Adafruit BMP085 breakout** (BMP180 die) | Tier 3. 300–1100 hPa absolute ⇒ **under 1 m of usable water column** at sea level (~1.2 m at a 978 mbar bench) — **bench-only since decision 39: as the sole depth source it raises `BARO_BENCH_ONLY` and arming is refused.** 7-bit I2C **0x77**. Measured genuine on this bench (CHIPID 0x55) |
 | O2 ADCs | **2x Adafruit "ADS1115 16-Bit ADC – 4 Channel with PGA", product #1085** | The named procurement (decision 31/35): identity is still proven by measurement on arrival (`d` measures the eight datasheet rates, `a` reads ID 0x85), never by the label |
 | O2 cells | 3x galvanic (e.g. Alphasense O2-A2 class), annual replacement | Self-powered, ~9–13 mV in air. **Never apply a voltage to a cell lead** |
 | Current/power monitor | **Adafruit INA219 breakout (#904 class, 0.1 Ω shunt)** | V_BAT + rail current, 7-bit **0x40** on I2C0. Current figures assume that 0.1 Ω — meter cross-check when fitted |
@@ -57,7 +61,7 @@ pio device monitor            # 115200 baud
 
 | Function | GPIO |
 |---|---|
-| I2C0 SDA / SCL — OLED 0x3C, baro 0x76/0x77, INA219 0x40 | 21 / 22 |
+| I2C0 SDA / SCL — OLED 0x3C, baro 0x76 / 0x5C / 0x5D / 0x77, INA219 0x40 | 21 / 22 |
 | I2C1 SDA / SCL — 2x ADS1115 | 18 / 19 |
 | ADS1115 U1 / U2 DRDY (ALRT) | 23 / 4 |
 | Solenoid drive (10k gate pulldown + flyback) | 26 |
@@ -91,11 +95,36 @@ Bar30 DF13 colours: **red = power, black = GND, yellow = SDA, blue = SCL.**
  blue  ── SCL (GPIO 22)       ("0x7C" in circulating code is the 8-bit write byte, not an address)
 ```
 
-One baro on I2C0 max (0x76/0x77 clash with BMP280/BME280 is by CSB strap). The MS5837 is
-confirmed by its **factory PROM read + CRC**, never by the ACK (risk 21). It is gel-filled:
+All three baro tiers (0x76, 0x5C/0x5D, 0x77) plus the OLED (0x3C) and INA219 (0x40) **coexist on
+I2C0 without an address clash**. The MS5837 is
+confirmed by its **factory PROM read + CRC**, never by the ACK (risk 21 — BMP280/BME280 squat at
+0x76/0x77 by CSB strap, and the MS5637 shares 0x76 and passes CRC; identity is what gates selection,
+not presence). It is gel-filled:
 **max 24 h continuous immersion, then 2 h drying** — long immersion destroys it (§7).
 
-### 3b. BMP085/BMP180 fallback — I2C0
+### 3b. Adafruit LPS28DFW #6067 (tier-2 fallback, armable — decision 39) — I2C0
+
+```
+ Adafruit LPS28DFW #6067      ESP32
+ VDD ── 3.3 V
+ GND ── GND
+ SDA ── SDA (GPIO 21)         7-bit 0x5C  (ST address bits 101110xb; SA0 solder jumper -> 0x5D)
+ SCL ── SCL (GPIO 22)
+```
+
+The design latches **CTRL_REG2 FS_MODE=1 — 4060 hPa ABSOLUTE** — by write **plus readback verify**:
+the identity chain is WHO_AM_I `0xB4` → SWRESET self-clear → config latches on readback → one real
+conversion, and the dive model's ceiling comes from the **latched mode, never the write request**.
+The ceiling is computed (`depth::ceilingMeters()`): 4.06 bar abs − learned Psurf ≈ **30.7 m salt at
+this bench** — the breakout page's "40 m underwater" treats an absolute full scale as if it were
+gauge (§4 mistake 3). It survives 10 bar but **measures** only 4.06: past ~31 m the reading rails
+and `inRangeBar`/P_OR flag it — never extrapolate. Armable **with** a permanent `BARO_RANGE_CLAMP`
+banner quoting that computed figure. Adafruit's LPS2X library does **not** support this part — the
+hand-rolled driver (`BaroLps28.h` + `Lps28dfw.h`) is the only path. **Unprocured:** acceptance on
+arrival is bench `b` (WHO_AM_I, FS latch, a Stockholm-station mbar with place/hour/source, squeeze
+movement) — AGENTS.md open item 19.
+
+### 3c. BMP085/BMP180 (bench tier) — I2C0
 
 ```
  Adafruit BMP085              ESP32
@@ -105,10 +134,12 @@ confirmed by its **factory PROM read + CRC**, never by the ACK (risk 21). It is 
  SCL ── SCL (GPIO 22)
 ```
 
-It arms only with a permanent clamp banner quoting its **computed** ceiling (<1 m at sea level —
-see §4 mistake 2). Its useful role on a dive unit is as a presence/sanity cross-check, not depth.
+**Bench-only since decision 39.** Bench mode runs fully with it and it is a fine presence/sanity
+cross-check, but as the only depth source that passed identity it raises `BARO_BENCH_ONLY` and
+arming is **refused** — its **computed** ceiling is under 1 m at sea level (~1.2 m at this bench;
+see §4 mistake 2). Never a dive depth source.
 
-### 3c. Two ADS1115 (#1085) — I2C1, differential cell pairs
+### 3d. Two ADS1115 (#1085) — I2C1, differential cell pairs
 
 ```
  Adafruit #1085 U1            Adafruit #1085 U2
@@ -128,7 +159,7 @@ cell networks on A0..A3. The boards carry 10 k I2C pull-ups; two boards parallel
 is ~1150–1660 counts. Cells 1 and 2 share U1 — a documented correlated-failure point (risk 2),
 compensated by the diluent-flush check, not by voting.
 
-### 3d. Galvanic cell inputs — per cell pair (this is the network that keeps inputs honest)
+### 3e. Galvanic cell inputs — per cell pair (this is the network that keeps inputs honest)
 
 ```
  cell + ──┬── 10 Ω ──── AINp (ADS1115)          galvanic cell: self-powered,
@@ -145,7 +176,7 @@ Without the 1 MΩ common-mode resistors the differential inputs float, rail, and
 signal polarity may be negative (reduction at the sensing electrode): a per-channel `invert`
 flag is resolved on the bench, raw codes are stored as the converter put them on the bus.
 
-### 3e. Solenoid drive stage — from the battery rail, no boost
+### 3f. Solenoid drive stage — from the battery rail, no boost
 
 ```
  V_BAT (1S2P, 3.4–4.2 V)
@@ -165,7 +196,7 @@ Never fire the coil while a converter is integrating — the interlock window is
 conversion period (62 ms on the fitted clones, ~31 ms on genuine parts — decision 34 says the
 pulse scheduler must carve explicit conversion-free slots; the incidental gap is 2–3 ms).
 
-### 3f. Power, alarms, buttons, watchdog
+### 3g. Power, alarms, buttons, watchdog
 
 - INA219 (#904): V+/VIN+ to the battery+, V− to the load side of its 0.1 Ω shunt, SDA/SCL to I2C0,
   address 0x40 (A0/A1 to GND). It measures the load return path — put it where you actually want
@@ -186,29 +217,37 @@ pulse scheduler must carve explicit conversion-free slots; the incidental gap is
    addresses 0x3E and 0x3B for a day because someone "halved" 0x7C and 0x77. Neither exists; every
    honest measurement against them produced false conclusions about a good part. The datasheets
    state 7-bit forms — MS5837: "Address (7 bits) 0x76 (1110110 b)"; BMP180: bits 1110111+R/W =
-   0x77. `Wire` takes 7-bit. **Take the form the datasheet states and confirm with a full sweep
+   0x77; LPS28DFW: bits 101110xb = 0x5C/0x5D (the ST vendor header's 0xB8/0xB9 are the 8-bit
+   bytes). `Wire` takes 7-bit. **Take the form the datasheet states and confirm with a full sweep
    (`s`), never with the fitted table alone.** MS5837's 0xA0–0xAC are PROM *command* bytes —
    a third trap in the same datasheet.
 2. **Believing a fallback baro has depth range.** BMP085/BMP180 measure 300–1100 hPa absolute;
    against a ~1013 mbar surface that is ~87 mbar gauge — **under 1 m of water**, not the "9 m" an
    early design note asserted (a 10x arithmetic error, corrected by decision 38; test/test_depth
    pins the hydrostatics). Never let depth logic extrapolate past a part's range — the clamp +
-   banner exists for exactly this.
-3. **Powering a galvanic cell.** Cells are self-powered; any voltage on a cell lead destroys the
+   banner exists for exactly this. Since decision 39 the rule is mechanical: as the sole depth
+   source the BMP raises `BARO_BENCH_ONLY` and arming is refused.
+3. **Reading an ABSOLUTE full scale as if it were gauge.** The LPS28DFW breakout page says
+   "40 m underwater"; its mode-2 full scale is 4060 hPa **absolute**, so the real water column is
+   4.06 bar − ~1.01 bar surface ≈ **~30 m**, and the part *survives* 10 bar while *measuring* only
+   4.06 — deeper dives see a railed reading, which the firmware flags (`inRangeBar`/P_OR + the
+   computed clamp banner) rather than extrapolate. Any range figure in this project is **computed
+   in code and printed with its reference** (`depth::ceilingMeters()`), never recited from a page.
+4. **Powering a galvanic cell.** Cells are self-powered; any voltage on a cell lead destroys the
    cell and usually the ADS1115. The ADS1115 inputs are the only connection.
-4. **Missing the 1 MΩ common-mode resistors** on the differential pairs — inputs rail and read
+5. **Missing the 1 MΩ common-mode resistors** on the differential pairs — inputs rail and read
    numbers that look plausible. Measured behaviour on this bench.
-5. **Both ADDR straps tied the same way** — two converters collide at 0x48. On #1085 the second
+6. **Both ADDR straps tied the same way** — two converters collide at 0x48. On #1085 the second
    board is 0x49 by **closing the back-side `A0` jumper**; do not hunt for a header jumper.
-6. **Solenoid without flyback** (kills the FET/MCU), or **a diode in series in the coil path**
+7. **Solenoid without flyback** (kills the FET/MCU), or **a diode in series in the coil path**
    (9% coil voltage at 3.4 V — the flyback goes drain→V_BAT, not in series).
-7. **ADC2 pads for analog reads with WiFi active** — use the INA219 for battery V/I, not the ESP32
+8. **ADC2 pads for analog reads with WiFi active** — use the INA219 for battery V/I, not the ESP32
    ADC. (Digital I/O on ADC2 pads is fine.)
-8. **Outputs on GPIO 34–39** — input-only, and the failure is silent: the haptic alarm just never
+9. **Outputs on GPIO 34–39** — input-only, and the failure is silent: the haptic alarm just never
    fires. Asserted by `test/test_pins/` so it is a build failure, not a water-side discovery.
-9. **A big display on I2C** — a 128x64 I2C frame is already ~25 ms; larger panels must use SPI
-   (and note the pin budget: the core's default SPI pins 18/19/23 collide with I2C1 and DRDY).
-10. **Adding I2C pull-ups on top of the #1085 boards' own** — two boards already parallel to ~5 kΩ.
+10. **A big display on I2C** — a 128x64 I2C frame is already ~25 ms; larger panels must use SPI
+    (and note the pin budget: the core's default SPI pins 18/19/23 collide with I2C1 and DRDY).
+11. **Adding I2C pull-ups on top of the #1085 boards' own** — two boards already parallel to ~5 kΩ.
 
 ## 5. Power and battery budget
 
@@ -244,7 +283,8 @@ diver responses.
 
 - **MS5837 gel-filled sensor: max 24 h continuous immersion, then 2 h drying.** A long immersion
   destroys it. Track cumulative immersion on long live-aboard days; this is a scheduled task, not
-  a memory.
+  a memory. (The tier-2 LPS28DFW has no such gel limit — one honest advantage — but it measures
+  only to 4.06 bar abs, §3b.)
 - **O2 cells: replace annually** regardless of reading; a spare cell travels in the housing.
   No temperature compensation is implemented (~2%/°C) — MS5837 temperature is logged every sample
   so post-dive review can see excursions.
@@ -270,9 +310,13 @@ diver responses.
    SPS). Until both fitted boards pass this, they are bench parts, not dive parts (decision 31).
 4. `t` — pair walkers: per-cell rate and the coil/ADC interlock window measured, zero I2C errors
    over 60 s.
-5. `b` — baro identity + live conversion: MS5837 PROM/CRC + real mbar, or BMP180 CHIPID + real
+5. `b` — baro identity + live conversion, all three tiers: MS5837 PROM/CRC + real mbar at 0x76;
+   LPS28DFW WHO_AM_I 0xB4 + FS_MODE latched on readback + real mbar + the computed ~31 m ceiling
+   at 0x5C/0x5D; or BMP180 CHIPID + real
    mbar agreeing with a local weather reference (**named place, hour and source** — e.g. SMHI
    Stockholm station, never a city picked by assumption). Squeeze the module: the reading MUST move.
+   With only the BMP180 fitted, expect `[arm] REFUSED` + `BARO_BENCH_ONLY` — that is decision 39
+   working, not a fault to chase.
 6. `w` — INA219 config write-verify + rail voltage cross-checked against a meter.
 7. `g` — pad map: nothing moved, no pad owned by two roles.
 8. Cell bench checks: bias sanity (each pair within ±250 mV and not railed), air cal flow passes,

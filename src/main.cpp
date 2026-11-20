@@ -28,6 +28,7 @@
 #include "sensors/BusProbe.h"
 #include "sensors/Bmp085.h"
 #include "sensors/Ina219.h"
+#include "sensors/Lps28dfw.h"
 #include "sensors/Ms5837.h"
 
 // Bench path only ('b'): the field-deployed Adafruit implementation of the same Bosch API, used
@@ -55,6 +56,9 @@ boot::Report g_faults;
 //     (bus bytes 0xEE write / 0xEF read). There is no 0x3B anywhere.
 //   MS5837: TE DS, "Module ref / Mode / Pins used / Address (7 bits): MS5837-07BA I2C SDA, SCL
 //     **0x76 (1110110 b)**". The "0x7C" seen in some code is the 8-bit write byte 11101100.
+//   LPS28DFW (decision 39 tier-2 fallback): ST quotes bits 101110xb — 7-bit **0x5C** (SA0=0,
+//     the Adafruit #6067 default) / **0x5D** (SA0=1 solder jumper); the vendor header's 0xB8/0xB9
+//     are the 8-bit bytes for SA0=0. Quoted from the vendor register header, same rule (decision 36).
 // Lesson for the README's common-wiring-mistakes list: a datasheet address may be quoted as
 // 7-bit, 8-bit, or as command bytes (MS5837's PROM reads are 0xA0..0xAC) — never do address
 // arithmetic on them; take the 7-bit form the datasheet states, and confirm with a bus sweep.
@@ -70,6 +74,8 @@ DevSpec g_devices[] = {
     {FaultCode::ADS1115_U1, 0x48, &Wire1, "ADS1115 U1", false},
     {FaultCode::ADS1115_U2, 0x49, &Wire1, "ADS1115 U2", false},
     {FaultCode::BARO, 0x76, &Wire, "MS5837", false},
+    {FaultCode::BARO, 0x5C, &Wire, "LPS28DFW A", false},
+    {FaultCode::BARO, 0x5D, &Wire, "LPS28DFW B", false},
     {FaultCode::BARO, 0x77, &Wire, "BMP085", false},
     {FaultCode::OLED, 0x3C, &Wire, "SSD1306 A", false},
     {FaultCode::OLED, 0x3D, &Wire, "SSD1306 B", false},
@@ -91,12 +97,22 @@ constexpr size_t kAdcCount = sizeof(g_adcs) / sizeof(g_adcs[0]);
 // conversion period at the design OSR, and a Stockholm-station mbar (decision 29's rule).
 sensors::Bmp085 g_bmp085(Wire, 0x77, /*oss=*/2);
 sensors::Ms5837 g_ms5837(Wire, ms5837::kAddr7);   // 7-bit form straight from the DS (decision 36)
+// Tier-2 fallback (decision 39). UNPROCURED as of 2026-11-20 — written-but-never-measured, like
+// the MS5837 side. Address resolves to the strap that ACKs (0x5C/0x5D, SA0 jumper) at check time.
+sensors::Lps28dfw g_lps28(Wire, lps28::kAddr7);
 sensors::Ina219 g_ina219(Wire, pwr::kAddr7);
 
 // Which barometer the dive path will actually use, established by ACTIVE checks at boot and on
 // presence transitions — never by which address ACKed (0x76/0x77 are shared with BMP280/BME280,
 // decision 36). Null until a part passes identity + a real conversion.
 Barometer* g_activeBaro = nullptr;
+
+// True while a baro-class address ACKed but failed its identity chain this pass (a squatter at
+// 0x76/0x5C/0x77). It is what keeps BARO_CONV_BAD raised after a working fallback selects itself:
+// the older code cleared CONV_BAD unconditionally on fallback success, erasing the squatter's
+// arming block the comment above promises. Selection order (decision 39): MS5837-30BA -> LPS28DFW
+// (mode 2) -> BMP085/180 bench-only.
+bool g_baroSquatter = false;
 
 // Psurf is LEARNED at the surface (AGENTS.md 2), from the fitted barometer itself: a hard-coded
 // 1013.25 mbar is the wrong-city-reference error class (risk 21). Locked by learnSurface() at
@@ -170,6 +186,15 @@ void raiseRangeBanner() {
         g_faults.raise(FaultCode::BARO_RANGE, Severity::ERROR, millis(), detail);
 }
 
+// Decision 39: the BMP085/180 is a BENCH sensor. Bench mode works fully with it and it is a fine
+// cross-check, but when it is the only depth source that passed identity, arming is refused —
+// its computed water column (banner above: under 1.3 m at this bench) cannot carry a dive. Same
+// ERROR class as the range banner, but unlike that one this DOES block: the tier below tier 2
+// exists for bring-up, not for depth.
+void raiseBaroBenchOnly() {
+    g_faults.raise(FaultCode::BARO_BENCH_ONLY, Severity::ERROR, millis(), "BMP180 sole: bench only");
+}
+
 void probeDevices() {
     for (DevSpec& d : g_devices) {
         if (!busUp(d.bus)) {
@@ -190,29 +215,41 @@ void probeDevices() {
         }
     }
 
-    // Baro selection. Identity, never ACK: 0x76 counts as the MS5837 primary only after
-// checkBaro()'s PROM+CRC+conversion chain verified it (BMP280/BME280 squat at 0x76/0x77 —
-// decision 36 — and the deployed-library note says the MS5637 shares 0x76 and passes CRC).
-// A 0x76 part that ACKs but fails identity while the BMP180 works gets BOTH banners: the range
-// clamp for the fallback in use, and BARO_CONV_BAD for the squatter, which blocks arming until
-// it is replaced. This runs before checkBaro() at boot, so the identity flag may be from the
-// last transition — checkBaro() re-derives everything and re-raises the banner after.
-    bool ms5837 = false, bmp085 = false;
+    // Baro selection, three tiers (decision 39). Identity, never ACK: 0x76 counts as the MS5837
+    // primary only after checkBaro()'s PROM+CRC+conversion chain verified it (BMP280/BME280 squat
+    // at 0x76/0x77 — decision 36 — and the deployed-library note says the MS5637 shares 0x76 and
+    // passes CRC); 0x5C/0x5D counts as the LPS28DFW tier-2 only after checkLps28()'s WHO_AM_I +
+    // FS_MODE-latch + real-conversion chain verified it. A part that ACKs but fails identity while
+    // a lower tier works gets BOTH banners: the computed range clamp for the tier in use, and
+    // BARO_CONV_BAD for the squatter, which blocks arming until it is replaced. This runs before
+    // checkBaro() at boot, so the identity flags may be from the last transition — checkBaro()
+    // re-derives everything and re-raises the banners after.
+    bool ms5837 = false, lps28 = false, bmp085 = false;
     for (const DevSpec& d : g_devices) {
         if (d.code != FaultCode::BARO || !d.present) continue;
         if (d.addr == ms5837::kAddr7 && g_ms5837.identityVerified()) ms5837 = true;
+        if ((d.addr == lps28::kAddr7 || d.addr == lps28::kAddr7Alt) && g_lps28.identityVerified())
+            lps28 = true;
         if (d.addr == 0x77) bmp085 = true;
     }
     if (ms5837) {
         // Either the MS5837 was verified at boot, or it hot-plugged later: in both cases the
-        // fallback clamp no longer applies.
+        // fallback clamp and the bench-only refusal no longer apply.
         g_faults.clear(FaultCode::BARO_RANGE, millis());
+        g_faults.clear(FaultCode::BARO_BENCH_ONLY, millis());
+        g_faults.clear(FaultCode::BARO, millis());
+    } else if (lps28) {
+        raiseRangeBanner();  // tier-2 ~31 m computed ceiling (decision 39); armable with the banner
+        g_faults.clear(FaultCode::BARO_BENCH_ONLY, millis());
         g_faults.clear(FaultCode::BARO, millis());
     } else if (bmp085) {
-        raiseRangeBanner();  // computed ceiling in the detail, never a recited figure
+        raiseRangeBanner();  // computed sub-1 m clamp, decision 38 — never "9 m" again
+        // The bench-only refusal is about the SELECTED depth source, so it follows g_activeBaro;
+        // checkBaro() re-derives that on every presence transition.
+        if (g_activeBaro == &g_bmp085) raiseBaroBenchOnly();
         g_faults.clear(FaultCode::BARO, millis());
     } else {
-        g_faults.raise(FaultCode::BARO, Severity::ERROR, millis(), "no MS5837/BMP085");
+        g_faults.raise(FaultCode::BARO, Severity::ERROR, millis(), "no MS5837/LPS28/BMP085");
     }
 
     // Same two-address-one-device shape for the OLED (0x3C, with 0x3D as the alternate strap).
@@ -313,16 +350,21 @@ void checkAdcs() {
 
 // Presence is not identity, and this applies at the depth sensor as hard as at the ADCs (risk 21).
 // The boot probe says an address is answered; this says whether the part there IS what it claims
-// and MEASURES. MS5837 is tried first — identity = factory PROM read + CRC-4 verify + C1 band
-// classification + one real D1/D2 pair landing in the surface window (900-1100 mbar, the same
-// window as the air-cal gate, AGENTS.md 6). An ACKing 0x76 that fails any of that is a squatter
-// (BMP280/BME280 class, decision 36) or a dead PROM: BARO_CONV_BAD, ERROR, blocks arming —
-// "something answers at the primary address" is not a depth source.
-// BMP180 fallback: CHIPID + cal ROM + one real conversion (the chain that closed item 17). Both
-// paths write commands, so this runs at boot and on presence transitions only — never on the 5 s
-// re-probe. The 02BA classification is reported and refused for the dive path (a 2-bar die is a
-// ~10 m ceiling, the wrong part for this design); it falls through to the BMP180 if one is fitted.
-void checkMs5837() {
+// and MEASURES. Three tiers (decision 39): MS5837-30BA primary — identity = factory PROM read +
+// CRC-4 verify + C1 band classification + one real D1/D2 pair landing in the surface window
+// (900-1100 mbar, the same window as the air-cal gate, AGENTS.md 6). An ACKing 0x76 that fails any
+// of that is a squatter (BMP280/BME280 class, decision 36) or a dead PROM: BARO_CONV_BAD, ERROR,
+// blocks arming — "something answers at the primary address" is not a depth source.
+// LPS28DFW tier 2 (decision 39): WHO_AM_I 0xB4 + SWRESET self-clear + FS_MODE=1 latching on
+// readback + one real conversion inside the latched 4.06 bar window — armable, with the computed
+// ~31 m clamp banner.
+// BMP085/180 tier 3, BENCH ONLY (decision 39): CHIPID + cal ROM + one real conversion (the chain
+// that closed item 17). It may be selected on the bench, but selecting it raises BARO_BENCH_ONLY,
+// which blocks arming.
+// All paths write commands, so this runs at boot and on presence transitions only — never on the
+// 5 s re-probe. The 02BA classification is reported and refused for the dive path (a 2-bar die is
+// a ~10 m ceiling, the wrong part for this design); it falls through to the lower tiers.
+bool checkMs5837() {
     char detail[40];
     if (!g_ms5837.init()) {
         const auto st = g_ms5837.lastStatus();
@@ -332,7 +374,7 @@ void checkMs5837() {
         snprintf(detail, sizeof(detail), "0x76 %s", why);
         g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
         Serial.printf("  BARO @0x76 ** %s — not a CRC-verified MS5837 PROM **\n", why);
-        return;
+        return false;
     }
     const auto model = g_ms5837.model();
     if (model != ms5837::Model::k30BA) {
@@ -340,7 +382,7 @@ void checkMs5837() {
         snprintf(detail, sizeof(detail), "0x76 %s — wrong range", m);
         g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
         Serial.printf("  BARO @0x76 PROM OK but %s — not the design's 30 mbar-range depth source\n", m);
-        return;
+        return false;
     }
     float ambBar = 0.0f, tempC = 0.0f;
     if (!g_ms5837.read(&ambBar, &tempC)) {
@@ -352,7 +394,7 @@ void checkMs5837() {
         g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
         Serial.printf("  BARO @0x76 ** %s — D1=%lu D2=%lu **\n", why,
                       (unsigned long)g_ms5837.lastD1(), (unsigned long)g_ms5837.lastD2());
-        return;
+        return false;
     }
     if (ambBar < 0.90f || ambBar > 1.10f) {
         // Same surface window the air-cal gate uses; the expectation's source is stated: bench at
@@ -362,38 +404,107 @@ void checkMs5837() {
         g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
         Serial.printf("  BARO @0x76 ** %.1f mbar at the surface — outside 900-1100 **\n",
                       ambBar * 1000.0f);
-        return;
+        return false;
     }
-    g_faults.clear(FaultCode::BARO_CONV_BAD, millis());
+    // The CONV_BAD clear is NOT here: checkBaro() owns it and refuses to clear while any other
+    // baro-class address failed identity this pass (the squatter bug — an unconditional clear here
+    // used to erase the arming block this function's own failure path raised).
     g_activeBaro = &g_ms5837;
     g_faults.clear(FaultCode::BARO, millis());
+    g_faults.clear(FaultCode::BARO_BENCH_ONLY, millis());
     raiseRangeBanner();  // clears itself for a full-range part, re-quotes a computed figure otherwise
     Serial.printf("  BARO @0x76 MS5837-30BA: %.2f mbar  %.2f C  (D1=%lu D2=%lu CRC ok W0=0x%04X "
                   "type=%u) — primary\n",
                   ambBar * 1000.0f, tempC, (unsigned long)g_ms5837.lastD1(),
                   (unsigned long)g_ms5837.lastD2(), g_ms5837.prom().w[0],
                   ms5837::w0TypeBits(g_ms5837.prom().w[0]));
+    return true;
+}
+
+// Tier-2 identity (decision 39). This silicon has no factory PROM to CRC — that is the part's
+// design, not a shortcut — so identity is the active capability chain from BaroLps28.h's header
+// comment: WHO_AM_I 0xB4, SWRESET self-clearing, the dual-full-scale write LATCHING (FS_MODE=1 is
+// what this part is for; a chip that will not present 4060 hPa must not get a 4.06 bar ceiling),
+// and one real conversion inside that latched window. The dive model's clamp comes from the mode
+// read back, never from the mode requested. Writes config registers, so boot/transition only.
+bool checkLps28() {
+    char detail[40];
+    if (!g_lps28.init()) {
+        const auto st = g_lps28.lastStatus();
+        const char* why = st == sensors::Lps28dfw::Status::WRONG_ID     ? "WHO_AM_I != 0xB4"
+                        : st == sensors::Lps28dfw::Status::FS_NOT_LATCHED ? "config/FS_MODE did not latch"
+                        : st == sensors::Lps28dfw::Status::RESET_STUCK  ? "SWRESET stuck"
+                        : st == sensors::Lps28dfw::Status::IO_FAIL      ? "IO fail"
+                                                                        : "init fail";
+        snprintf(detail, sizeof(detail), "0x%02X %s", g_lps28.address(), why);
+        g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
+        Serial.printf("  BARO @0x%02X ** %s — not a verified LPS28DFW **\n", g_lps28.address(), why);
+        return false;
+    }
+    float ambBar = 0.0f, tempC = 0.0f;
+    if (!g_lps28.read(&ambBar, &tempC)) {
+        const auto st = g_lps28.lastStatus();
+        const char* why = st == sensors::Lps28dfw::Status::OUT_OF_RANGE ? "outside latched FS window"
+                        : st == sensors::Lps28dfw::Status::NO_DATA      ? "P_DA never set"
+                                                                        : "read fail";
+        snprintf(detail, sizeof(detail), "0x%02X %s", g_lps28.address(), why);
+        g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
+        Serial.printf("  BARO @0x%02X ** %s — raw=0x%08lX **\n", g_lps28.address(), why,
+                      static_cast<unsigned long>(g_lps28.lastRawAligned()));
+        return false;
+    }
+    if (ambBar < 0.90f || ambBar > 1.10f) {
+        // Same surface window as the tier-1 gate and the air-cal gate: the reference is this bench
+        // at this moment (Stockholm 0-100 m, SLP 984-987 hPa band, risk 21), not a remembered
+        // 1013. Part converts, but to a number nobody should trust at the surface.
+        snprintf(detail, sizeof(detail), "0x%02X surface %.0fmbar odd", g_lps28.address(),
+                 ambBar * 1000.0f);
+        g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
+        Serial.printf("  BARO @0x%02X ** %.1f mbar at the surface — outside 900-1100 **\n",
+                      g_lps28.address(), ambBar * 1000.0f);
+        return false;
+    }
+    g_activeBaro = &g_lps28;
+    g_faults.clear(FaultCode::BARO, millis());
+    g_faults.clear(FaultCode::BARO_BENCH_ONLY, millis());  // tier 2 is armable; bench-only lifted
+    raiseRangeBanner();  // computed ~31 m ceiling at this bench, decision 38's rule
+    char banner[32];
+    baroRangeBanner(banner, sizeof(banner));
+    Serial.printf("  BARO @0x%02X LPS28DFW: %.2f mbar  %.2f C  (WHO=0x%02X CTRL1=0x%02X "
+                  "CTRL2=0x%02X raw=0x%08lX) — tier-2 fallback, %s\n",
+                  g_lps28.address(), ambBar * 1000.0f, tempC, g_lps28.whoAmI(), g_lps28.lastCtrl1(),
+                  g_lps28.lastCtrl2(), static_cast<unsigned long>(g_lps28.lastRawAligned()), banner);
+    return true;
 }
 
 void selectBaroFallback() {
     g_activeBaro = &g_bmp085;
-    raiseRangeBanner();  // computed sub-1 m clamp, decision 38 — never "9 m" again
+    raiseRangeBanner();    // computed sub-1 m clamp, decision 38 — never "9 m" again
+    raiseBaroBenchOnly();  // decision 39: the bench tier may run the bench, not arm a dive
 }
 
 void checkBaro() {
-    bool ack76 = false, ack77 = false;
+    bool ack76 = false, ack5C = false, ack77 = false;
+    uint8_t lpsAddr = lps28::kAddr7;  // which strap ACKed (0x5C/0x5D), for the driver
     for (const DevSpec& d : g_devices) {
         if (d.code != FaultCode::BARO || !d.present || !busUp(&Wire)) continue;
         if (d.addr == ms5837::kAddr7) ack76 = true;
+        if (d.addr == lps28::kAddr7 || d.addr == lps28::kAddr7Alt) { ack5C = true; lpsAddr = d.addr; }
         if (d.addr == 0x77) ack77 = true;
     }
     g_activeBaro = nullptr;
+    bool squatter = false;  // something ACKed a baro-class address and failed identity this pass
 
-    if (ack76) checkMs5837();
+    if (ack76) { if (!checkMs5837()) squatter = true; }
+    if (!g_activeBaro && ack5C) {
+        g_lps28.setAddress(lpsAddr);
+        if (!checkLps28()) squatter = true;
+    }
 
     char detail[40];
-    if (!g_activeBaro && ack77) {  // fallback, or the primary failed its identity chain
+    if (!g_activeBaro && ack77) {  // bench tier, or both dive-capable tiers absent/failed identity
         if (!g_bmp085.init()) {
+            squatter = true;
             if (g_bmp085.lastStatus() == sensors::Bmp085::Status::CAL_ROM_BAD) {
                 snprintf(detail, sizeof(detail), "0x77 cal word %d bad", g_bmp085.calRomBadIndex());
                 g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
@@ -406,6 +517,7 @@ void checkBaro() {
         } else {
             float ambBar = 0.0f, tempC = 0.0f;
             if (!g_bmp085.read(&ambBar, &tempC)) {
+                squatter = true;
                 const char* why = g_bmp085.lastStatus() == sensors::Bmp085::Status::OUT_OF_RANGE
                                       ? "outside 300-1100 hPa"
                                       : "no conversion";
@@ -414,23 +526,30 @@ void checkBaro() {
                 Serial.printf("  BARO @0x77 ** %s — raw UT=%u UP=%lu **\n", why, g_bmp085.lastUt(),
                               static_cast<unsigned long>(g_bmp085.lastUp()));
             } else {
-                g_faults.clear(FaultCode::BARO_CONV_BAD, millis());
                 // A real pressure at the bench is the whole point: identity by register read is
                 // necessary, not sufficient (item 17 closure). ~1 atm expected indoors; 'b' shows
                 // it moving when squeezed. The clamp figure is computed, decision 38.
-                selectBaroFallback();
+                selectBaroFallback();  // also raises BARO_BENCH_ONLY (decision 39) — arm refused
                 g_faults.clear(FaultCode::BARO, millis());
                 char banner[32];
                 baroRangeBanner(banner, sizeof(banner));
                 Serial.printf("  BARO @0x77 BMP180: %.2f mbar  %.1f C  (UT=%u UP=%lu B5=%ld "
-                              "oss=2) — fallback, %s\n",
+                              "oss=2) — bench-only tier, %s\n",
                               ambBar * 1000.0f, tempC, g_bmp085.lastUt(),
                               static_cast<unsigned long>(g_bmp085.lastUp()),
                               (long)g_bmp085.lastB5(), banner);
             }
         }
     }
-    if (!g_activeBaro) g_faults.clear(FaultCode::BARO_RANGE, millis());  // no depth source at all:
+    // Squatter bug fix, decision 39 integration: a selected lower tier must NOT erase the
+    // CONV_BAD block that a failed identity at a higher tier's address just raised. Old code
+    // cleared unconditionally on fallback success, contradicting the comment above it.
+    g_baroSquatter = squatter;
+    if (g_activeBaro && !squatter) g_faults.clear(FaultCode::BARO_CONV_BAD, millis());
+    if (!g_activeBaro) {
+        g_faults.clear(FaultCode::BARO_RANGE, millis());      // no depth source at all:
+        g_faults.clear(FaultCode::BARO_BENCH_ONLY, millis()); // these banners would blame the wrong part
+    }
     // BARO_RANGE would blame the wrong part. The active fault is BARO (none fitted) or
     // BARO_CONV_BAD (something ACKs but cannot be trusted), and both block arming.
 }
@@ -465,7 +584,9 @@ void learnSurface() {
     }
     g_psurf = l;
     g_psurfBar = l.psurfBar();
-    g_faults.clear(FaultCode::BARO_CONV_BAD, millis());
+    // Only clear CONV_BAD when it can only have come from Psurf instability or a re-checked
+    // fallback — a squatter at another baro address keeps its block (checkBaro owns that).
+    if (!g_baroSquatter) g_faults.clear(FaultCode::BARO_CONV_BAD, millis());
     raiseRangeBanner();  // re-quote the clamp against a LEARNED reference: "SL ref" disappears
     Serial.printf("[psurf] learned %.2f mbar (sigma %.2f mbar over %d samples, %.1f C) — "
                   "depth = gauge pressure x %.3f m/bar (SG %.3f)\n",
@@ -556,12 +677,13 @@ void knownScan() {
 
 // Baro identity by measurement — presence is not identity (decision 29). The candidate list is
 // the datasheet 7-bit forms (Bosch DS Table 7: 1110111+R/W = 0x77; TE MS5837 DS: "Address (7
-// bits) 0x76"), plus the BMP280/BME280 strap pair, which share 0x76/0x77 (CSB selects) — so an
-// ACK at 0x76 is *not* proof of an MS5837 until the PROM read says so. Bosch CHIPID reads
-// (pointer write + read of 0xD0, then 0x30 for the BMP3xx family) are WRITES to the pointer
-// register — bench-only, same class as 'a'/'d', and the banner says so.
+// bits) 0x76"; ST LPS28DFW: bits 101110xb = 0x5C/0x5D), plus the BMP280/BME280 strap pair, which
+// share 0x76/0x77 (CSB selects) — so an ACK at 0x76 is *not* proof of an MS5837 until the PROM
+// read says so. Bosch CHIPID reads (pointer write + read of 0xD0, then 0x30 for the BMP3xx
+// family) are WRITES to the pointer register, and the LPS28DFW check runs the dive driver's
+// init() (SWRESET + config writes) — all bench-only, same class as 'a'/'d', and the banner says so.
 void baroIdentity() {
-    static const uint8_t kBaro[] = {0x76, 0x77};
+    static const uint8_t kBaro[] = {0x76, 0x77, lps28::kAddr7, lps28::kAddr7Alt};
     bool any = false;
     for (BusState& b : g_buses) {
         if (!busUp(b.wire)) continue;
@@ -617,6 +739,62 @@ void baroIdentity() {
                                      "(part unprocured) — the math is DS-C6 + deployed-library "
                                      "anchored (test_ms5837); this is its first run on silicon"));
                 }
+            }
+
+            // LPS28DFW (decision 39 tier-2): no factory PROM on this silicon, so the bench runs
+            // the same active chain the dive path uses — WHO_AM_I, then the real driver's init()
+            // (SWRESET + config writes + readback verify, bench class) and a live conversion,
+            // plus the COMPUTED depth ceiling against the latched full scale (decision 38: never
+            // recite, and the "40 m underwater" marketing treats an ABSOLUTE full scale as gauge).
+            if (a == lps28::kAddr7 || a == lps28::kAddr7Alt) {
+                uint8_t who = 0;
+                bool gotWho = false;
+                b.wire->beginTransmission(a);
+                b.wire->write(lps28::kRegWhoAmI);
+                gotWho = b.wire->endTransmission(false) == 0 &&
+                         b.wire->requestFrom(a, (uint8_t)1) == 1;
+                if (gotWho) who = b.wire->read();
+                Serial.printf("  %s @0x%02X ACK  WHO_AM_I=%s0x%02X (LPS28DFW: 0xB4) -> %s\n",
+                              b.label, a, gotWho ? "" : "no-read ", who,
+                              (gotWho && who == lps28::kWhoAmI) ? "claims LPS28DFW"
+                                                                : "NOT an LPS28DFW WHO_AM_I");
+                if (b.wire != &Wire) {
+                    Serial.println(F("    driver check skipped: module answers but the design fits "
+                                     "the baro on I2C0 (Wire) — check the wiring"));
+                } else {
+                    g_lps28.setAddress(a);
+                    if (!g_lps28.init()) {
+                        Serial.printf("    driver: init FAILED (status %d, WHO=0x%02X CTRL1=0x%02X "
+                                      "CTRL2=0x%02X) — no verified identity, no ceiling claim\n",
+                                      (int)g_lps28.lastStatus(), g_lps28.whoAmI(), g_lps28.lastCtrl1(),
+                                      g_lps28.lastCtrl2());
+                    } else {
+                        float a1 = 0, a2 = 0, t1 = 0;
+                        if (g_lps28.read(&a1, &t1) && g_lps28.read(&a2, &t1)) {
+                            const float refPsurf = g_psurf.locked() ? g_psurfBar : 1.01325f;
+                            const float ceilM = depth::ceilingMeters(refPsurf,
+                                                                     g_lps28.rangeCeilingBar(),
+                                                                     g_salinity);
+                            Serial.printf("    driver (10 Hz, AVG4, FS4060 latched=%d): %.2f mbar -> "
+                                          "%.2f mbar  %.2f C  raw=0x%08lX CTRL1=0x%02X CTRL2=0x%02X\n",
+                                          g_lps28.fsMode2(), a1 * 1000.0f, a2 * 1000.0f, t1,
+                                          static_cast<unsigned long>(g_lps28.lastRawAligned()),
+                                          g_lps28.lastCtrl1(), g_lps28.lastCtrl2());
+                            Serial.printf("    ceiling %.1fm @ %.0fmbar ref (computed abs-FS minus "
+                                          "Psurf — Adafruit's \"40 m underwater\" quotes ABS FS as "
+                                          "if gauge)\n", ceilM, refPsurf * 1000.0f);
+                            Serial.println(F("    squeeze the module and re-run 'b': the mbar MUST move"));
+                        } else {
+                            Serial.printf("    driver read FAILED status %d (raw=0x%08lX)\n",
+                                          (int)g_lps28.lastStatus(),
+                                          static_cast<unsigned long>(g_lps28.lastRawAligned()));
+                        }
+                        Serial.println(F("    caveat: LPS28DFW driver is written-not-measured (part "
+                                         "unprocured) — scaling is ST vendor-driver anchored "
+                                         "(test_lps28); this is its first run on silicon"));
+                    }
+                }
+                continue;  // the Bosch CHIPID/cal-ROM dump below does not apply to ST silicon
             }
 
             uint8_t d0 = 0x00, r30 = 0x00, d1 = 0x00, ac1msb = 0x00, ac1lsb = 0x00;
@@ -704,7 +882,7 @@ void baroIdentity() {
             }
         }
     }
-    if (!any) Serial.println(F("  no baro-class address (0x76/0x77) ACKed on any live bus"));
+    if (!any) Serial.println(F("  no baro-class address (0x76/0x77/0x5C/0x5D) ACKed on any live bus"));
     Serial.println(F("  note: the design fits baro on I2C0 only (SDA 21/SCL 22) — an ACK on I2C1 "
                      "means the module is on the ADC bus, not where the firmware will look."));
 }
@@ -1055,9 +1233,10 @@ void handleCommand(char c) {
             break;
         case 'b':
             Serial.println(F("[baro] identity: Bosch CHIPID/cal-ROM + a REAL conversion through the "
-                             "dive driver and the Adafruit library, and the MS5837 PROM/CRC + "
-                             "OSR4096 conversion chain (writes commands — bench only, same class "
-                             "as 'a'/'d'):"));
+                             "dive driver and the Adafruit library, the MS5837 PROM/CRC + OSR4096 "
+                             "conversion chain, and the LPS28DFW WHO_AM_I + FS_MODE-latch + 10 Hz "
+                             "conversion chain (writes commands — bench only, same class as "
+                             "'a'/'d'):"));
             baroIdentity();
             break;
         case 'w':
@@ -1222,7 +1401,7 @@ void loop() {
             // achieved-rate counters restart with it, so 't' never mixes two parts' history.
             for (sensors::AdcPairWalker* w : g_walkers) w->begin();
         }
-        // Same rule one bus over: an ACK at 0x76/0x77 does not say the part is a depth source.
+        // Same rule one bus over: an ACK at 0x76/0x77/0x5C/0x5D does not say the part is a depth source.
         if (baroChanged) checkBaro();
         // And the same rule again for the rail monitor: plenty of parts ACK at 0x40.
         if (powerChanged) checkPower();
