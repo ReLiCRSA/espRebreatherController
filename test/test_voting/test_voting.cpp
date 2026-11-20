@@ -1,5 +1,7 @@
 #include <unity.h>
 
+#include <string.h>
+
 #include "Voting.h"
 
 void setUp() {}
@@ -206,6 +208,27 @@ void test_sigma_stability_gate() {
     TEST_ASSERT_TRUE(mvSigma(noisy, 10, &mean) > 1.0f);
 }
 
+// §6's other statistic: the median is what the slope is computed FROM, so a step in the
+// window (a cell being breathed on mid-cal) must not move it, while the mean does move.
+void test_median_robust_to_a_step_in_the_window() {
+    float s[9] = {10.0f, 10.1f, 9.9f, 10.0f, 10.2f, 90.0f, 90.1f, 89.9f, 90.0f};
+    float scratch[9];
+    memcpy(scratch, s, sizeof s);
+    // Sorted: 9.9 10.0 10.0 10.1 | 10.2 | 89.9 90.0 90.0 90.1 — four steps below the middle
+    // and four above, so the median stays inside the 10 mV cluster while the mean moves to 45.6.
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 10.2f, mvMedian(scratch, 9));   // sorted in place
+    float mean = 0.0f;
+    mvSigma(scratch, 9, &mean);
+    TEST_ASSERT_TRUE(mean > 40.0f);        // the mean moved; the median did not
+
+    float even[4] = {3.0f, 1.0f, 4.0f, 2.0f};
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 2.5f, mvMedian(even, 4));       // middle pair averaged
+
+    float one[1] = {-4.0f};
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, -4.0f, mvMedian(one, 1));       // sign survives
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, mvMedian(nullptr, 0));    // empty is caller's gate
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_three_agree);
@@ -220,5 +243,6 @@ int main() {
     RUN_TEST(test_zero_ppo2_uses_tolerance_floor);
     RUN_TEST(test_diluent_flush_catches_correlated_error);
     RUN_TEST(test_sigma_stability_gate);
+    RUN_TEST(test_median_robust_to_a_step_in_the_window);
     return UNITY_END();
 }

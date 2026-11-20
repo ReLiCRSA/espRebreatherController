@@ -5,8 +5,10 @@
 // if a sensor is absent, something must say so.
 #pragma once
 
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "FaultCode.h"
@@ -133,6 +135,53 @@ class Report {
         return terminate(cap, out, n);
     }
 
+    // M6 web (§9): /api/health and /faults serialize the whole report — ACTIVE faults and
+    // closed history entries, because §4's rule is that a device which came back keeps its
+    // entry so the web can still show it dropped out at boot. `armOk` repeats the gate
+    // answer so the page shows why arming is refused, next to the codes that refuse it.
+    // Returns the length, or -1 when the buffer was too small: a half-written fault list
+    // is exactly the silent-all-clear failure mode this project refuses (§17), so an
+    // overflow is an error the caller must see, never a clipped string.
+    int toJson(char* out, size_t cap) const {
+        if (!out || cap == 0) return -1;
+        int n = 0;
+        int active = 0;
+        for (size_t i = 0; i < kCapacity; ++i)
+            if (slots_[i].code != FaultCode::NONE && slots_[i].present) ++active;
+        if (!emit(out, cap, n, "{\"armOk\":%s,\"highest\":\"%s\",\"active\":%d,\"faults\":[",
+                  blocksArming() ? "false" : "true", severityName(highest()), active))
+            return -1;
+        bool first = true;
+        for (size_t i = 0; i < kCapacity; ++i) {
+            const Entry& e = slots_[i];
+            if (e.code == FaultCode::NONE) continue;
+            if (!emit(out, cap, n, "%s{\"code\":\"%s\",\"sev\":\"%s\",\"active\":%s,"
+                                   "\"attempts\":%u,\"firstMs\":%lu,\"lastMs\":%lu",
+                      first ? "" : ",", faultName(e.code), severityName(e.severity),
+                      e.present ? "true" : "false", (unsigned)e.attempts,
+                      (unsigned long)e.firstMs, (unsigned long)e.lastMs))
+                return -1;
+            if (e.detail[0]) {
+                char esc[kMaxDetail * 2 + 3];
+                escapeInto(esc, sizeof esc, e.detail);
+                if (!emit(out, cap, n, ",\"detail\":\"%s\"", esc)) return -1;
+            }
+            if (!emit(out, cap, n, "}")) return -1;
+            first = false;
+        }
+        if (!emit(out, cap, n, "]}")) return -1;
+        return n;
+    }
+
+    static const char* severityName(Severity s) {
+        switch (s) {
+            case Severity::FATAL: return "FATAL";
+            case Severity::ERROR: return "ERROR";
+            case Severity::WARN:  return "WARN";
+            default:              return "INFO";
+        }
+    }
+
     int countActive(Severity atLeast = Severity::INFO) const {
         int n = 0;
         for (size_t i = 0; i < kCapacity; ++i)
@@ -159,6 +208,28 @@ class Report {
     void reset() { memset(slots_, 0, sizeof(slots_)); }
 
   private:
+    // printf-style append with a hard failure on overflow: every call site checks the
+    // return, so the JSON is either complete or the whole toJson returns -1.
+    static bool emit(char* out, size_t cap, int& n, const char* fmt, ...) {
+        va_list ap;
+        va_start(ap, fmt);
+        int r = vsnprintf(out + n, cap - (size_t)n, fmt, ap);
+        va_end(ap);
+        if (r < 0 || (size_t)r >= cap - (size_t)n) return false;
+        n += r;
+        return true;
+    }
+    // detail strings are firmware-authored, so this is defensive against a future site
+    // that puts a quote or backslash in one — never against user text reaching here.
+    static void escapeInto(char* dst, size_t cap, const char* src) {
+        size_t k = 0;
+        for (const char* p = src; *p && k + 2 < cap; ++p) {
+            if (*p == '"' || *p == '\\') dst[k++] = '\\';
+            dst[k++] = *p;
+        }
+        dst[k] = '\0';
+    }
+
     Entry* find(FaultCode code) {
         for (size_t i = 0; i < kCapacity; ++i)
             if (slots_[i].code == code && slots_[i].code != FaultCode::NONE) return &slots_[i];

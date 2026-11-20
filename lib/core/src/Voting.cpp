@@ -150,3 +150,22 @@ float mvSigma(const float* samples, int n, float* meanOut) {
     if (meanOut) *meanOut = mean;
     return sqrtf(var);
 }
+
+float mvMedian(float* samples, int n) {
+    if (!samples || n <= 0) return 0.0f;
+    // Insertion sort: the window is 60 samples of a slow physical signal, so it is nearly
+    // sorted already and an in-place insertion sort is both cheap and allocation-free.
+    for (int i = 1; i < n; ++i) {
+        const float v = samples[i];
+        int j = i - 1;
+        while (j >= 0 && samples[j] > v) {
+            samples[j + 1] = samples[j];
+            --j;
+        }
+        samples[j + 1] = v;
+    }
+    // Even n averages the middle pair: a median of a two-point window that reported one of
+    // the two points would make the statistic depend on the sample count's parity.
+    if ((n & 1) != 0) return samples[n / 2];
+    return 0.5f * (samples[n / 2 - 1] + samples[n / 2]);
+}

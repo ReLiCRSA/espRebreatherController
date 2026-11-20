@@ -148,7 +148,8 @@ void test_highest_severity_reports_the_worst_active_fault() {
 // ...), so walking the value range needs the gaps spelled out: a new code that is missing from a
 // table lands outside this list and fails. If you add a code, this test tells you to name it.
 void test_every_fault_code_has_a_name_and_a_default_severity() {
-    static const int kGaps[][2] = {{1, 9}, {29, 29}, {32, 39}, {45, 49}, {55, 59}, {69, 79}};
+    // {29,29} closed 2026-11-20 by CONFIG_WRITE_FAILED (M6): the gap took it deliberately.
+    static const int kGaps[][2] = {{1, 9}, {32, 39}, {45, 49}, {55, 59}, {69, 79}};
     auto isGap = [](int v) {
         for (const auto& g : kGaps)
             if (v >= g[0] && v <= g[1]) return true;
@@ -170,7 +171,18 @@ void test_every_fault_code_has_a_name_and_a_default_severity() {
         TEST_ASSERT_TRUE_MESSAGE(intentionalInfo || defaultSeverity(c) != Severity::INFO, msg);
         ++checked;
     }
-    TEST_ASSERT_EQUAL_INT_MESSAGE(46, checked, "the walk no longer covers every enumerator");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(47, checked, "the walk no longer covers every enumerator");
+}
+
+// M6 config path: CONFIG_WRITE_FAILED (a validated edit that did not persist to BOTH
+// stores) is ERROR and refuses an arm — §9's double-write only protects the diver if a
+// half-written setup cannot go diving. CONFIG_CORRUPT (a stored config that failed to
+// LOAD) was already ERROR + blocking; this closes the other half of the write path.
+void test_config_write_failed_blocks_arming() {
+    TEST_ASSERT_TRUE(blocksArming(FaultCode::CONFIG_WRITE_FAILED));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Severity::ERROR),
+                          static_cast<int>(defaultSeverity(FaultCode::CONFIG_WRITE_FAILED)));
+    TEST_ASSERT_NOT_EQUAL(0, strcmp(faultName(FaultCode::CONFIG_WRITE_FAILED), "UNKNOWN"));
 }
 
 // Decision 39's tiering gate: BARO_RANGE (the computed clamp banner) stays a non-blocking ERROR —
@@ -259,5 +271,6 @@ int main() {
     RUN_TEST(test_wrong_adc_part_blocks_arming);
     RUN_TEST(test_display_and_bus_faults_block_arming);
     RUN_TEST(test_bench_only_baro_blocks_arming_but_range_banner_does_not);
+    RUN_TEST(test_config_write_failed_blocks_arming);
     return UNITY_END();
 }

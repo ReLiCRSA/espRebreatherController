@@ -70,6 +70,14 @@ enum class FaultCode : uint16_t {
     // Takes the previously-unassigned value 28; gap list in test_boot follows.
     DISPLAY_RENDER_SLOW = 28,
 
+    // M6 config path: a config edit passed server-side validation but could NOT be persisted
+    // to both stores (§9's atomic LittleFS write + NVS mirror). ERROR and blocks arming: the
+    // double-write is precisely the defence against a diver running on settings that differ
+    // from the ones they typed, and a half-persisted edit is that failure mode. Distinct from
+    // CONFIG_CORRUPT (19), which is about a stored config that failed to LOAD at boot.
+    // Takes the previously-unassigned value 29; gap list in test_boot follows.
+    CONFIG_WRITE_FAILED = 29,
+
     // Power
     VBAT_LOW = 30,
     RAIL_3V3_LOW = 31,
@@ -147,6 +155,7 @@ inline Severity defaultSeverity(FaultCode c) {
         case FaultCode::LITTLEFS:
         case FaultCode::NVS:
         case FaultCode::CONFIG_CORRUPT:
+        case FaultCode::CONFIG_WRITE_FAILED:  // M6: a validated edit that did not persist
         case FaultCode::TISSUE_STATE_STALE:
         case FaultCode::EXTERNAL_WATCHDOG:
         case FaultCode::CELL_DEAD:
@@ -200,6 +209,7 @@ inline bool blocksArming(FaultCode c) {
         case FaultCode::CELL_AGED:
         case FaultCode::VOTING_FAILED:
         case FaultCode::CONFIG_CORRUPT:
+        case FaultCode::CONFIG_WRITE_FAILED:  // §9 double-write failed: settings may differ from intent
         case FaultCode::VBAT_LOW:
         case FaultCode::CAL_STALE:
         case FaultCode::SOLENOID_NO_CLICK:
@@ -234,6 +244,7 @@ inline const char* faultName(FaultCode c) {
         case FaultCode::LITTLEFS: return "LITTLEFS";
         case FaultCode::NVS: return "NVS";
         case FaultCode::CONFIG_CORRUPT: return "CONFIG_CORRUPT";
+        case FaultCode::CONFIG_WRITE_FAILED: return "CONFIG_WRITE_FAILED";
         case FaultCode::TISSUE_STATE_STALE: return "TISSUE_STALE";
         case FaultCode::EXTERNAL_WATCHDOG: return "EXT_WATCHDOG";
         case FaultCode::VBAT_LOW: return "VBAT_LOW";

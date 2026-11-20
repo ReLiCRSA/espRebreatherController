@@ -15,6 +15,7 @@
 //  - presence is not identity: an ACKing 0x48 could be an ADS1015. The ID register is read at boot
 //    and on hot-plug for anything that ACKs, and a mismatch raises ADC_PART_WRONG (blocks arming).
 #include <Arduino.h>
+#include <LittleFS.h>
 #include <esp_log.h>
 #include <Wire.h>
 // perimanGetPinBusType(): which peripheral the core has routed to a pad. This is the observable
@@ -32,6 +33,13 @@
 #include "sensors/Ms5837.h"
 #include "ui/Ssd1306I2C.h"  // M7 panel transport (thingpulse SSD1306Wire subclass; provenance in the header)
 #include "ui/Buttons.h"     // debounced pad scan for paging now, arm sequence (M9) later
+
+// M6: config persistence, the dive-log ring, and the web server. All three are thin ESP
+// wrappers over pure-C++ gates in lib/core (ConfigSchema / DiveSchema / BootReport::toJson),
+// which is where their validation and column order are pinned by native tests.
+#include "config/RuntimeConfig.h"
+#include "dive/DiveLog.h"
+#include "web/WebServer.h"
 
 // Bench path only ('b'): the field-deployed Adafruit implementation of the same Bosch API, used
 // as a second compensation implementation cross-checking lib/core/src/BaroBosch.h on the same
@@ -52,6 +60,7 @@
 // bench 'o' + the 5 Hz live service below are thin ESP wrappers over the same code test_display
 // pins — parse, SAFETY validator, fit report, render, all host-verifiable without hardware.
 #include "LiveState.h"
+#include "StateJson.h"  // the web JSON face of that snapshot (§9), built on the same registry
 #include "Template.h"
 #include "TemplateBundles.h"
 
@@ -130,6 +139,21 @@ uint8_t g_dispPage = 0;  // page button cycles template pages (§12 @page)
 // on entry, so there is no stale state between users.
 disp::tmpl::Template g_tmpl;
 
+// ---- M6: filesystem, stored config, dive ring, web (§9) ---------------------------------
+// LittleFS mount state. Every store layer asks the caller for it rather than assuming it:
+// a config that "saved" to an unmounted volume is the assumed-write class this project has
+// been burned by twice (INA219 CONFIG, LPS28 FS_MODE).
+bool g_fsUp = false;
+
+// Active display template TEXT, cached at boot and on save. displayService() runs at 5 Hz;
+// opening LittleFS for every frame would put a flash read inside the display path for no
+// reason, so the panel renders from this buffer. Empty string = bundled bench_128x64.
+char g_activeTmplText[webnet::kTemplateCap] = "";
+
+// One shared text scratch for the template save + preview services. Like g_tmpl there is
+// exactly ONE instance (decision 40 rule 2): every user is serial on loopTask.
+char g_jobText[webnet::kTemplateCap] = "";
+
 // Which barometer the dive path will actually use, established by ACTIVE checks at boot and on
 // presence transitions — never by which address ACKed (0x76/0x77 are shared with BMP280/BME280,
 // decision 36). Null until a part passes identity + a real conversion.
@@ -147,7 +171,7 @@ bool g_baroSquatter = false;
 // boot; the dive path (M4+) reads g_psurfBar only when locked.
 depth::SurfaceLearner g_psurf;
 float g_psurfBar = 0.0f;
-float g_salinity = 1.025f;  // placeholder until RuntimeConfig (M6); salt default
+float g_salinity = 1.025f;  // salt default; replaced at boot from cfg::RuntimeConfig.sgWater (M6)
 
 // The alternating-mux pair walkers (AGENTS.md 2): U1 walks cell 1 (AIN0/1) -> cell 2 (AIN2/3),
 // U2 walks cell 3 (AIN0/1) -> coil shunt (AIN2/3). The coil slot reads a floating input until
@@ -184,6 +208,29 @@ bool busUp(TwoWire* w) {
     for (const BusState& b : g_buses)
         if (b.wire == w) return b.up;
     return false;
+}
+
+// Wall clock (§9 POST /api/time): the ESP32 classic has no RTC, so the phone sets a
+// (unixS, uptimeS) pair and this turns it into a running clock. 0 means NEVER SET, and every
+// consumer treats 0 as unknown rather than as 1970: a calibration age measured against an
+// invented "now" is this project's recurring defect class (risk 13/21), not a rounding detail.
+uint32_t wallNowS() {
+    const cfg::RuntimeConfig& c = cfgstore::g_cfg;
+    if (c.lastWallS == 0) return 0;
+    const uint32_t up = millis() / 1000u;
+    return up >= c.lastWallUptimeS ? c.lastWallS + (up - c.lastWallUptimeS) : c.lastWallS;
+}
+
+// The configured setpoint law as the gas model sees it (§8 dual setpoint). One builder for the
+// live frame, the simulator and M5's control law, so the number on the screen and the number
+// the loop runs on cannot drift apart.
+GasModelConfig gasCfgFrom(const cfg::RuntimeConfig& c) {
+    GasModelConfig g{};
+    g.pCO2Bar = c.pco2Bar;
+    g.spDeepBar = c.spDeepBar;
+    g.spShallowBar = c.spShallowBar;
+    g.spCrossoverDepthM = c.spCrossoverM;   // config field name != engine field name
+    return g;
 }
 
 // The BARO_RANGE banner quotes a COMPUTED ceiling, never a recited one (decision 38: the record's
@@ -1121,33 +1168,48 @@ void gpioMapReport() {
 // then runs through the real voter, gas model and ZHL engine. It touches no pin, no bus and no
 // radio, and every line is stamped SIM (AGENTS.md 19 risk 11: source stamping is not decoration).
 //
-// This runs in one go inside the bench loop. A profile of a few minutes of dive time is tens of
-// thousands of arithmetic operations; on the ESP32 that is tens of seconds (worst tick 41.5 ms
-// measured — AGENTS.md risk 19), and the idle-task WDT *is* armed on this core: the loop below
-// yields with delay(1) every 15 engine ticks. Do not wire it to anything while it runs.
-void benchRunSim(Stream& out) {
-    // NOT a local: SimRunner is ~145 KB (the 512-entry snapshot history dominates). The Arduino
-    // loop task stack is ~8 KB, and constructing it there smashed memory and came back as
-    // TG1WDT_SYS_RESET with no panic output — measured on the first 'v' run. Static storage is
-    // also the AGENTS.md 17 rule in miniature: no large allocation in the running path.
+// The runner is ~145 KB (the snapshot history dominates), so it is ONE static instance and
+// never a local: a local smashed the 8 KB loopTask and came back as TG1WDT_SYS_RESET with no
+// panic output — measured on the first 'v' run (AGENTS.md 17 in miniature: no large
+// allocation in the running path). Every user — bench 'v', the web Simulator tab, the SIM demo
+// dive — runs serially on loopTask, so one instance serves all three.
+sim::SimRunner& simRunner() {
     static sim::SimRunner r;
-    r.resetRun();
-    sim::CalSet cal{};              // shipped air-cal shape: 47.6 mV/bar, 0 offset
-    zhl::Config ec{};               // GF 30/70, 6 m last stop, defaults from Zhl16c.h
-    GasModelConfig gc{};            // dual setpoint 0.7 above / 1.3 below the 21 m crossover
-    sim::ControlConfig cc{};
-    cc.enabled = true;              // the law computes and injects inside the MODEL only
-    r.setConfig(ec, gc, cal, cc);
-    r.setBattery(3.7f);
+    return r;
+}
 
-    sim::GasSet gases{};            // air diluent, escape air, O2 — the bench default set
-    r.setGases(gases);
+// What the fixed profile was configured with, kept so the flush check, the LiveState frame and
+// the dive-log header all read the SAME calibration and gas set the run actually breathed.
+struct SimSetup {
+    sim::CalSet cal;
+    sim::GasSet gases;
+    zhl::Config engine;
+    GasModelConfig gas;
+    int totalS = 0;
+};
+
+// Configure the runner on THE fixed bench profile (§11). One builder for bench 'v', the web
+// Simulator tab and the SIM demo dive on purpose: a verify() PASS has to describe the same run
+// the console printed, or the report is answering about a dive nobody saw.
+void simConfigureFixed(sim::SimRunner& r, SimSetup* out) {
+    r.resetRun();
+    out->cal = sim::CalSet{};        // shipped air-cal shape: 47.6 mV/bar, 0 offset
+    out->engine = zhl::Config{};     // GF 30/70, 6 m last stop, defaults from Zhl16c.h
+    out->gas = GasModelConfig{};     // dual setpoint 0.7 above / 1.3 below the 21 m crossover
+    out->gases = sim::GasSet{};      // air diluent, escape air, O2 — the bench default set
+    out->totalS = 0;
+    sim::ControlConfig cc{};
+    cc.enabled = true;               // the law computes and injects inside the MODEL only
+    r.setConfig(out->engine, out->gas, out->cal, cc);
+    r.setBattery(3.7f);
+    r.setGases(out->gases);
 
     sim::Profile p{};
     auto seg = [&](int i, float depthM, float min, BreathingState mode) {
         p.seg[i].depthM = depthM;
         p.seg[i].durationMin = min;
         p.seg[i].mode = mode;
+        out->totalS += (int)(min * 60.0f);
     };
     seg(0, 30.0f, 5.0f, BreathingState::CCR_CLOSED);      // descent (ramped at the profile rate)
     seg(1, 30.0f, 8.0f, BreathingState::CCR_CLOSED);      // bottom
@@ -1162,6 +1224,40 @@ void benchRunSim(Stream& out) {
     // the ring would silently hold only the first 96 seconds and every window query about the
     // later dive would be answering from nothing (the NO-DATA rule in SimRunner::verify).
     r.setHistoryStride(16);
+}
+
+// The assertions a fixed-profile run is checked against — §11's regression idea, kept HERE
+// because the web assertion editor is deferred: bench 'j', the SIM demo dive and the web
+// Simulator tab all answer the same five questions, so "the suite passed" means one thing.
+int simFixedAssertions(sim::Assertion* out, int cap) {
+    if (cap < 5) return 0;
+    int n = 0;
+    out[n++] = { sim::Metric::PP02_USED, 540, 780, 0.62f, 0.78f,
+                 "bottom hold stays near the 0.70 setpoint" };
+    out[n++] = { sim::Metric::VOTE_PASSING, 60, 780, 2.0f, 3.0f,
+                 "at least two cells agree all the way down" };
+    out[n++] = { sim::Metric::PP02_MAX, 0, 0, 0.0f, 1.45f,
+                 "never above the 1.30 shallow setpoint plus margin" };
+    out[n++] = { sim::Metric::PLAN_BOUNDED, 0, 0, 0.0f, 0.0f,
+                 "no deco search may saturate its step budget (risk 19)" };
+    out[n++] = { sim::Metric::TTS_MIN, 780, 1020, 0.5f, 240.0f,
+                 "the flush + 21 m phase carries a real decompression obligation" };
+    return n;
+}
+
+// Bench 'v': the fixed profile, run in one go inside the bench loop. A profile of a few minutes
+// of dive time is tens of thousands of arithmetic operations; on the ESP32 that is tens of
+// seconds (worst tick 41.5 ms measured — AGENTS.md risk 19), and the idle-task WDT *is* armed on
+// this core: the loop below yields with delay(1) every 15 engine ticks. Do not wire it to
+// anything while it runs. The web Simulator tab runs the SAME profile in bounded slices instead
+// (simWebService below), because there a console and a radio have to stay answerable.
+void benchRunSim(Stream& out) {
+    sim::SimRunner& r = simRunner();
+    SimSetup setup{};
+    simConfigureFixed(r, &setup);
+    sim::CalSet& cal = setup.cal;              // the flush check below re-uses these
+    sim::GasSet& gases = setup.gases;
+    GasModelConfig& gc = setup.gas;
 
     out.println(F("[sim] SIM run — 30 m / 8 min CCR on air, diluent flush at depth, GF 30/70"));
     out.println(F("      SIM DATA, bench only: no pin, no bus, no radio is touched"));
@@ -1258,6 +1354,31 @@ disp::LiveState demoLiveState() {
     return s;
 }
 
+// The three cell channels as millivolts, straight off the pair walkers. Returns a bitmask of
+// the cells with a FRESH (< 2 s) reading; a stale channel is left at 0 rather than holding its
+// last value, because a stale cell number on a dive display is a lie with a plausible face.
+// Counts stay UN-inverted (per-channel invert is a CellArray concern, M2), so what the panel
+// and the console show is exactly what the converter put on the bus.
+int readCellMv(int32_t* mv) {
+    static const int kCellSlot[3][2] = {{0, 1}, {0, -1}, {-1, -1}};  // c1/c2 on U1, c3 on U2
+    int fresh = 0;
+    for (int c = 0; c < 3; c++) {
+        mv[c] = 0;
+        for (int w = 0; w < 2; w++) {
+            const int slot = kCellSlot[c][w];
+            if (slot < 0) continue;
+            sensors::AdcPairWalker* walk = g_walkers[w];
+            if (!walk->slotValid(slot)) continue;
+            if (walk->slotAgeMs(slot, millis()) > 2000) continue;
+            mv[c] = static_cast<int32_t>(
+                walk->slotRaw(slot) * sensors::Ads1115::kLsbVoltsDesign * 1000.0f);
+            fresh |= 1 << c;
+            break;
+        }
+    }
+    return fresh;
+}
+
 // The live bench frame: built ONLY from parts that passed their identity chains, and every
 // unavailable one reads as an explicit zero in a field the operator knows the unit of — there
 // is no simulation in this path, so simFlag stays 0 (REAL). ppo2_used is 0.00 until M2 wires
@@ -1267,23 +1388,9 @@ void buildBenchLiveState(disp::LiveState& s) {
     std::strcpy(s.mode, "BENCH");
     std::strcpy(s.solenoidState, HAVE_SOLENOID ? "off" : "disabled");
 
-    // Cells: raw counts from the pair walkers x the design-config LSB. Counts are stored
-    // UN-inverted (per-channel invert is a CellArray concern, M2), so what the panel shows is
-    // exactly what the converter put on the bus. Cell inputs float on this bench — plausible-
-    // looking nonsense is expected here (as 't' says); staleness is flagged with a '*'.
-    static const int kCellSlot[3][2] = {{0, 1}, {0, -1}, {-1, -1}};  // c1/c2 on U1, c3 on U2
-    for (int c = 0; c < 3; c++) {
-        for (int w = 0; w < 2; w++) {
-            const int slot = kCellSlot[c][w];
-            if (slot < 0) continue;
-            sensors::AdcPairWalker* walk = g_walkers[w];
-            if (!walk->slotValid(slot)) continue;
-            if (walk->slotAgeMs(slot, millis()) > 2000) { s.cellMv[c] = 0; continue; }
-            s.cellMv[c] = static_cast<int32_t>(
-                walk->slotRaw(slot) * sensors::Ads1115::kLsbVoltsDesign * 1000.0f);
-            break;
-        }
-    }
+    // Cells: raw mV from the walkers. Cell inputs float on this bench — plausible-looking
+    // nonsense is expected here (as 't' says); staleness shows as a 0 with a fresh-bitmask miss.
+    readCellMv(s.cellMv);
 
     // Depth: real baro read (blocking T+P cycle, ~17 ms at oss=2) — only once Psurf is locked,
     // because a depth with no learned surface reference is a wrong number, not a missing one.
@@ -1300,6 +1407,49 @@ void buildBenchLiveState(disp::LiveState& s) {
         float v = 0.0f, a = 0.0f;
         if (g_ina219.read(&v, &a)) s.vBat = v;
     }
+
+    // Config-derived fields. These are COMPUTED from the settings the diver chose plus the
+    // measured ambient, never copied from a demo: MOD / END / density are limit arithmetic
+    // (GasMix.h, pinned natively) and the inspired pressures come out of the same
+    // resolveInspired() the deco engine will run on (M4), so what the screen shows and what
+    // the model breathes cannot disagree. A field this path cannot compute honestly stays 0
+    // with its unit known (ndl, tts, cns: no dive running).
+    const cfg::RuntimeConfig& c = cfgstore::g_cfg;
+    GasLimits gl{};
+    gl.ppO2MaxBar = c.ppO2MaxBar;
+    gl.ppO2MinBar = c.ppO2MinBar;
+    gl.heNarcFactor = c.heNarcFactor;
+    gl.densityMaxGL = c.densityMaxGL;
+    const GasModelConfig gasCfg = gasCfgFrom(c);
+
+    const int slot = (c.selectedGas >= 0 && c.selectedGas < cfg::kGasCount) ? c.selectedGas : 0;
+    const GasMix& g = c.gases[slot];
+    std::strncpy(s.gas, g.name[0] ? g.name : "-", sizeof(s.gas) - 1);
+    s.fo2 = g.fo2;
+    s.fHe = g.fhe;
+
+    const float refSurf = g_psurfBar > 0.0f ? g_psurfBar : 1.01325f;  // 1.01325 = stated SL ref
+    const float amb = s.ambBar > 0.0f ? s.ambBar : refSurf;
+    const GasAssessment a = assessGas(g, s.depthM, amb, s.tempC, refSurf,
+                                      depth::metersPerBar(g_salinity), gl);
+    s.modM = static_cast<int32_t>(a.modM);
+    s.hypoxicModM = static_cast<int32_t>(a.hypoxicMinM);
+    s.endM = static_cast<int32_t>(a.endM);
+    s.gasDensityGL = a.densityGL;
+
+    const bool oc = (c.mode == cfg::MODE_OC);
+    const BreathingState bs = oc ? BreathingState::OC_OPEN : BreathingState::CCR_CLOSED;
+    const Inspired ins = resolveInspired(bs, c.gases[0], c.gases[1], c.gases[2], g,
+                                         amb, s.depthM, gasCfg);
+    s.ppN2 = ins.pn2;
+    s.ppHe = ins.phe;
+    // The commanded setpoint at the measured depth (OC: the inspired ppO2 of the open-circuit
+    // mix). This is a COMMAND, not a measurement — the ppO2 a cell voted stays 0.00 until M2.
+    s.setpoint = oc ? g.fo2 * amb : setpointAt(gasCfg, s.depthM);
+    s.lastStopM = static_cast<int32_t>(c.lastStopM);
+    const uint32_t nowS = wallNowS();
+    if (nowS > 0 && c.calWallS > 0 && nowS >= c.calWallS)
+        s.calAgeH = static_cast<float>(nowS - c.calWallS) / 3600.0f;
     g_faults.summaryLine(s.faultBanner, sizeof(s.faultBanner));
 }
 
@@ -1400,6 +1550,27 @@ void benchDisplay(Print& out) {
     }
 }
 
+// ---------------------------------------------------------------- snapshot transport (§4)
+//
+// §4's contract, literally: the dive path owns the frame and the web side receives an
+// immutable copy through a 1-deep xQueueOverwrite queue — that is webnet::snapshotPublish(),
+// whose queue lives in src/web/WebServer.cpp (created in start(), written by loopTask, read
+// by GET /api/state; the same call also drives the ~2 Hz WebSocket push). One producer, one
+// consumer, no shared mutable dive state.
+//
+// What this build does NOT do is §4's CORE split, and the difference is stated rather than
+// papered over: there is no dive task yet. loopTask (core 1, priority 1) is the dive path
+// until M5/M8 put DiveTask on core 0 at priority 24, and AsyncTCP's async_tcp task is created
+// unpinned (CONFIG_ASYNC_TCP_RUNNING_CORE default -1, read from the installed AsyncTCP.h),
+// so the radio may run on either core today. The JSON build and the WS enqueue therefore
+// happen on loopTask right now — bounded (one 2 KB payload at 2 Hz) and measured by bench 'n'
+// staying responsive, but it is not §4's split until the task exists.
+
+// The SIM frame, if a simulator run owns the display right now (defined with the sim web
+// service below). One frame is built per tick and served to BOTH the panel and the socket,
+// so the display and the browser cannot disagree about what the sim did.
+bool simLiveFrame(disp::LiveState& out);
+
 // 5 Hz live bench display service, ticked from the service windows so it shares the loop with
 // the ADC walkers instead of delaying them. §12: renderer runs at 5 Hz, and a render over the
 // 50 ms budget is ABANDONED (last good frame stays on the panel) with DISPLAY_RENDER_SLOW —
@@ -1421,8 +1592,19 @@ void displayService() {
     lastTick = now;
     if (!busUp(&Wire)) return;  // no bus: never touch the pad (decision 26)
 
+    // One frame per tick, built once and used twice: the panel and the WebSocket. A simulator
+    // run owns the display while it is running (SIM-stamped, so the panel says so out loud and
+    // risk 11 stays satisfied in the visible output); otherwise the frame is the real one.
     disp::LiveState s;
-    buildBenchLiveState(s);
+    const bool simFrame = simLiveFrame(s);
+    if (!simFrame) buildBenchLiveState(s);
+    webnet::snapshotPublish(s, now);   // §4's queue + the ~2 Hz WS push (§9)
+
+    // The ACTIVE template (§12's whole point: the layout is data, and the web editor can change
+    // it without a reflash). loadActiveTemplate() read the file once at boot / after a save, so
+    // this path never opens a file — it parses cached text.
+    const char* activeText = g_activeTmplText[0] ? g_activeTmplText
+                                                 : disp::bundles::bench_128x64();
 
     // Parse per tick into the shared scratch g_tmpl (see its declaration: one static
     // instance for every serial display path). Re-parsing rather than caching keeps
@@ -1431,11 +1613,12 @@ void displayService() {
     // 8-line parse at 5 Hz, microseconds next to the ~25 ms frame push.
     disp::tmpl::Template& t = g_tmpl;
     disp::tmpl::ParseResult pr;
-    if (!disp::tmpl::parse(disp::bundles::bench_128x64(), t, pr)) {
+    if (!disp::tmpl::parse(activeText, t, pr)) {
         if (now - lastSlowLog > 5000) {
             lastSlowLog = now;
-            Serial.printf("[oled] bundled bench template failed to parse (line %u: %s) — display "
-                          "stale, dive loop unaffected\n", pr.lineNo, pr.msg);
+            Serial.printf("[oled] active template '%s' failed to parse (line %u: %s) — display "
+                          "stale, dive loop unaffected\n", webnet::activeTemplate(),
+                          pr.lineNo, pr.msg);
         }
         return;
     }
@@ -1458,10 +1641,807 @@ void displayService() {
     // waiting (§12): count it once per change rather than spamming the console.
     if (st.truncated != lastTruncReport) {
         lastTruncReport = st.truncated;
-        Serial.printf("[oled] bench frame clipped %u segment(s) at the panel edge — banner is "
-                      "longer than one line; the fit report is the tool for that (§12)\n",
-                      st.truncated);
+        Serial.printf("[oled] '%s' frame clipped %u segment(s) at the panel edge — a field is "
+                      "longer than its line; the fit report is the tool for that (§12)\n",
+                      webnet::activeTemplate(), st.truncated);
     }
+}
+
+// ==================================================== M6: files, config, web jobs (§9/§10)
+//
+// Everything in this section runs on loopTask. That IS §4's enforcement on this build: the
+// radio task's only routes in are the request flags in src/web/WebServer.h, and this section
+// is the only caller of applyAndSave / factoryWipe / the template render path / the dive-log
+// writer. No web callback touches g_cfg, a template file, the display scratch or an open dive
+// (dive DELETE is the one FS write the web task may do, and it is refused while a dive is open).
+
+// --- LittleFS text helpers --------------------------------------------------------------
+constexpr const char* kTmplDir = "/display/templates";
+constexpr const char* kActivePath = "/display/active.txt";
+
+// Bundled templates by name — the same three the web listing offers. fitdemo_9on8 and
+// invalid_missing_safety stay bench gate demos, not layouts a diver can select.
+const char* bundledTemplate(const char* name) {
+    if (!strcmp(name, "default_128x64")) return disp::bundles::default_128x64();
+    if (!strcmp(name, "compact_128x32")) return disp::bundles::compact_128x32();
+    if (!strcmp(name, "bench_128x64")) return disp::bundles::bench_128x64();
+    return nullptr;
+}
+
+// Names are [A-Za-z0-9_]{1,23}: the same rule the web handler applies, restated here because
+// a name that reaches snprintf unfiltered reaches a path buffer unfiltered.
+bool tmplPathFor(const char* name, char* out, int cap) {
+    if (!name || !name[0]) return false;
+    int i = 0;
+    for (; name[i]; i++) {
+        if (i > 22) return false;
+        const char c = name[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_')) return false;
+    }
+    snprintf(out, (size_t)cap, "%s/%s.txt", kTmplDir, name);
+    return true;
+}
+
+bool readFileText(const char* path, char* out, int cap) {
+    if (!g_fsUp || cap <= 1) return false;
+    File f = LittleFS.open(path, "r");
+    if (!f) { f.close(); return false; }
+    const int n = f.readBytes(out, cap - 1);
+    f.close();
+    if (n <= 0) return false;
+    out[n] = '\0';
+    int k = n;
+    while (k > 0 && (out[k - 1] == '\n' || out[k - 1] == '\r')) out[--k] = '\0';
+    return k > 0;
+}
+
+// tmp+rename with a size check before the rename and a presence check after it. A store that
+// reports success without being re-read is the assumed-write class this project has been
+// burned by twice (INA219 CONFIG, LPS28 FS_MODE), so the write is not trusted until flash
+// says it happened.
+bool writeFileText(const char* path, const char* text) {
+    if (!g_fsUp || !text) return false;
+    char tmp[96];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    if (LittleFS.exists(tmp)) LittleFS.remove(tmp);
+    {
+        File f = LittleFS.open(tmp, "w");
+        if (!f) { f.close(); return false; }
+        f.print(text);
+        f.close();
+    }
+    bool ok = LittleFS.exists(tmp);
+    if (ok) {
+        File f = LittleFS.open(tmp, "r");
+        const size_t got = f.size();
+        f.close();
+        ok = got == strlen(text);
+    }
+    if (!ok) { LittleFS.remove(tmp); return false; }
+    if (LittleFS.exists(path)) LittleFS.remove(path);
+    return LittleFS.rename(tmp, path) && LittleFS.exists(path);
+}
+
+// Read the active template's NAME and TEXT into the caches (§12). Bundled names resolve to
+// compiled-in text, so a board with no LittleFS still renders; a custom name is read once
+// here, never per frame. Returns false when the active pointer could not be honoured — the
+// caches then hold the bundled bench layout, and the caller's console line says which.
+bool loadActiveTemplate() {
+    char name[24] = "bench_128x64";
+    if (g_fsUp) {
+        char txt[32];
+        char path[64];
+        if (readFileText(kActivePath, txt, (int)sizeof txt)) {
+            if (tmplPathFor(txt, path, (int)sizeof path)) snprintf(name, sizeof name, "%s", txt);
+            else Serial.printf("[disp] %s names an unusable template '%s' — staying on bench_128x64\n",
+                               kActivePath, txt);
+        }
+    }
+    webnet::setActiveTemplate(name);
+
+    if (const char* b = bundledTemplate(name)) {
+        snprintf(g_activeTmplText, sizeof g_activeTmplText, "%s", b);
+        return true;
+    }
+    char path[64];
+    if (tmplPathFor(name, path, (int)sizeof path) &&
+        readFileText(path, g_activeTmplText, (int)sizeof g_activeTmplText))
+        return true;
+
+    Serial.printf("[disp] active template '%s' is not on flash (%s) — rendering bundled bench_128x64\n",
+                  name, g_fsUp ? "missing or unreadable" : "LittleFS down");
+    snprintf(g_activeTmplText, sizeof g_activeTmplText, "%s", disp::bundles::bench_128x64());
+    return false;
+}
+
+// --- air calibration (§6): 60 s of cell samples at ~1 bar ambient, sigma-gated -----------
+// Precondition first, then sampling, then the slope gate. The order is the point: §6 refuses a
+// cal that is not happening at 1 bar, because a slope derived at depth is wrong by the pressure
+// ratio and looks completely plausible afterwards (risk 13's class, in millivolts).
+constexpr int   kCalSamples = 60;            // §6: 60 s countdown, one sample per second
+constexpr float kCalAmbientMinBar = 0.900f;  // §6: refuse unless ambient is 900-1100 mbar
+constexpr float kCalAmbientMaxBar = 1.100f;
+constexpr float kCalSigmaMaxMv = 1.0f;       // §6 stability gate
+constexpr float kCalSlopeMinMvPerBar = 30.0f;  // §5: aged / current-limited cell
+constexpr float kCalSlopeMaxMvPerBar = 120.0f;  // ConfigSchema's own upper bound
+constexpr float kCalAirFo2 = 0.21f;          // the single point §6 requires
+constexpr float kCalAgreeTolFrac = 0.20f;    // §6: >20% disagreement is rejected
+
+struct AirCal {
+    int state = 0;                    // 0 idle, 1 running, 2 accepted, 3 refused/failed
+    int n = 0;
+    uint32_t nextSampleMs = 0;
+    float sample[3][kCalSamples];     // 720 B static: this is the sampling window
+    float sigma[3] = {0, 0, 0};
+    float med[3] = {0, 0, 0};           // median mV of the window, the §6 statistic
+    float slope[3] = {0, 0, 0};
+    int passMask = 0;
+    char msg[64] = "";
+};
+AirCal g_aircal;
+
+void calReport() {
+    float worst = 0.0f;
+    for (int i = 0; i < 3; i++)
+        if (g_aircal.sigma[i] > worst) worst = g_aircal.sigma[i];
+    webnet::setCalStatus(g_aircal.state, g_aircal.n, worst, g_aircal.passMask,
+                         g_aircal.slope, g_aircal.msg);
+}
+
+void calRefuse(const char* why) {
+    g_aircal.state = 3;
+    snprintf(g_aircal.msg, sizeof g_aircal.msg, "%s", why);
+    calReport();
+    Serial.printf("[cal] air cal refused: %s\n", why);
+}
+
+void calStart() {
+    g_aircal = AirCal{};
+    if (!g_fsUp) { calRefuse("LittleFS down: slopes cannot persist"); return; }
+    // "the baro is present" is not the precondition — the baro must have passed its identity
+    // chain and learned Psurf, or ambient pressure is a guess (decision 39's rule).
+    if (!g_activeBaro || g_psurfBar <= 0.0f) {
+        calRefuse("no identity-passed baro / Psurf not learned"); return;
+    }
+    float ambBar = 0.0f, tempC = 0.0f;
+    if (!g_activeBaro->read(&ambBar, &tempC)) { calRefuse("baro conversion failed"); return; }
+    if (ambBar < kCalAmbientMinBar || ambBar > kCalAmbientMaxBar) {
+        char why[64];
+        snprintf(why, sizeof why, "ambient %.0f mbar outside 900-1100", ambBar * 1000.0f);
+        calRefuse(why);
+        return;
+    }
+    int32_t mv[3] = {0, 0, 0};
+    if (readCellMv(mv) != 0b111) { calRefuse("all three cells must be sampling"); return; }
+    g_aircal.state = 1;
+    g_aircal.nextSampleMs = millis();
+    snprintf(g_aircal.msg, sizeof g_aircal.msg, "sampling — keep still for 60 s");
+    calReport();
+    Serial.println(F("[cal] air cal started: 60 s at 0.21 ppO2, sigma gate 1 mV, slope >= 30 mV/bar"));
+}
+
+void calFinish(bool accepted, const char* summary) {
+    g_aircal.state = accepted ? 2 : 3;
+    snprintf(g_aircal.msg, sizeof g_aircal.msg, "%s", summary);
+    calReport();
+    Serial.printf("[cal] air cal %s: %s\n", accepted ? "accepted" : "FAILED", summary);
+    for (int i = 0; i < 3; i++)
+        Serial.printf("      cell %d: sigma %5.2f mV  median %7.1f mV  slope %6.2f mV/bar  %s\n",
+                      i + 1, g_aircal.sigma[i], g_aircal.med[i], g_aircal.slope[i],
+                      (g_aircal.passMask & (1 << i)) ? "PASS" : "reject");
+}
+
+void calCompute() {
+    char fail[3][24] = {"", "", ""};
+    float cand[3] = {0, 0, 0};
+    int pass = 0;
+    for (int i = 0; i < 3; i++) {
+        float mean = 0.0f;
+        g_aircal.sigma[i] = mvSigma(g_aircal.sample[i], g_aircal.n, &mean);
+        // mvMedian sorts the window in place; it is scratch, and a local copy would be a KB
+        // of stack in a task that already owns the 18 KB display scratch (decision 40 rule 1).
+        const float med = mvMedian(g_aircal.sample[i], g_aircal.n);
+        const float sl = med / kCalAirFo2;
+        g_aircal.med[i] = med;
+        g_aircal.slope[i] = sl;
+        if (g_aircal.sigma[i] > kCalSigmaMaxMv) {
+            snprintf(fail[i], sizeof fail[i], "sigma %.2fmV", g_aircal.sigma[i]);
+            continue;
+        }
+        if (sl < 0.0f) {
+            // A negative air signal is not a dead cell — it is a live cell wired the other
+            // way round. §2 resolves a per-channel invert flag on the bench; until that is
+            // stored, saying so beats silently calibrating a sign error into the slope.
+            snprintf(fail[i], sizeof fail[i], "negative: check invert");
+            continue;
+        }
+        if (sl < kCalSlopeMinMvPerBar || sl > kCalSlopeMaxMvPerBar) {
+            snprintf(fail[i], sizeof fail[i], "slope %.1f out 30-120", sl);
+            continue;
+        }
+        cand[pass++] = sl;
+    }
+    if (pass >= 2) {
+        // Cross-cell agreement (§6) against the median of the accepted slopes: an absolute
+        // 20% band would let two cells that are both wrong together pass each other.
+        const float ref = mvMedian(cand, pass);
+        for (int i = 0; i < 3; i++) {
+            if (fail[i][0]) continue;
+            if (ref > 0.0f && fabsf(g_aircal.slope[i] - ref) > kCalAgreeTolFrac * ref)
+                snprintf(fail[i], sizeof fail[i], "20%% off group %.1f", ref);
+        }
+    }
+    for (int i = 0; i < 3; i++)
+        if (!fail[i][0]) g_aircal.passMask |= 1 << i;
+    pass = __builtin_popcount((unsigned)g_aircal.passMask);
+
+    if (pass == 0) {
+        char why[64];
+        snprintf(why, sizeof why, "no cell passed: %s", fail[0][0] ? fail[0] : "?");
+        calFinish(false, why);
+        return;
+    }
+
+    // Persist the accepted cells. A rejected cell keeps its previous slope — stated rather
+    // than zeroed, because zeroing it silently would also silently drop a cell that may still
+    // be the only honest one until the diver can look at the reason. M2's arming gate
+    // re-checks all three in air, so a bad cell cannot arm the unit on its old value.
+    cfg::RuntimeConfig cand2 = cfgstore::g_cfg;
+    for (int i = 0; i < 3; i++)
+        if (g_aircal.passMask & (1 << i)) cand2.calSlopeMvPerBar[i] = g_aircal.slope[i];
+    cand2.calWallS = wallNowS();
+    cfg::ConfigErrors errs{};
+    const int code = cfgstore::applyAndSave(g_faults, millis(), cand2, errs);
+
+    char why[64];
+    if (code == 0) {
+        snprintf(why, sizeof why, "rejected by config gate: %s",
+                 errs.count ? errs.items[0].field : "?");
+        calFinish(false, why);
+        return;
+    }
+    snprintf(why, sizeof why, "%d of 3 accepted%s%s%s", pass, pass == 3 ? "" : "; ",
+             pass == 3 ? "" : (fail[0][0] ? fail[0] : (fail[1][0] ? fail[1] : fail[2])),
+             code == -1 ? " WRITE FAILED" : "");
+    calFinish(pass > 0, why);
+    if (cand2.calWallS == 0)
+        Serial.println(F("      wall clock is not set: cal age reads unknown — POST /api/time "
+                         "(the cal-age arming gate cannot run without it)"));
+    if (code == -1)
+        Serial.println(F("      CONFIG_WRITE_FAILED: slopes are live but did not persist — "
+                         "arming stays blocked until a clean double-write"));
+}
+
+void airCalService() {
+    if (webnet::takeCalStartRequest()) { calStart(); return; }
+    if (g_aircal.state != 1) return;
+    const uint32_t now = millis();
+    if (now < g_aircal.nextSampleMs) return;
+    g_aircal.nextSampleMs = now + 1000;
+    int32_t mv[3] = {0, 0, 0};
+    if (readCellMv(mv) != 0b111) {
+        // A cell dropping out mid-cal is exactly the event the sample count would otherwise
+        // paper over: the window would still be 60 samples long and look complete.
+        calFinish(false, "a cell stopped sampling — aborted");
+        return;
+    }
+    for (int i = 0; i < 3; i++) g_aircal.sample[i][g_aircal.n] = (float)mv[i];
+    g_aircal.n++;
+    calReport();
+    if (g_aircal.n >= kCalSamples) calCompute();
+}
+
+// --- display template save (§9 route, §12 gate) ----------------------------------------
+// The whole §12 safety story runs HERE, on loopTask, with the single g_tmpl scratch: parse,
+// the SAFETY validator, and a fit check against the panel actually fitted. A template that
+// hides ppO2/depth/TTS is refused and never reaches flash — that is the invariant risk 10
+// exists for, and it is enforced on the write path, not only in the native test.
+void templateSaveService() {
+    char name[24];
+    if (!webnet::takeTemplateSave(name, (int)sizeof name, g_jobText, webnet::kTemplateCap))
+        return;
+
+    bool ok = false;
+    char msg[128] = "";
+    do {
+        if (!g_fsUp) { snprintf(msg, sizeof msg, "LittleFS down: templates cannot persist"); break; }
+
+        disp::tmpl::ParseResult pr;
+        if (!disp::tmpl::parse(g_jobText, g_tmpl, pr)) {
+            snprintf(msg, sizeof msg, "parse line %u: %s", pr.lineNo, pr.msg);
+            break;
+        }
+        disp::tmpl::ValidationResult vr;
+        if (!disp::tmpl::validate(g_tmpl, vr)) { snprintf(msg, sizeof msg, "%s", vr.msg); break; }
+
+        // A custom file must not shadow a bundled layout: bundledTemplate() wins at boot, so
+        // a saved file of the same name would be a template that never renders — a silent
+        // divergence between what the editor shows and what the panel paints.
+        if (bundledTemplate(name)) {
+            snprintf(msg, sizeof msg, "'%s' is a bundled layout: choose another name", name);
+            break;
+        }
+
+        // Fit against the FITTED panel. Saving is allowed (the layout may be for the bigger
+        // panel of open item 6); activating something the current panel cannot draw is not,
+        // because the drop rules can leave a SAFETY-only page that does not fit.
+        disp::tmpl::Layout lay;
+        disp::tmpl::layoutPage(g_tmpl, 0, g_display.size().w, g_display.size().h, lay);
+        char path[64];
+        if (!tmplPathFor(name, path, (int)sizeof path)) {
+            snprintf(msg, sizeof msg, "template name rejected");
+            break;
+        }
+        if (!lay.fit.fits) {
+            // Saving is allowed (the layout may be written for the bigger panel of open
+            // item 6); ACTIVATING something the fitted panel cannot draw is not, because the
+            // drop rules can leave a page the SAFETY fields alone exceed. Reported, not
+            // celebrated: ok=false with the §12 fit report as the reason.
+            if (writeFileText(path, g_jobText))
+                snprintf(msg, sizeof msg, "saved but NOT active: %s", lay.fit.message);
+            else
+                snprintf(msg, sizeof msg, "save failed: %s", lay.fit.message);
+            break;
+        }
+        if (!writeFileText(path, g_jobText)) { snprintf(msg, sizeof msg, "write failed"); break; }
+        if (!writeFileText(kActivePath, name)) {
+            snprintf(msg, sizeof msg, "saved, but the active pointer did not persist");
+            break;
+        }
+        webnet::setActiveTemplate(name);
+        snprintf(g_activeTmplText, sizeof g_activeTmplText, "%s", g_jobText);
+        ok = true;
+        snprintf(msg, sizeof msg, "saved, validated and active: %s", name);
+    } while (0);
+
+    webnet::templateSaveDone(ok, msg);
+    Serial.printf("[disp] template '%s': %s\n", name, msg);
+}
+
+// --- display preview (§12 browser preview) ---------------------------------------------
+// Renders the named template into the SAME framebuffer the panel uses and never calls
+// present(), so a preview cannot paint over a live dive frame. The payload is the raw
+// page-major bitmap as hex — the browser then draws the same pixels the SSD1306 would,
+// which is what makes the preview worth trusting. Sizes are capped to a framebuffer that
+// exists for them (128x64 / 128x32); a bigger panel is the SPI decision (items 6/15), not
+// a buffer to pretend at here.
+char g_prevJson[2560];
+
+void previewService() {
+    char name[24];
+    int w = 0, h = 0;
+    if (!webnet::takePreview(name, (int)sizeof name, &w, &h)) return;
+
+    const char* text = nullptr;
+    char path[64];
+    static char fileText[webnet::kTemplateCap + 8];
+    if (const char* b = bundledTemplate(name)) text = b;
+    else if (tmplPathFor(name, path, (int)sizeof path) &&
+             readFileText(path, fileText, (int)sizeof fileText)) text = fileText;
+
+    // The same set webnet::requestPreview accepts (WebServer.cpp) — a framebuffer exists for
+    // exactly these, and a bigger panel is the SPI decision (open items 6/15), not a buffer
+    // to pretend at here.
+    if (!(w == 128 && (h == 64 || h == 32)) && !(w == 64 && h == 48)) {
+        snprintf(g_prevJson, sizeof g_prevJson,
+                 "{\"ok\":false,\"error\":\"preview sizes are 128x64, 128x32 or 64x48 until an "
+                 "SPI panel exists (open items 6/15)\"}");
+        webnet::previewDone(g_prevJson, (int)strlen(g_prevJson));
+        return;
+    }
+    if (!text) {
+        snprintf(g_prevJson, sizeof g_prevJson, "{\"ok\":false,\"error\":\"no such template\"}");
+        webnet::previewDone(g_prevJson, (int)strlen(g_prevJson));
+        return;
+    }
+
+    disp::tmpl::ParseResult pr;
+    if (!disp::tmpl::parse(text, g_tmpl, pr)) {
+        snprintf(g_prevJson, sizeof g_prevJson, "{\"ok\":false,\"error\":\"parse line %u: %s\"}",
+                 pr.lineNo, pr.msg);
+        webnet::previewDone(g_prevJson, (int)strlen(g_prevJson));
+        return;
+    }
+    disp::tmpl::ValidationResult vr;
+    if (!disp::tmpl::validate(g_tmpl, vr)) {
+        snprintf(g_prevJson, sizeof g_prevJson, "{\"ok\":false,\"error\":\"%s\"}", vr.msg);
+        webnet::previewDone(g_prevJson, (int)strlen(g_prevJson));
+        return;
+    }
+
+    // The preview frame is LIVE state (the editor previews against what the unit is showing
+    // now), SIM-stamped only when the sim owns the display. A fabricated preview frame would
+    // be risk 11 in a browser.
+    disp::LiveState s;
+    if (!simLiveFrame(s)) buildBenchLiveState(s);
+
+    disp::tmpl::Layout lay;
+    disp::tmpl::layoutPage(g_tmpl, 0, (uint16_t)w, (uint16_t)h, lay);
+    disp::Framebuf fb(g_dispBuf, (uint16_t)w, (uint16_t)h);
+    fb.clear();
+    disp::tmpl::RenderStats st;
+    const uint8_t page = g_dispPage < g_tmpl.pageCount ? g_dispPage : 0;
+    disp::tmpl::renderPage(g_tmpl, lay, page, s, fb, st);
+
+    // 1024 B -> 2048 hex chars, so the buffer is sized for the largest previewable panel.
+    int k = snprintf(g_prevJson, sizeof g_prevJson,
+                     "{\"ok\":true,\"name\":\"%s\",\"w\":%d,\"h\":%d,\"bytes\":%u,\"lines\":%u,"
+                     "\"truncated\":%u,\"fieldErrors\":%u,\"fits\":%s,\"report\":\"%s\",\"sim\":%d,\"hex\":\"",
+                     name, w, h, (unsigned)fb.byteCount(), st.linesDrawn, st.truncated,
+                     st.fieldErrors, lay.fit.fits ? "true" : "false",
+                     lay.fit.message[0] ? lay.fit.message : "", s.simFlag);
+    if (k < 0 || k > (int)sizeof g_prevJson - 3) k = (int)sizeof g_prevJson - 3;
+    const uint8_t* p = fb.data();
+    const size_t n = fb.byteCount();
+    static const char* kHex = "0123456789abcdef";
+    for (size_t i = 0; i < n && k + 2 < (int)sizeof g_prevJson - 4; i++) {
+        g_prevJson[k++] = kHex[p[i] >> 4];
+        g_prevJson[k++] = kHex[p[i] & 0x0f];
+    }
+    k += snprintf(g_prevJson + k, sizeof g_prevJson - (size_t)k, "\"}");
+    webnet::previewDone(g_prevJson, k);
+}
+
+// --- simulator run for the web Simulator tab (§9 tab, §11 sim) -------------------------
+// The same fixed profile bench 'v' runs, executed in bounded slices instead of one blocking
+// pass: the console, the ADC walkers and the radio have to stay answerable while it runs, and
+// this core arms the idle-task WDT (the first 'v' run learned that the hard way). 8 engine
+// ticks per service window, with delay(1) breaks, is ~195 windows for the 1560 s profile —
+// roughly ten seconds of wall time, which is a test harness, not a dive.
+//
+// Scope stated: this run drives the DISPLAY and the WEBSOCKET (both from one frame per tick,
+// SIM-stamped) and it runs the fixed verify() assertions. It does NOT write to the dive ring —
+// the ring is for dives that happened; the bench 'j' command is the explicit way to put a SIM
+// dive in the log for the graph tab to read.
+bool g_simRunActive = false;
+SimSetup g_simSetup;                       // what the running/last run was configured with
+
+// The verify report is ~1.5 KB (kMaxAssertions x AssertionResult + a Snapshot): not a
+// task-stack local next to an 18 KB display scratch (decision 40 rule 1). One static, used
+// serially on loopTask.
+static sim::VerifyReport g_verify;
+
+// Breathing-state label that FITS the 12-byte mode fields (LiveState::mode, dlog::Sample::mode).
+// gas::breathingStateName() is the exact enum name, and its longest label "DILUENT_FLUSH" is 13
+// characters — a 13-char label in a 12-byte field is a column silently clipped in the CSV and a
+// truncated word on the panel, which is risk 17's defect class in text. So the presentation
+// label is short and stated here; the exact name stays where the engine reports state.
+const char* modeLabel(BreathingState s) {
+    switch (s) {
+        case BreathingState::CCR_CLOSED:        return "CCR";
+        case BreathingState::CCR_DILUENT_FLUSH: return "FLUSH-DIL";
+        case BreathingState::CCR_O2_FLUSH:      return "FLUSH-O2";
+        case BreathingState::MANUAL_BAILOUT:    return "BAILOUT";
+        case BreathingState::OC_OPEN:           return "OC";
+    }
+    return "?";
+}
+
+// Same writer the LiveState serializer uses (web::detail::Jw, StateJson.h): every append is
+// checked, so a report that does not fit is a hard failure rather than a JSON document that
+// silently describes fewer assertions than ran.
+void simVerifyJson(const sim::VerifyReport& rep, char* out, int cap) {
+    web::detail::Jw j{out, cap, 0, false};
+    j.prf("{\"allPassed\":%s,\"total\":%d,\"passed\":%d,\"unevaluated\":%d,"
+          "\"boundedPlanSeen\":%s,\"histFromS\":%u,\"histToS\":%u,\"histDropped\":%lu,\"items\":[",
+          rep.allPassed() ? "true" : "false", rep.total, rep.passed, rep.unevaluated,
+          rep.boundedPlanSeen ? "true" : "false",
+          (unsigned)rep.histOldestSec, (unsigned)rep.histNewestSec,
+          (unsigned long)rep.histDropped);
+    char msg[96];
+    for (int i = 0; i < rep.total && !j.bad; i++) {
+        const sim::AssertionResult& a = rep.item[i];
+        snprintf(msg, sizeof msg, "%s", a.message);   // clip to 95 chars: the band text is
+        if (i) j.prf(",");                            // prose, and the payload has a cap
+        j.prf("{\"passed\":%s,\"evaluated\":%s,\"samples\":%d,\"observed\":%.3f,\"msg\":",
+              a.passed ? "true" : "false", a.evaluated ? "true" : "false", a.samples, a.observed);
+        j.str(msg);
+        j.prf("}");
+    }
+    j.prf("]}");
+    if (j.bad) {
+        snprintf(out, (size_t)cap, "{\"allPassed\":false,\"error\":\"verify report too large "
+                                   "for the payload buffer — %d assertions, cap %d B\"}",
+                 rep.total, cap);
+    }
+}
+
+void simWebStart() {
+    sim::SimRunner& r = simRunner();
+    simConfigureFixed(r, &g_simSetup);
+    g_simRunActive = true;
+    webnet::setSimStatus(1, 0, g_simSetup.totalS);
+    webnet::setSimVerify("");
+    Serial.println(F("[sim] web SIM run started (fixed profile). SIM DATA: the display and the "
+                     "browser are both showing model output, stamped SIM"));
+}
+
+void simWebFinish(int state) {
+    sim::SimRunner& r = simRunner();
+    sim::Assertion a[8];
+    const int n = simFixedAssertions(a, (int)sizeof a / (int)sizeof a[0]);
+    g_verify = r.verify(a, n);
+    // Static, and sized to the web side's own buffer (WebServer.cpp g_simVerify): a local would
+    // be 1.4 KB on the 8 KB loopTask next to the display scratch (decision 40 rule 1), and a
+    // JSON built wider than the receiver's buffer would be truncated there without saying so.
+    static char json[1400];
+    simVerifyJson(g_verify, json, (int)sizeof json);
+    webnet::setSimVerify(json);
+    const sim::Snapshot& f = r.last();
+    webnet::setSimStatus(state, (int)f.tSec, g_simSetup.totalS);
+    Serial.printf("[sim] SIM run %s at t=%us: %d of %d assertions passed, %d unevaluated, "
+                  "plan-bounded seen %s (history %u-%us, %lu dropped)\n",
+                  state == 3 ? "stopped" : "complete", (unsigned)f.tSec, g_verify.passed,
+                  g_verify.total, g_verify.unevaluated, g_verify.boundedPlanSeen ? "YES" : "no",
+                  (unsigned)g_verify.histOldestSec, (unsigned)g_verify.histNewestSec,
+                  (unsigned long)g_verify.histDropped);
+    g_simRunActive = false;
+}
+
+void simWebService() {
+    if (webnet::takeSimStartRequest()) { simWebStart(); return; }
+    if (!g_simRunActive) { (void)webnet::simStopRequested(); return; }
+
+    if (webnet::simStopRequested()) { webnet::clearSimStopRequest(); simWebFinish(3); return; }
+
+    sim::SimRunner& r = simRunner();
+    if (r.finished()) { simWebFinish(2); return; }
+
+    // Bounded slice. delay(1) feeds the idle-task WDT and lets the radio task run; the ADC
+    // walkers keep their own pacing and simply get fewer ticks while a sim run holds the loop.
+    for (int i = 0; i < 8 && !r.finished(); i++) {
+        r.tick();
+        if ((i & 3) == 3) delay(1);
+    }
+    webnet::setSimStatus(r.finished() ? 2 : 1, (int)r.last().tSec, g_simSetup.totalS);
+}
+
+// Snapshot -> LiveState, so the sim frame carries the same registry fields as a real one and
+// the WebSocket/panel code has no idea which it is looking at. simFlag=1 always (risk 11).
+void liveStateFromSim(const sim::Snapshot& s, disp::LiveState& out) {
+    out.clear();
+    out.simFlag = 1;
+    out.depthM = s.depthM;
+    out.ambBar = s.ambBar;
+    out.tempC = s.tempC;
+    out.ppo2Used = s.ppO2Used;
+    for (int i = 0; i < 3; i++) {
+        // Per-cell ppO2 in bar, from the sim's own millivolts through the SAME calibration the
+        // run was configured with — the voter's inputs, not a restatement of its answer.
+        const float sl = g_simSetup.cal.cal[i].slopeMvPerBar;
+        out.ppo2Cell[i] = s.cellPresent[i] && sl > 0.0f ? s.cellMv[i] / sl : 0.0f;
+        out.cellMv[i] = (int32_t)s.cellMv[i];
+    }
+    out.votingPass = (s.passing >= 2);
+    out.ndlMin = (int32_t)s.ndlMin;
+    out.ttsMin = (int32_t)s.ttsMin;
+    out.ceilingM = s.ceilingM;
+    out.lastStopM = (int32_t)g_simSetup.engine.lastStopM;
+    out.gfNow = 0.0f;                       // the snapshot does not carry the live GF value
+    snprintf(out.controllingComp, sizeof out.controllingComp, "%d", s.controllingComp);
+    out.cnsPct = (int32_t)s.cnsPct;
+    out.otu = s.otu;
+    out.ppN2 = s.ppN2;
+    out.ppHe = s.ppHe;
+    out.setpoint = s.setpointBar;
+    out.pulsesPerMin = (int32_t)s.pulsesPerMin;
+    out.injectedL = s.injectedAmbL;
+    out.vBat = simRunner().battery();
+    out.diveTimeSec = (int32_t)s.tSec;
+    out.ascRateMMin = 0.0f;                 // the model moves depth by profile rate per tick
+    std::strcpy(out.mode, modeLabel(s.mode));
+    const GasMix& dil = g_simSetup.gases.diluent;
+    out.fo2 = dil.fo2;
+    out.fHe = dil.fhe;
+    std::strcpy(out.gas, dil.name[0] ? dil.name : "SIM-AIR");
+    std::strcpy(out.solenoidState, s.noClick ? "no click"
+                                             : (s.wouldInject ? "model inject" : "idle"));
+    // The banner carries the REAL faults plus the SIM stamp, so a mixed frame is legible as
+    // mixed on the panel too, not just in the JSON.
+    char banner[sizeof out.faultBanner];
+    g_faults.summaryLine(banner, sizeof banner);
+    snprintf(out.faultBanner, sizeof out.faultBanner, "SIM %s", banner);
+}
+
+bool simLiveFrame(disp::LiveState& out) {
+    if (!g_simRunActive) return false;
+    liveStateFromSim(simRunner().last(), out);
+    return true;
+}
+
+// --- the web job pump: everything the radio asked for, executed here -------------------
+void webJobsService() {
+    cfgstore::serviceConfigQueue(g_faults, millis());
+    airCalService();
+    simWebService();
+    templateSaveService();
+    previewService();
+
+    // Salinity is config-derived and the baro banner/depth math read the global, so an edit
+    // that lands through the queue has to reach the math. Compared, not assumed: the ceiling
+    // banner is re-raised with the new figure so the record shows which reference was used.
+    if (g_salinity != cfgstore::g_cfg.sgWater && cfgstore::g_cfg.sgWater > 0.5f) {
+        g_salinity = cfgstore::g_cfg.sgWater;
+        Serial.printf("[cfg] salinity now %.3f (%.4f m/bar) — depth math re-derived\n",
+                      g_salinity, depth::metersPerBar(g_salinity));
+        raiseRangeBanner();   // the clamp ceiling is salinity-derived: re-quote it (decision 38)
+    }
+
+    if (webnet::takeFactoryResetRequest()) {
+        const bool ok = cfgstore::factoryWipe(g_faults, millis());
+        g_salinity = cfgstore::g_cfg.sgWater;
+        Serial.println(ok ? F("[cfg] factory reset: defaults active, both stores verified empty")
+                          : F("[cfg] factory reset FAILED — CONFIG_WRITE_FAILED blocks arming"));
+    }
+}
+
+// --- bench 'k': the config store, inspected rather than assumed -----------------------
+// §9 promises a double-written, read-back-verified, versioned config. This is where that
+// claim is checked on the bench: both stores re-read side by side, byte counts, schema
+// numbers, and whether the two texts are identical. A store that is down prints DOWN —
+// "absent" would be a different and wrong statement about the hardware.
+void benchConfig(Print& out) {
+    const cfg::RuntimeConfig& c = cfgstore::g_cfg;
+    cfgstore::StoreState st{};
+    cfgstore::storeInspect(&st);
+
+    auto store = [](int s) -> const char* {
+        switch (s) { case 0: return "absent"; case 1: return "valid";
+                     case 2: return "UNTRUSTED"; default: return "DOWN"; }
+    };
+    out.printf("[cfg] stores: LittleFS %s (%u B, schema %d)   NVS %s (%u B, schema %d)   %s\n",
+               store(st.fs), (unsigned)st.fsBytes, st.fsSchema,
+               store(st.nvs), (unsigned)st.nvsBytes, st.nvsSchema,
+               st.identical ? "texts identical" : "TEXTS DIFFER");
+    if (st.fs == 2 || st.nvs == 2)
+        out.println(F("      UNTRUSTED = present but unreadable / oversize / bad syntax / schema "
+                      "newer than this build. CONFIG_CORRUPT or CONFIG_WRITE_FAILED should be on "
+                      "the banner — check 'p'"));
+    out.printf("  live: mode %s, selected gas %d, GF %.0f/%.0f, last stop %.0fm, sp %.2f deep / "
+               "%.2f shallow above %.0fm, ppO2 %.2f-%.2f, SG %.3f\n",
+               c.mode == cfg::MODE_OC ? "OC" : "CCR", (int)c.selectedGas, c.gfLow * 100.0f,
+               c.gfHigh * 100.0f, c.lastStopM, c.spDeepBar, c.spShallowBar, c.spCrossoverM,
+               c.ppO2MinBar, c.ppO2MaxBar, c.sgWater);
+    out.printf("  valves: pulse %.0f-%.0f ms, max %.0f pulses/min, %.3f ambL/pulse, inject floor "
+               "%.2f V; sim: %.2f surfL/min into %.1f L\n",
+               c.valvePulseMsMin, c.valvePulseMsMax, c.valvePulsesPerMinMax, c.valvePulseVolAmbL,
+               c.vbatInjectMinV, c.metabolicSurfLpm, c.loopVolumeL);
+    out.printf("  gases:");
+    for (int i = 0; i < cfg::kGasCount; i++) {
+        const GasMix& g = c.gases[i];
+        if (!g.name[0]) continue;
+        out.printf(" [%d]%s %.2f/%.2f", i, g.name, g.fo2, g.fhe);
+    }
+    out.println();
+    out.printf("  cal:");
+    for (int i = 0; i < 3; i++) out.printf(" c%d %.2f mV/bar", i + 1, c.calSlopeMvPerBar[i]);
+    const uint32_t w = wallNowS();
+    if (c.calWallS == 0) out.println(F("   — NEVER CALIBRATED on this board (0 = no slope accepted yet)"));
+    else if (w == 0) out.println(F("   wall clock unset, so cal AGE is unknown ('h' shows how to set it)"));
+    else out.printf("  age %.1f h\n", (float)(w - c.calWallS) / 3600.0f);
+    out.printf("  wall clock: %s (lastWallS %u + uptime %u s)\n",
+               w ? "set" : "NEVER SET — dive logs and cal age will read 0",
+               (unsigned)c.lastWallS, (unsigned)c.lastWallUptimeS);
+    out.println(F("      writes go through POST /api/config: validated server-side, applied here "
+                  "on loopTask, tmp+rename to LittleFS + NVS mirror, each read back before the "
+                  "reply claims success"));
+}
+
+// --- bench 'n': network status for acceptance ----------------------------------------
+// The user's network is not this device's business: it runs a SoftAP and never joins or
+// changes anything. This is the bench-side acceptance for the AP — SSID, station count,
+// and the fact that the server is answering (the HTTP/WS checks are curl/WS-client side).
+void benchNetwork(Print& out) {
+    char ssid[40] = "";
+    webnet::apSsid(ssid, (int)sizeof ssid);
+    out.printf("[net] web server %s; AP SSID '%s'; http://diveccr.local; stations %d\n",
+               webnet::running() ? "RUNNING" : "NOT RUNNING", ssid, webnet::stationCount());
+    out.printf("  wifiDuringDive=%d in config; SoftAP only — this firmware never joins a network, "
+               "so it cannot change the operator's Wi-Fi\n",
+               (int)cfgstore::g_cfg.wifiDuringDive);
+    out.println(F("  from a machine on the AP: curl http://diveccr.local/api/health then "
+                  "/api/state, /api/config, /api/dives, and a WS to /ws; the page itself is at /"));
+    if (!webnet::running())
+        out.println(F("      not running: start() failed or WiFi is off for the dive — the boot "
+                      "line says which; no dive function is lost, so no fault code is raised"));
+}
+
+// --- bench 'j': the fixed profile written to the dive ring ---------------------------
+// §10's real auto-start (ppO2 valid + depth >= 1 m for 10 s) cannot fire until M2's voting
+// produces a real ppO2, so this is the explicit path that puts a dive in the ring — SIM-tagged
+// in the header AND in every sample's source column (risk 11: the stamp is in the data, not in
+// a comment). It is what the web Dive log tab and the CSV export are tested against.
+void benchSimDive(Print& out) {
+    if (!g_fsUp) { out.println(F("[log] LittleFS is down: no dive can be written")); return; }
+    if (divelog::isOpen()) { out.printf("[log] dive %d is already open\n", divelog::openId()); return; }
+
+    sim::SimRunner& r = simRunner();
+    simConfigureFixed(r, &g_simSetup);
+
+    dlog::Header h{};
+    h.startWallS = wallNowS();
+    snprintf(h.mode, sizeof h.mode, "CCR");
+    h.gases[0] = g_simSetup.gases.diluent;
+    h.gases[1] = g_simSetup.gases.oxygen;
+    h.gases[2] = g_simSetup.gases.bailout;
+    for (int i = 0; i < g_simSetup.gases.stageCount && i + 3 < dlog::kGasSlots; i++)
+        h.gases[i + 3] = g_simSetup.gases.stage[i];
+    h.gfLow = g_simSetup.engine.gfLow;
+    h.gfHigh = g_simSetup.engine.gfHigh;
+    for (int i = 0; i < 3; i++) h.calSlopeMvPerBar[i] = g_simSetup.cal.cal[i].slopeMvPerBar;
+    h.source = 1;  // SIM (§10: sim runs land in the same ring, tagged)
+    g_faults.summaryLine(h.faults, sizeof h.faults);
+    float v = r.battery();
+    h.vBatStart = v;
+    h.vBatMin = v;
+    for (int i = 0; i < 3; i++) { h.minPpO2[i] = 99.0f; h.maxPpO2[i] = -99.0f; }
+
+    if (!divelog::startDive(h)) {
+        out.println(F("[log] startDive FAILED — the ring/index write did not verify; see the fault "
+                      "banner"));
+        return;
+    }
+    out.printf("[log] SIM dive %d opened; running the fixed profile in slices (touches no "
+               "hardware; source=SIM in every row)\n", divelog::openId());
+
+    int nextSample = 0;
+    int ticksSinceYield = 0;
+    int nsamples = 0;
+    float maxDepth = 0.0f;
+    while (!r.finished()) {
+        if (++ticksSinceYield >= 15) { ticksSinceYield = 0; delay(1); }
+        const sim::Snapshot& s = r.tick();
+        if (s.depthM > maxDepth) maxDepth = s.depthM;
+        if (s.tSec >= (uint32_t)nextSample) {
+            nextSample += 60;
+            dlog::Sample sm{};
+            sm.tS = (int32_t)s.tSec;
+            sm.depthM = s.depthM; sm.ambBar = s.ambBar; sm.ppo2Used = s.ppO2Used;
+            for (int i = 0; i < 3; i++) {
+                sm.cellMv[i] = (int32_t)s.cellMv[i];
+                // §10 wants min/max ppO2 PER CELL, so it is computed per cell from that cell's
+                // millivolts through the calibration the run used — the voted value would put
+                // the same number in all three columns and hide a diverging cell.
+                const float sl = g_simSetup.cal.cal[i].slopeMvPerBar;
+                if (s.cellPresent[i] && sl > 0.0f) {
+                    const float pp = s.cellMv[i] / sl;
+                    if (pp < h.minPpO2[i]) h.minPpO2[i] = pp;
+                    if (pp > h.maxPpO2[i]) h.maxPpO2[i] = pp;
+                }
+            }
+            sm.ndlMin = (int32_t)s.ndlMin; sm.ttsMin = (int32_t)s.ttsMin;
+            sm.ceilingM = s.ceilingM; sm.cnsPct = (int32_t)s.cnsPct; sm.otu = (uint32_t)s.otu;
+            sm.ppHe = s.ppHe; sm.fHe = g_simSetup.gases.diluent.fhe;
+            snprintf(sm.controllingComp, sizeof sm.controllingComp, "%d", s.controllingComp);
+            sm.endM = 0;                      // END is a gas-planning field; not computed here
+            snprintf(sm.mode, sizeof sm.mode, "%s", modeLabel(s.mode));
+            snprintf(sm.gas, sizeof sm.gas, "%s", g_simSetup.gases.diluent.name);
+            sm.pulses = (int32_t)s.pulsesTotal;
+            sm.vBat = r.battery();
+            sm.coilShuntPeakA = s.clickPeakA;  // model click, not the shunt (M5)
+            sm.tempC = s.tempC;
+            sm.source = 1;
+            if (divelog::appendSample(sm)) nsamples++;
+        }
+    }
+
+    const sim::Snapshot& f = r.last();
+    h.durationS = (int32_t)f.tSec;
+    h.maxDepthM = maxDepth;
+    h.decoTimeS = (int32_t)(f.ttsMin * 60.0f);
+    h.cnsPct = (int32_t)f.cnsPct;
+    h.otu = (uint32_t)f.otu;
+    h.vBatMin = r.battery();
+    h.sampleCount = nsamples;
+    for (int i = 0; i < 3; i++) if (h.maxPpO2[i] < 0.0f) { h.minPpO2[i] = 0.0f; h.maxPpO2[i] = 0.0f; }
+    const int id = divelog::openId();
+    divelog::endDive(h);
+    out.printf("[log] SIM dive %d closed: %d samples at 60 s, max %.1f m, TTS %.1f min, CNS %.0f%%, "
+               "OTU %.0f — /dives/NNN.json + .csv in the 5-dive ring\n",
+               id, nsamples, maxDepth, f.ttsMin, f.cnsPct, f.otu);
+    out.println(F("      SIM DATA: read it as a regression fixture for the log/graph path, never "
+                  "as a dive that happened"));
 }
 
 void handleCommand(char c) {
@@ -1568,6 +2548,15 @@ void handleCommand(char c) {
                              "(touches only the OLED, bench only):"));
             benchDisplay(Serial);
             break;
+        case 'k':
+            benchConfig(Serial);
+            break;
+        case 'n':
+            benchNetwork(Serial);
+            break;
+        case 'j':
+            benchSimDive(Serial);
+            break;
         case 'h':
         default:
             Serial.println(F("bench commands: s=full bus scan  p=probe table + report  "
@@ -1576,7 +2565,9 @@ void handleCommand(char c) {
                              "interlock window  b=baro identity + live mbar/C reading  w=INA219 "
                              "battery rail + raw registers  g=pad map + pad test  "
                              "v=headless sim profile (SIM-stamped, touches no hardware)  "
-                             "o=display: validator rejections + fit report + demo render"));
+                             "o=display: validator rejections + fit report + demo render  "
+                             "k=config stores + live settings  n=web/AP status  "
+                             "j=write the fixed SIM profile into the dive ring"));
             break;
     }
 }
@@ -1590,7 +2581,8 @@ void serviceWindow(uint32_t ms) {
     const uint32_t end = millis() + ms;
     for (;;) {
         for (sensors::AdcPairWalker* w : g_walkers) w->tick();
-        displayService();  // self-throttled to 5 Hz (§12); I2C0 frame, walkers ride I2C1
+        displayService();  // self-throttled to 5 Hz (§12); also publishes the §4 snapshot
+        webJobsService();  // config edits, air cal, SIM run, template save/preview, factory reset
         while (Serial.available()) handleCommand(static_cast<char>(Serial.read()));
         if (millis() >= end) return;
         delay(2);
@@ -1623,6 +2615,40 @@ void setup() {
     }
     if (pins::WDT_HEARTBEAT >= 0) pinMode(pins::WDT_HEARTBEAT, OUTPUT);
 
+    // --- M6 boot order: filesystem -> config -> buses -> identity probes -> ring ->
+    //     active template -> web. Config comes before the probes because the baro range
+    //     banner and the depth math are salinity-derived (decision 38: computed from
+    //     config + the fitted part, never recited), so the setting has to be loaded before
+    //     anything computes a ceiling from it. The web starts LAST: its handlers must not
+    //     answer before the state they report on exists.
+    // false = never format on a mount failure: a silent format would erase the dive ring and
+    // both config copies, which is a data-loss failure mode, not a recovery.
+    //
+    // The 4th argument is load-bearing and was read from the installed core rather than
+    // assumed: LittleFS.begin()'s default partitionLabel is the literal string "spiffs"
+    // (libraries/LittleFS/src/LittleFS.h), and this project's data partition is named "fs"
+    // (partitions.csv). Passing the default asks esp_littlefs for a partition that does not
+    // exist, so the mount fails on a board with a perfectly good filesystem — the "absence
+    // inferred from a wrong expectation" class again.
+    g_fsUp = LittleFS.begin(false, "/littlefs", 10, "fs");
+    if (!g_fsUp) {
+        g_faults.raise(FaultCode::LITTLEFS, Severity::ERROR, millis(), "mount failed");
+        Serial.println(F("[fs] LittleFS mount FAILED — dive log and templates are offline, "
+                         "config runs single-copy from NVS; not fatal at boot"));
+    } else {
+        Serial.printf("[fs] LittleFS mounted on partition 'fs': %u KB total, %u KB used\n",
+                      (unsigned)(LittleFS.totalBytes() / 1024),
+                      (unsigned)(LittleFS.usedBytes() / 1024));
+    }
+
+    const bool cfgLoaded = cfgstore::loadAtBoot(g_faults, millis(), g_fsUp);
+    g_salinity = cfgstore::g_cfg.sgWater > 0.5f ? cfgstore::g_cfg.sgWater : 1.025f;
+    cfgstore::publishWebMirror();
+    Serial.printf("[cfg] %s; salinity %.3f (%.4f m/bar)\n",
+                  cfgLoaded ? "stored config loaded (see 'k' for both stores)"
+                            : "factory defaults — no stored config on this board",
+                  g_salinity, depth::metersPerBar(g_salinity));
+
     for (BusState& b : g_buses) initBus(b);
 
     probeDevices();
@@ -1648,6 +2674,19 @@ void setup() {
     g_faults.raise(FaultCode::SOLENOID_DISABLED, Severity::INFO, millis(), "inert, not fitted");
     Serial.println(F("[o2] solenoid disabled — GPIO 26 will not be driven"));
 #endif
+
+    // --- M6: dive ring, active template, config edit queue, then the radio --------------
+    // Last, on purpose: no route may answer before the state it reports on exists (a /api/state
+    // served before the baro identity chain ran would publish numbers that are not true yet).
+    divelog::begin(g_faults, millis());
+    loadActiveTemplate();
+    if (!cfgstore::configQueueInit())
+        Serial.println(F("[cfg] config edit queue NOT created — POST /api/config will refuse "
+                         "rather than apply settings outside the dive path"));
+    if (webnet::start(g_faults)) benchNetwork(Serial);
+    else Serial.println(F("[web] web server NOT started — everything else still runs; bench 'n' "
+                          "re-reads the radio state"));
+
     handleCommand('h');
 }
 

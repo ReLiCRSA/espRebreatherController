@@ -1,7 +1,14 @@
 # HANDOFF.md — session transfer snapshot
 
 **Written:** 2026-11-19, after the headless dive simulator was written and run on real hardware.
-**Updated:** 2026-11-20 (fourth pass), after **M7: display template engine + FieldRegistry +
+**Updated:** 2026-11-21 (fifth pass) — **M6 (web + config store + dive log) is IN PROGRESS, NOT
+committed, and the ESP32 image does NOT link: `dram0_0_seg` overflowed by 57,376 B when the radio
+went live.** Nothing from M6 is flashed; the board still runs the fourth-pass (M7) image. Read
+**§7 "M6 — where it stands, and the DRAM blocker" before touching anything**: it holds the measured
+map figures, the ordered cut list, what is already written and tested, and the acceptance path.
+Native suite is green (**15 suites, ~173 cases**, incl. new `test_config` and `test_webjson`); only
+the ESP32 link is failing.
+**Previously (fourth pass), 2026-11-20,** after **M7: display template engine + FieldRegistry +
 SSD1306 scenes** — engine complete in `lib/core` (decision 40), bench `o` runs the gate on-target
 (validator OK/rejection, §12 fit report verbatim, SIM-stamped demo render 1426 µs, real panel
 frame 22 ms), live 5 Hz render from boot, boot `[oled] SSD1306 up @0x3C`. Along the way the board
@@ -42,11 +49,15 @@ the ADC register map, the GPIO pin map, the **source interfaces** in `SensorIf.h
 layout/fit/render, `Fields.h` registry, `Framebuf.h`, `Font6x8.h`, `LiveState.h`, the
 `DisplayDriver` interface, `SimDisplay.h`, `TemplateBundles.h` — decision 40)) plus
 **`lib/sim`** (SimBaro, SimCells, LoopModel, ValveModel, CcrControlLaw, SimRunner) are complete and
-regression-anchored: **140 native cases green** across thirteen suites. `src/` boots on the board:
+regression-anchored: **173 native cases green** across **fifteen** suites (counted 2026-11-21, after
+M6 added `test_config` and `test_webjson`). `src/` boots on the board:
 safe-state pins first, bounded I2C presence probing, active converter checks, honest boot fault
 report, arming refusal, hot re-probe every 5 s, two alternating-mux pair walkers running in `loop()`,
-the 5 Hz display renderer live on the fitted 0x3C panel, serial bench commands (`s p r c a d t b w g v o`).
-**M0, M1 and M7 (engine + fitted-panel path; browser preview rides on M6) are DONE. M3's code is DONE on 2026-11-20 (two days of work), its gate is not.**
+the 5 Hz display renderer live on the fitted 0x3C panel, serial bench commands (`s p r a d c t b w g
+v o`, plus M6's `k n j` — **not flashed yet, see below**).
+**M0, M1 and M7 (engine + fitted-panel path) are DONE; M3's code is DONE (2026-11-20), its gate is
+not; M6 is WRITTEN and native-pinned but UNCOMMITTED and its ESP32 image DOES NOT LINK (DRAM region
+over by 57,376 B — §7's first section is the recovery plan, and the board still runs the M7 image).**
 Written and flashed: the BMP085/BMP180 fallback driver (`BaroBosch.h` + `src/sensors/Bmp085.h` +
 `checkBaro()` — decision 37: the compensation is a transcription of the deployed Adafruit library,
 wrong in four places until that cross-check caught it) — **proven on the part** (driver 977.75/977.78
@@ -522,6 +533,14 @@ as `a`/`d`), at I2C0, after the fix:
   19), the INA219, the solenoid, all buttons, buzzer, motor, watchdog.
   Cell inputs floating, DRDY
   lines not connected (open item 14).
+- **Flashed image vs working tree (2026-11-21): the board runs the M7 image** (commit `662dbc3`);
+  **M6's work is uncommitted in the working tree and does not link** (`git status`: modified
+  `src/main.cpp`, `platformio.ini`, `BootReport.h`, `FaultCode.h`, `Voting.*`, `test_boot`,
+  `test_voting`; new `lib/core/src/ConfigSchema.*`, `StateJson.h`, `DiveSchema.h`,
+  `src/config/RuntimeConfig.*`, `src/dive/`, `src/web/`, `test/test_config/`, `test/test_webjson/`,
+  plus `data/` still to write — it holds only an empty `display/templates/` tree, no `index.html`,
+  `app.js` or `style.css`). Expect `dram0_0_seg` overflow on `pio run -e esp32` until §7's cut
+  list is applied — that is a real defect to fix, not a configuration to work around.
 - Firmware flashed = current `src/` at HEAD of this session, **including all of M3's code, the
   decision-39 three-tier baro path, and the whole M7 display stack**
   (BaroBosch/Bmp085, Depth/SurfaceLearner, BaroMs5837/Ms5837/checkMs5837, BaroLps28/Lps28dfw/
@@ -655,6 +674,132 @@ SIM tick cost: worst 41492us at t=1081s (plan search saturating its step budget 
 
 ## 7. Resume point — the next steps, in order
 
+### M6 (web + config store + dive log) — WHERE IT STANDS, READ THIS FIRST
+
+**Status: written, native-green, NOT committed, and the ESP32 image does not link.** `pio test -e
+native` = **173 cases green across 15 suites** (measured 2026-11-21). `pio run -e esp32` = **FAILED:
+`region 'dram0_0_seg' overflowed by 57376 bytes`**. The board still runs the M7 image; nothing of M6
+has been flashed. Do not start M5 or M8 on top of a non-linking image.
+
+**The DRAM budget, measured from the link map** (`platformio.ini` now emits
+`-Wl,-Map=.pio/build/esp32/firmware.map`, kept on purpose):
+
+| Figure | Value |
+|---|---|
+| `dram0_0_seg` origin / length | 0x3ffbdb5c, 0x1e6a4 = **124,580 B** |
+| `.dram0.data` + `.dram0.bss` (map lines 116773 / 117861) | 0x7b39 (31,545) + 0x24b80 (150,400) |
+| per-object sum over those two sections | **181,560 B** → overflow 57,376 (ld's figure) |
+| **project** statics (our `src/` + `lib/core` + `lib/sim`) | **128,864 B** |
+| framework/IDF statics (WiFi, lwIP, FreeRTOS, Arduino core — precompiled `.a`, not ours to cut) | 52,696 B |
+| by file | `main.cpp.o` 64,839 · `WebServer.cpp.o` 36,050 · `RuntimeConfig.cpp.o` 26,407 · `DiveLog.cpp.o` 1,568 |
+
+Honest caveat about that arithmetic: an earlier parse of the same map reported "library DRAM 11,255 B"
+— a **parse artifact**, not a fact (it matched only one of ld's two line forms, and when a section
+overflows some contribution lines carry no address). A wrong total here would send the next session
+cutting the wrong 40 KB. The table above is the corrected parse of the two `.dram0` sections; after
+any code change, re-derive it from the map instead of trusting these numbers.
+
+**Biggest individual statics (from the map) and the cut that pays for each:**
+
+| Static | B | Cut |
+|---|---|---|
+| `simRunner()` static instance | 28,020 | `SIM_HIST_CAPACITY` on Arduino: 96 → 32–48 Snapshots (280 B each), verify stride re-derived so the 5 fixed assertions still see the whole profile → **~13–18 KB** |
+| `g_tmpl` (the ONE Template scratch, decision 40) | 18,442 | only by deliberately re-facing page/line/segment capacities and updating `test_display`'s pinned `sizeof` → **up to ~6 KB**, only if needed |
+| `cfgstore` `g_doc` (`cfg::JsonDoc` node pool) | 8,968 | size the node pool to the real config document (count its nodes) → **~6 KB** |
+| five `kJsonCap` (3,072) config buffers | 15,360 | merge to two buffers (read → parse → verify reuses the same storage) and set `kJsonCap` from the **measured** config JSON length + margin (bench `k` prints byte counts) → **~9–12 KB** |
+| WebServer per-handler response statics (3,584 ×2, 3,072, 2,200, 1,160, 1,024 ×3, 900, 640, 320) | ~21,700 | **one shared response scratch** (~3,584): every HTTP callback runs on the single `async_tcp` task, serialized — the same argument that already justifies the one `g_body` accumulator → **~18 KB**, the single biggest win |
+| `g_prevJson` 2,560 (main.cpp) + `g_prevJson` 2,560 (WebServer) | 5,120 | build the preview hex **directly into the web-side buffer** — safe because `previewAwait()` blocks until `previewDone()`, so the two tasks never touch it at once → **~2.5 KB** |
+| `g_verify` (`sim::VerifyReport`) | 4,428 | `AssertionResult::message` 160 → 96 B → **~1.7 KB** |
+| `g_body` | 4,096 | 2,048 if the measured config JSON fits with margin → **~2 KB** |
+| `g_wsJson` 2,048, `g_simVerify` 1,400, `g_dispBuf` 1,024, `g_faults` 1,280, `g_jobText`/`g_activeTmplText` 1,152 ×2, `g_display` 2,172 | — | keep: payload, fault table, panel frame |
+
+The identified cuts total **~59 KB against a 57.4 KB overflow** — it fits, but with little room, and
+M5/M8 add more (DiveTask stack, solenoid buffers, §10's 30-min 1 Hz live-graph ring). Apply the cuts
+biggest first and **re-measure the map after each one** (never estimate). If it still does not fit,
+the next levers are the `Template` capacities and shrinking `Snapshot` itself — state the new
+footprint numbers; several of these sizes are pinned by tests precisely so a capacity change is a
+deliberate act.
+
+**Already written and native-pinned (do not rewrite it):**
+- `lib/core/src/ConfigSchema.{h,cpp}` — the config struct (**`sizeof(RuntimeConfig) == 384`, pinned
+  by `test/test_config/`**), its hand-rolled JSON codec (no ArduinoJson on the config path), the
+  server-side range table with per-field errors, and the migration model (absent fields take
+  defaults; a `schema` newer than this build is refused). `kSchemaVersion = 1`, `kGasCount = 9`.
+- `lib/core/src/StateJson.h` — LiveState → JSON **through `disp::FieldRegistry`** (§12's single
+  source of truth: one registry row = one JSON key, same table feeds `/api/fields`), `sim_flag`
+  always present (risk 11), and the checked writer `web::detail::Jw` — every append is
+  bounds-checked, so an oversized payload is a hard failure, never a truncated document that looks
+  complete. `kStateJsonCap` 2048, `kFieldsJsonCap` 3072.
+- `lib/core/src/DiveSchema.h` — the §10 23-column `Sample`, the `Header`, `csvHeader()` (writer and
+  test share one string) and the header JSON. `test/test_webjson/` (13 cases) pins BootReport JSON,
+  state/fields JSON and the CSV row.
+- `lib/core/src/BootReport.h` — `toJson()`; closed history entries report `"active":false`.
+- `src/config/RuntimeConfig.{h,cpp}` — the store layer: trust rules between the two mirrors,
+  **tmp+rename plus read-back verify on both**, the NVS mirror, the config-edit queue applied by
+  loopTask, `factoryWipe`, the RAM-only wall clock (`wallNowS()` returns 0 = never set) and
+  **`storeInspect()` for bench `k`** (per-store absent / valid / UNTRUSTED / DOWN — "absent" and
+  "could not look" are different facts).
+- `src/dive/DiveLog.{h,cpp}` — 5-dive ring + index + CSV writer, header written at dive start AND
+  end, DELETE refused while a dive is open, all writes on loopTask.
+- `src/web/WebServer.{h,cpp}` — the full §9 route set; SoftAP (`DiveCCR-%02X%02X` from MAC[4..5],
+  WPA2 `dive-ccr-wifi`) + mDNS `diveccr.local`; the 1-deep `xQueueOverwrite` snapshot queue and the
+  ~2 Hz WS push (`snapshotPublish()`); `serveStatic("/", LittleFS, "/")` with an `onNotFound` that
+  tells the operator to `pio run -t uploadfs` rather than serving a blank page; and **no `/api/arm`
+  route at all** (§13 — the web cannot arm the unit). `/api/solenoid/test` answers **501 with the
+  reason** (M5 not built, valve not purchased) instead of pretending a GPIO toggle is a valve test.
+- `src/main.cpp` — the M6 integration: boot order (safe pins → **LittleFS** → config → buses →
+  identity probes → learnSurface → dive ring → active template → config queue → **web last**, so no
+  route answers before the state it reports exists); the air-cal service against real walker
+  readings; template save with the §12 SAFETY validator + the fit gate against the fitted panel;
+  preview (renders into the panel framebuffer, **never `present()`**); the SIM web run in bounded
+  slices (one SIM-stamped frame per tick shared by panel and WS); `webJobsService()`; and new bench
+  commands **`k`** (config stores + live settings), **`n`** (AP/web status), **`j`** (the fixed SIM
+  profile written into the dive ring, `source=SIM` in the header and every row — §10's real
+  auto-start cannot fire until M2 produces a real ppO2). Bench letters now in use:
+  `s p r a d c t b w g v o k n j`.
+- **LittleFS mount finding (a trap that would have looked like a dead filesystem):**
+  `LittleFS.begin()`'s default 4th argument is the literal partition label **`"spiffs"`**
+  (`libraries/LittleFS/src/LittleFS.h`, read at source), while this project's data partition is
+  named **`fs`** (`partitions.csv`) — the default asks esp_littlefs for a partition that does not
+  exist, so the mount fails on a board with a perfectly good filesystem. Now
+  `LittleFS.begin(false, "/littlefs", 10, "fs")`, where `false` = never format on a mount failure (a
+  silent format would erase the dive ring and both config copies).
+- **§4's core split is stated, not claimed:** there is no dive task yet, loopTask is the dive path,
+  and AsyncTCP's `async_tcp` task is created unpinned (`CONFIG_ASYNC_TCP_RUNNING_CORE` default −1,
+  read from the installed `AsyncTCP.h`), so today the JSON build and the WS enqueue happen on
+  loopTask. The queue keeps the isolation that matters — no shared mutable dive state — and the
+  pinning claim belongs to the milestone that creates the task (M5/M8).
+- **Labels:** `modeLabel()` (main.cpp) maps `BreathingState` to strings that fit the 12-byte `mode`
+  fields (`CCR`, `FLUSH-DIL`, `FLUSH-O2`, `BAILOUT`, `OC`); `gas::breathingStateName()`'s
+  `"DILUENT_FLUSH"` is 13 characters and would be silently clipped in the CSV and on the panel.
+
+**Next steps, in order:**
+1. **Free the DRAM** with the cut table above, biggest first (WebServer shared response scratch →
+   SimRunner history capacity → RuntimeConfig buffers + `g_doc` node pool → preview single buffer →
+   `g_verify` message width → `g_body`), re-measuring `.pio/build/esp32/firmware.map` after each
+   change until `pio run -e esp32` links. Keep `pio test -e native` at 173 green throughout.
+2. **Write the web assets** `data/index.html`, `data/app.js`, `data/style.css` — §9's tabs (Live,
+   Gases, Deco, Calibration, Dive log, Simulator, Display, System), a ~120-line hand-drawn canvas
+   plotter, the WS client, **no CDN** (the phone has no internet at the water) — then
+   `pio run -t uploadfs`.
+3. **Flash + capture** (`/dev/cu.usbserial-0001` @115200; opening the port resets the board). Expect
+   the M7 baseline unchanged (`BARO_RANGE_CLAMP`, `BARO_BENCH_ONLY`, **`[arm] REFUSED`** — intended)
+   plus new `[fs] LittleFS mounted on partition 'fs' …`, `[cfg] …`, `[web] AP DiveCCR-xxxx …` lines,
+   then bench `n`, `k`, `j`, `p`, and re-confirm `[arm] REFUSED` still stands.
+4. **Verify HTTP/WS from the AP side — and leave the operator's network alone.** The user has said so
+   explicitly. This firmware runs a SoftAP and never joins a network; acceptance is bench `n` plus
+   curl/WS against `http://diveccr.local` from a machine already on the AP. If a browser check is
+   genuinely needed, **ask the user to join the AP manually** — do not change the Mac's Wi-Fi.
+5. **Commit + push**, then update AGENTS.md §16's M6 row and this file with the measured evidence
+   (link sizes, the map-derived DRAM budget, the boot/`k`/`n`/`j` captures, the curl results).
+   M6's gate — "phone on SoftAP, all tabs, offline graphs render" — closes only at step 4.
+6. Then M5 (valve purchase, open item 1; the pulse scheduler must carve explicit conversion-free
+   slots per decision 34) and M8. **Separately, still owed: cross-validating the M4 deco engine
+   against a trusted computer at the specific profile being claimed (risk 13) — it is
+   regression-anchored, not validated, and it is life-support math.**
+
+### M0, M1, M7 and M3's code — done (context for the above)
+
 M0, M1 and **M7 (engine + fitted-panel path — decision 40, 2026-11-20: template parse/validate/
 fit/render + FieldRegistry + Framebuf/Font6x8/LiveState in `lib/core`, 17 native cases; thingpulse
 transport; bench `o` gate captured on-target: bundles OK, validator rejection, §12 fit report,
@@ -751,7 +896,14 @@ update it when hardware changes what it teaches.
 | `lib/core/src/Template.h` | the §12 layout engine: parse → **validate** (SAFETY fields required on every page, never inside `@if`; fmt sanitizer rejects user-typed `%`) → layout/fit (priority drop order, §12 fit report pinned verbatim) → render (last-good-frame semantics, truncation counted). Capacities fixed, no allocation in the render path. `sizeof` pinned by `test/test_display/` — footprint rule of decision 40: KB-scale structs are static/boot-time, never task-stack locals |
 | `lib/core/src/Fields.h` `Framebuf.h` `Font6x8.h` `LiveState.h` `DisplayDriver.h` `SimDisplay.h` `TemplateBundles.h` | FieldRegistry (name/type/unit/priority/getter — the §12 single source of truth), the page-major 128x64 buffer with clip/gauge/shift, the 6x8 font (glyph anchors pinned; source: fetched Adafruit GFX glcdfont.c), the display snapshot struct, the driver **interface** (lib/core on purpose — §14 updated), the text/JSON preview renderer (the browser preview's engine, HTTP wrapper awaits M6), and the bundled templates + gate demos (`fitdemo_9on8`, `invalid_missing_safety`) |
 | `src/ui/Ssd1306I2C.h` | the only panel-touching display code: subclasses thingpulse `SSD1306Wire` (sda/scl=-1 — we own `Wire.begin(21,22)`, decision 26; 400 kHz bus-wide, stated), `present()` = guarded memcpy into the library buffer + `display()` (geometry and nullptr guards, byte-layout provenance from OLEDDisplay.cpp); `pixelShift` = native-tested software wrap. If the panel turns out SH1106-class, `SH1106Wire` in the same library is the drop-in |
-| `lib/core/src/FaultCode.h` | the fault enum plus `defaultSeverity`/`blocksArming`/`faultName`. `ADC_PART_WRONG`/`ADC_CONV_BAD` block arming; `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` deliberately do not; `BARO_CONV_BAD` (26) is ERROR and blocks, `BARO_RANGE` (13) deliberately does not (§13 fallback rule) — its `faultName` is `BARO_RANGE_CLAMP` since decision 38 (was `BARO_RANGE_9M`; the enum value never changed, so old logs with the old name read as this same code); **`BARO_BENCH_ONLY` (27, decision 39) is ERROR and blocks** — the BMP085/180 as sole depth source refuses an arm |
+| `lib/core/src/FaultCode.h` | the fault enum plus `defaultSeverity`/`blocksArming`/`faultName`. `ADC_PART_WRONG`/`ADC_CONV_BAD` block arming; `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` deliberately do not; `BARO_CONV_BAD` (26) is ERROR and blocks, `BARO_RANGE` (13) deliberately does not (§13 fallback rule) — its `faultName` is `BARO_RANGE_CLAMP` since decision 38 (was `BARO_RANGE_9M`; the enum value never changed, so old logs with the old name read as this same code); **`BARO_BENCH_ONLY` (27, decision 39) is ERROR and blocks** — the BMP085/180 as sole depth source refuses an arm; `DISPLAY_RENDER_SLOW` (28) is WARN — a screen failure never mutes alarms; **`CONFIG_WRITE_FAILED` (29, M6) is ERROR and blocks**: a setting that is not read back is a setting that is not there |
+| `lib/core/src/ConfigSchema.{h,cpp}` | **M6 config: `cfg::RuntimeConfig` (sizeof 384, pinned), `kSchemaVersion 1`, the range table + `ConfigErrors` per-field reporting, the JSON codec (hand-rolled; ArduinoJson is not on the config path) and the migration model** — absent fields take defaults, a newer `schema` is refused outright. Pure C++, pinned by `test/test_config/`; §17's rule that every threshold lives in RuntimeConfig, not in engine magic numbers, is enforced here |
+| `lib/core/src/StateJson.h` + `lib/core/src/DiveSchema.h` | **M6 serialization faces, both built on the §12 registry rather than a hand-written field list** (a hand-written list is a second copy of every field — the divergence risk 17 describes). `web::detail::Jw` is the checked writer: every append is bounds-checked and a failed document reports itself instead of truncating. `DiveSchema` holds the §10 23-column `Sample`, `Header` and `csvHeader()` shared by writer and test. Pinned by `test/test_webjson/` (13 cases) |
+| `src/config/RuntimeConfig.{h,cpp}` | **the config store layer (§9): LittleFS tmp+rename + NVS mirror, both read back before any reply claims success; store trust rules and the fault codes `CONFIG_CORRUPT`/`CONFIG_WRITE_FAILED`; the edit queue applied by loopTask; `factoryWipe`; RAM-only wall clock (`wallNowS()` 0 = never set); `storeInspect()` behind bench `k`.** Its buffers are DRAM-budget-critical — see §7's cut table before adding another |
+| `src/dive/DiveLog.{h,cpp}` | §10's 5-dive ring (`/dives/NNN.json` + `.csv` + text index), header written at start **and** end, 60 s samples, oldest evicted, DELETE refused while a dive is open; all writes on loopTask, web reads only (esp_littlefs serializes each operation — read at source, provenance in the header) |
+| `src/web/WebServer.{h,cpp}` | **M6 routes + SoftAP + mDNS + the snapshot queue and 2 Hz WS ticker; the header states the threading contract as measured** (async_tcp unpinned, core −1, so §4's core split is NOT claimed until DiveTask exists), the no-`/api/arm` rule, the 501-with-reason for the solenoid test, and the shared per-task scratch discipline that the DRAM budget depends on |
+| `test/test_config/` `test/test_webjson/` | config parse/validate/migration (incl. `sizeof(RuntimeConfig) == 384`), and the JSON/CSV faces: boot report, live state, `/api/fields`, the 23-column dive row. Both are native-only — the web handlers themselves are bench/curl-tested |
+| `.pio/build/esp32/firmware.map` | **the DRAM budget, measured not estimated.** Emitted by `build_flags` in `platformio.ini`. `dram0_0_seg` is 124,580 B and the radio stack's precompiled statics are not ours to cut, so every project KB-scale static is a budget decision — §7's table lists them and the cut that pays for each. When the region overflowed by 57 KB, arithmetic on the source would have guessed wrong; the map did not |
 | `lib/core/src/BootReport.h` | `blocksArming()` refuses on **any active FATAL**, not only on listed codes |
 | `lib/core/src/PinMap.h` | **the GPIO capability table (one word per pad, 0..39) and the role assignment.** Pure C++, asserted natively — it was a paragraph in a header before and was wrong twice. Carries `noSuchPad` (24, 28–31: no such pad on the ESP32-D0WD-V3 die) and `kDieOnly` (20, 37, 38: die pads WROOM-32 does not bond out) as separate claims, `unusableReason()`, and `SPARE_OUT = 17` |
 | `src/config/Pins.h` | **an alias of `PinMap.h`, not a second copy of the numbers.** `BTN_PAGE = 33`, `VIBRATOR_OUT = 16` (moved off 33, decision 32), `SPARE_OUT = 17`. Drivers must still check `>= 0` before `pinMode`: a role may be unassigned on purpose |
@@ -766,7 +918,7 @@ update it when hardware changes what it teaches.
 | `test/test_sim/test_sim.cpp` | hand-computed loop physics: depth-independent sag + 276 s floor, closed-loop hold asserted in pulse quanta, click taxonomy, cell faults through the real voter, flush agreement from the other side, source stamping, bit-identical repeats, ring/NO-DATA harness honesty |
 | `test/test_adc/test_adc.cpp` | config-field masks tile 0xFFFF once; `0x8583` decodes as the DS default; design config = gain 16 + 32 SPS + explicit single-shot; LSB tables; air-signal code counts; the measured non-datasheet rate table |
 | `test/test_baro/test_baro.cpp` | DS command/timing table; the cal-ROM rule as the **datasheet's 0/0xFFFF check, not a value check** (bench AC1=0x219C passes; every Table-5 position poisoned at its own index); the `assembleUp` oss truncation chain (34321/68643/137286/274572); the "use datasheet numbers!" example reproduced exactly (B5=2400, 15.0 °C, 69964 Pa); a 64-point grid match against a second copy of the deployed reference; monotonicity + oss scale invariance; out-of-range flagged; corrupt ROM refused before arithmetic |
-| `test/test_boot/test_boot.cpp` | fault severities; absent solenoid is INFO and must **not** block arming; the whole-enum table walk (gap list `{28,29}`, walked count 45 — keep it current when adding codes); unlisted FATAL still blocks; `BARO_RANGE_CLAMP` name + computed-clamp detail asserted; **decision 39: `BARO_BENCH_ONLY` blocks arming while the range banner does not — the two baro ERRORs gate-tested apart** |
+| `test/test_boot/test_boot.cpp` | fault severities; absent solenoid is INFO and must **not** block arming; the whole-enum table walk (**gap list `{1,9},{32,39},{45,49},{55,59},{69,79}`, walked count 47** — `BARO_BENCH_ONLY` took 27, `DISPLAY_RENDER_SLOW` took 28 and `CONFIG_WRITE_FAILED` took 29, so the gap list is now shorter; keep it current when adding codes); unlisted FATAL still blocks; `BARO_RANGE_CLAMP` name + computed-clamp detail asserted; **decision 39: `BARO_BENCH_ONLY` blocks arming while the range banner does not — the two baro ERRORs gate-tested apart** |
 | `test/test_depth/test_depth.cpp` | the water-hydrostatics anchors (1 mbar ≈ 1.02 cm; salt 9.9484 / fresh 10.1972 m/bar) and **the decision-38 conclusion itself** (BMP180 gauge range < 1 m at sea level, ~1.2 m at the bench Psurf); `SurfaceLearner` lock at σ ≤ 2 mbar, refusal on a drifting series, no half-learned state |
 | `test/test_ms5837/test_ms5837.cpp` | CRC-4 against a verbatim copy of the DS C6 published example; C1-band classification; compensation against a verbatim BlueRobotics `br_pressure` copy (pins truncation semantics — code 1982/2381323465/1145816756 vs the DS's floor columns, ≤1 LSB); W0/W7 field extraction |
 | `test/test_lps28/test_lps28.cpp` | decision 39 tier-2: vendor sensitivity anchors both FS modes (0x3E8000/0x1F4000 at 1000 hPa, both FS ends), left-aligned assembly vs a second vendor-shape copy across a grid, mode-scaling non-interchangeability (the silent 2x error the latch gate prevents), negative two's-complement branch, temp LSB/100 both signs, WHO_AM_I 0xB4 + 0x5C/0x5D, CTRL_REG1/2 bit positions (FS_MODE=bit 6, not BOOT bit 7), range-window edges, and the **derived ~30.7 m tier-2 ceiling** asserted < the "40 m" marketing figure and >10x the BMP tier |
@@ -878,6 +1030,24 @@ update it when hardware changes what it teaches.
   `... SL1013mbar` pre-Psurf), so a wrong figure cannot survive by being copied.
 - Over-blocking is also a failure mode: a WARN that refuses a dive at the water trains a diver to
   override the gate. Say it out loud, log it, and only block on things that truly break trust.
+- **The operator's network is off-limits.** This firmware runs a SoftAP and never joins a network, so
+  it cannot and must not change anyone's Wi-Fi. Web acceptance is bench `n` plus curl/WS from a
+  machine already on the AP; if a real browser check is needed, **ask the user to join the AP
+  manually**. (Stated by the user on 2026-11-21; do not "just test it" from the Mac.)
+- **DRAM is a budget, and the link map is the only honest ledger.** `dram0_0_seg` on ESP32 classic is
+  124,580 B and the WiFi/lwIP statics inside it are precompiled in framework `.a` archives — the only
+  lever is our own statics (M6 measured: project 128,864 B against framework 52,696 B, over by
+  57,376). So: one shared scratch per serial path (decision 40), one shared response scratch for the
+  serialized HTTP callbacks, capacities that are pinned by tests so a change is deliberate, and
+  `-Wl,-Map=…` kept in `platformio.ini` so the next overflow is read from the map, not guessed from
+  the source. A parse of the map is itself a measurement — an earlier one undercounted library DRAM
+  by matching only one of ld's two line forms.
+- **Read a library's default arguments at source before trusting them** (same class as decision 36,
+  one level up): `LittleFS.begin()`'s default partition label is the literal `"spiffs"`
+  (`libraries/LittleFS/src/LittleFS.h`) while `partitions.csv` names this board's data partition `fs`,
+  so the default call fails the mount on a board with a healthy filesystem and would have been
+  written up as dead flash. Pass the label; keep `formatOnFail = false` (a silent format would erase
+  the dive ring and both config copies).
 - Pure C++ goes in `lib/` (host-buildable); anything touching a pin, peripheral or socket goes in
   `src/` and is not compiled natively.
 - **Record what happened at the bench alongside what the board reported.** A fault code cannot tell

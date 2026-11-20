@@ -60,3 +60,9 @@ bool diluentFlushAgrees(const VoteOutcome& v, float expectedPpO2, float tolBar,
 
 // Stability gate for calibration: sigma of the mV samples over the sampling window.
 float mvSigma(const float* samples, int n, float* meanOut);
+
+// Median of the same window (§6: "60 s countdown sampling median mV per cell"). Sorts the
+// CALLER's array in place — the sampling window is scratch by contract, and a local copy
+// would be a KB of stack in a path that also owns the display scratch (decision 40 rule 1).
+// n <= 0 returns 0, which is a legal cell reading: callers gate on n themselves.
+float mvMedian(float* samples, int n);
