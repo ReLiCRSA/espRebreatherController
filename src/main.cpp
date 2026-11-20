@@ -26,6 +26,12 @@
 #include "config/Pins.h"
 #include "sensors/Ads1115Bus.h"
 #include "sensors/BusProbe.h"
+#include "sensors/Bmp085.h"
+
+// Bench path only ('b'): the field-deployed Adafruit implementation of the same Bosch API, used
+// as a second compensation implementation cross-checking lib/core/src/BaroBosch.h on the same
+// physical module. Never in the dive path — decision 27's rule, applied to the baro.
+#include <Adafruit_BMP085.h>
 
 // lib/core is a library directory, so these resolve from lib/core/src.
 #include "BootReport.h"
@@ -73,6 +79,12 @@ sensors::Ads1115 g_ads1(Wire1, 0x48, pins::ADS_U1_DRDY);
 sensors::Ads1115 g_ads2(Wire1, 0x49, pins::ADS_U2_DRDY);
 sensors::Ads1115* g_adcs[] = {&g_ads1, &g_ads2};
 constexpr size_t kAdcCount = sizeof(g_adcs) / sizeof(g_adcs[0]);
+
+// The fallback baro gets a real driver object too, for the same reason (checkBaro below): the
+// presence table answers "is 0x77 answered", not "does the part there measure pressure". The
+// MS5837 driver waits for the part — its side of the address table stays datasheet-derived
+// until one is fitted and its PROM read confirms identity (risk 21).
+sensors::Bmp085 g_bmp085(Wire, 0x77, /*oss=*/2);
 
 // The alternating-mux pair walkers (AGENTS.md 2): U1 walks cell 1 (AIN0/1) -> cell 2 (AIN2/3),
 // U2 walks cell 3 (AIN0/1) -> coil shunt (AIN2/3). The coil slot reads a floating input until
@@ -246,6 +258,55 @@ void checkAdcs() {
     }
 }
 
+// Presence is not identity, and this applies at the depth sensor as hard as at the ADCs (risk 21).
+// The boot probe says 0x77 is answered; this says whether the part there reads a usable cal ROM
+// (the DS's own 0/0xFFFF rule), converts, and lands inside its own 300-1100 hPa range. It writes
+// ctrl_meas, so it runs at boot and on a presence transition — not on every 5 s re-probe. The
+// first real conversion of the bench BMP180 is what closes AGENTS.md 20 item 17's second half:
+// register reads were necessary, not sufficient.
+void checkBaro() {
+    bool bmp085 = false;
+    for (const DevSpec& d : g_devices)
+        if (d.code == FaultCode::BARO && d.addr == 0x77 && d.present && busUp(&Wire)) bmp085 = true;
+    if (!bmp085) {  // BARO covers absence; nothing for this check to say
+        g_faults.clear(FaultCode::BARO_CONV_BAD, millis());
+        return;
+    }
+
+    char detail[40];
+    if (!g_bmp085.init()) {
+        if (g_bmp085.lastStatus() == sensors::Bmp085::Status::CAL_ROM_BAD) {
+            snprintf(detail, sizeof(detail), "0x%02X cal word %d bad", 0x77,
+                     g_bmp085.calRomBadIndex());
+            g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
+            Serial.printf("  BARO @0x77 ** cal ROM fails the DS 0/0xFFFF rule (word %d) **\n",
+                          g_bmp085.calRomBadIndex());
+        } else {
+            g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), "0x77 no CHIPID");
+            Serial.println(F("  BARO @0x77 ** D0 != 0x55 — not reading as BMP085/180 **"));
+        }
+        return;
+    }
+
+    float ambBar = 0.0f, tempC = 0.0f;
+    if (!g_bmp085.read(&ambBar, &tempC)) {
+        const char* why = g_bmp085.lastStatus() == sensors::Bmp085::Status::OUT_OF_RANGE
+                              ? "outside 300-1100 hPa"
+                              : "no conversion";
+        snprintf(detail, sizeof(detail), "0x77 %s", why);
+        g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
+        Serial.printf("  BARO @0x77 ** %s — raw UT=%u UP=%lu **\n", why, g_bmp085.lastUt(),
+                      static_cast<unsigned long>(g_bmp085.lastUp()));
+        return;
+    }
+    g_faults.clear(FaultCode::BARO_CONV_BAD, millis());
+    // A real pressure at the bench is the whole point: identity by register read is necessary,
+    // not sufficient (item 17 closure). ~1 atm expected indoors; 'b' shows it moving when squeezed.
+    Serial.printf("  BARO @0x77 BMP180: %.2f mbar  %.1f C  (UT=%u UP=%lu B5=%ld oss=2) — fallback, 9 m clamp\n",
+                  ambBar * 1000.0f, tempC, g_bmp085.lastUt(),
+                  static_cast<unsigned long>(g_bmp085.lastUp()), (long)g_bmp085.lastB5());
+}
+
 void adcSelfTests() {
     Serial.println(F("[ads] converter self-test (reads ID/registers, write-verifies lo_thresh and "
                      "restores it, times one 32 SPS conversion):"));
@@ -339,6 +400,47 @@ void baroIdentity() {
                 Serial.println(F("    note: 0x77 is the datasheet 7-bit address for this family "
                                  "(bits 1110111 + R/W). CHIPID 0x55 claims a BMP085/180 register "
                                  "map; conversion correctness is still proved by a real reading."));
+
+            // Identity by register read is necessary, not sufficient (item 17). Run the real
+            // firmware driver, then the field-deployed Adafruit implementation of the same Bosch
+            // API, on the same module: two compensation implementations agreeing on the same raw
+            // silicon is the bench-grade cross-check for the transcription in BaroBosch.h.
+            // This writes ctrl_meas, so it is bench path, same class as 'a'/'d'.
+            if (d0 == 0x55 && a == 0x77) {
+                if (b.wire != &Wire) {
+                    Serial.println(F("    driver check skipped: module answers but the design fits "
+                                     "the baro on I2C0 (Wire) — check the wiring"));
+                } else {
+                    if (!g_bmp085.init()) {
+                        Serial.printf("    driver: init FAILED (status %d, cal word %d) — no trustworthy "
+                                      "ROM, no number\n",
+                                      (int)g_bmp085.lastStatus(), g_bmp085.calRomBadIndex());
+                    } else {
+                        float a1 = 0, a2 = 0, t1 = 0, t2 = 0;
+                        if (g_bmp085.read(&a1, &t1) && g_bmp085.read(&a2, &t2)) {
+                            Serial.printf("    driver (oss=2): %.2f mbar -> %.2f mbar  %.1f C   "
+                                          "UT=%u UP=%lu B5=%ld\n",
+                                          a1 * 1000.0f, a2 * 1000.0f, t1, g_bmp085.lastUt(),
+                                          static_cast<unsigned long>(g_bmp085.lastUp()),
+                                          static_cast<long>(g_bmp085.lastB5()));
+                            Serial.println(F("    squeeze the module and re-run 'b': the mbar MUST move"));
+                        } else {
+                            Serial.printf("    driver read FAILED status %d (UT=%u UP=%lu)\n",
+                                          (int)g_bmp085.lastStatus(), g_bmp085.lastUt(),
+                                          static_cast<unsigned long>(g_bmp085.lastUp()));
+                        }
+                        Adafruit_BMP085 ref;
+                        if (ref.begin(BMP085_HIGHRES, b.wire)) {
+                            const float rp = ref.readPressure();  // Pa
+                            const float rt = ref.readTemperature();
+                            Serial.printf("    Adafruit lib (oss=2): %.2f mbar  %.1f C\n",
+                                          rp / 100.0f, rt);
+                        } else {
+                            Serial.println(F("    Adafruit lib begin() failed — cross-check skipped"));
+                        }
+                    }
+                }
+            }
         }
     }
     if (!any) Serial.println(F("  no baro-class address (0x76/0x77) ACKed on any live bus"));
@@ -691,8 +793,9 @@ void handleCommand(char c) {
             for (sensors::AdcPairWalker* w : g_walkers) w->report(Serial, millis());
             break;
         case 'b':
-            Serial.println(F("[baro] identity by CHIPID reads (writes the Bosch pointer register — "
-                             "bench only, same class as 'a'/'d'):"));
+            Serial.println(F("[baro] identity: CHIPID/cal-ROM reads plus a REAL conversion through "
+                             "the dive driver and the Adafruit library (writes ctrl_meas — bench "
+                             "only, same class as 'a'/'d'):"));
             baroIdentity();
             break;
         case 'g':
@@ -706,7 +809,7 @@ void handleCommand(char c) {
             Serial.println(F("bench commands: s=full bus scan  p=probe table + report  "
                              "r=raw probe codes (destructive, bench only)  c=bus recovery  "
                              "a=ADC self-test  d=ADC rate characterisation  t=pair-walker rate + "
-                             "interlock window  b=baro identity (Bosch CHIPID)  g=pad map + pad test  "
+                             "interlock window  b=baro identity + live mbar/C reading  g=pad map + pad test  "
                              "v=headless sim profile (SIM-stamped, touches no hardware)"));
             break;
     }
@@ -758,6 +861,7 @@ void setup() {
     probeDevices();
     knownScan();
     checkAdcs();
+    checkBaro();
     printBootReport();
 
     // Start the pair walkers only after checkAdcs() has timed a real conversion on each present
@@ -785,6 +889,7 @@ void loop() {
             if (!b.up && initBus(b)) Serial.printf("INFO: %s ONLINE\n", b.label);
         }
         bool adcChanged = false;
+        bool baroChanged = false;
         for (DevSpec& d : g_devices) {
             if (!busUp(d.bus)) continue;
             const bool was = d.present;
@@ -793,9 +898,11 @@ void loop() {
                 Serial.printf("INFO: %s ONLINE @0x%02X\n", d.label, d.addr);
                 g_faults.clear(d.code, millis());
                 if (d.bus == &Wire1) adcChanged = true;
+                if (d.code == FaultCode::BARO) baroChanged = true;
             } else if (!d.present && was) {
                 Serial.printf("ERROR: %s OFFLINE\n", d.label);
                 if (d.bus == &Wire1) adcChanged = true;
+                if (d.code == FaultCode::BARO) baroChanged = true;
             }
         }
         probeDevices();
@@ -807,6 +914,8 @@ void loop() {
             // achieved-rate counters restart with it, so 't' never mixes two parts' history.
             for (sensors::AdcPairWalker* w : g_walkers) w->begin();
         }
+        // Same rule one bus over: an ACK at 0x77 does not say the part measures pressure.
+        if (baroChanged) checkBaro();
     }
 
     // External watchdog heartbeat: HIGH 20 ms, LOW 30 ms, same shape as before. The delays are

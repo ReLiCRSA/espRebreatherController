@@ -44,6 +44,14 @@ enum class FaultCode : uint16_t {
     // for the bench to resolve, not something to refuse a dive at the water for.
     ADC_RATE_MISMATCH = 25,
 
+    // The barometer ACKs but cannot produce a trustworthy pressure: bad cal ROM (the DS's own
+    // 0/0xFFFF rule), a conversion that never completes, or a result outside the part's
+    // 300-1100 hPa range. Presence was never identity (risk 21) — the first real conversion on
+    // the bench BMP085 is what closes item 17's second half, and this code is what says out loud
+    // when it does not. Same logic as ADC_CONV_BAD one register over: a depth input that does not
+    // measure must refuse an arm, not silently report an extrapolation (risk 1).
+    BARO_CONV_BAD = 26,
+
     // Power
     VBAT_LOW = 30,
     RAIL_3V3_LOW = 31,
@@ -109,6 +117,9 @@ inline Severity defaultSeverity(FaultCode c) {
         // all: ppO2 cannot be trusted either way, and a presence probe alone would never say so.
         case FaultCode::ADC_PART_WRONG:
         case FaultCode::ADC_CONV_BAD:
+        // The baro equivalent: ACKs, but its cal ROM is corrupt, its conversion did not complete,
+        // or its result is outside the part's own range. Depth cannot be trusted either way.
+        case FaultCode::BARO_CONV_BAD:
         case FaultCode::OLED:
         case FaultCode::INA219:
         case FaultCode::LITTLEFS:
@@ -156,6 +167,7 @@ inline bool blocksArming(FaultCode c) {
         case FaultCode::ADC_PART_WRONG:
         case FaultCode::ADC_CONV_BAD:
         case FaultCode::BARO:
+        case FaultCode::BARO_CONV_BAD:   // a baro that ACKs but cannot measure is not a depth source
         case FaultCode::OLED:              // AGENTS.md 13: the in-water display is required to arm
         case FaultCode::I2C_BUS_STUCK:    // a bus that failed to init carries ppO2 and depth
         case FaultCode::EXTERNAL_WATCHDOG:
@@ -185,6 +197,7 @@ inline const char* faultName(FaultCode c) {
         case FaultCode::ADC_RATE_MISMATCH: return "ADC_RATE_MISMATCH";
         case FaultCode::BARO: return "BARO";
         case FaultCode::BARO_RANGE: return "BARO_RANGE_9M";
+        case FaultCode::BARO_CONV_BAD: return "BARO_CONV_BAD";
         case FaultCode::OLED: return "OLED";
         case FaultCode::INA219: return "INA219";
         case FaultCode::I2C_BUS_STUCK: return "I2C_BUS_STUCK";

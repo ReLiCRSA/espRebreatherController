@@ -140,6 +140,22 @@ the Adafruit product page and the Adafruit 4-Channel ADC Breakouts guide (2026-1
   same class as `a`/`d`). Caution kept: BMP280/BME280 also live at 7-bit 0x76/0x77 (CSB strap), so
   an ACK at 0x76 is not proof of an MS5837 until its PROM read says so — and only one baro fits
   on I2C0 without an address clash.
+- **Compensation (M3, 2026-11-20): `lib/core/src/BaroBosch.h`.** The register map, the DS's own
+  cal-ROM validity rule (no word 0/0xFFFF — the only check the DS states; AC1=8604 passing is
+  normal), the command/timing table and the pressure compensation live there as pure C++, pinned
+  by `test/test_baro/` — decision 28's pattern again. The compensation is a **faithful
+  transcription of the Bosch API as deployed in the Adafruit BMP085 library**, not datasheet text
+  (the DS formula appendix is page images with no text layer); the first transcription, written
+  partly from memory, was wrong in four places until a line-by-line cross-check against the
+  deployed library caught them, and the library's own "use datasheet numbers!" example (B5=2400,
+  15.0 °C, 69964 Pa) is what discriminates the corrected arithmetic from the wrong one —
+  decision 37. The remembered "AC1=7295, UT=27898, UP=23843" constants appear in no source and
+  are banned as anchors. Driver `src/sensors/Bmp085.h` + `checkBaro()` do CHIPID + cal-ROM + one
+  real conversion at boot and on presence transitions; a failure raises `BARO_CONV_BAD` (ERROR,
+  blocks arming — a baro that ACKs but cannot measure is not a depth source). **Built and
+  linking, not yet measured on the part**: the devkit is not enumerating on USB; the acceptance
+  run (bench `b` showing ~1013 mbar, moving when squeezed, agreeing with the Adafruit library)
+  is open.
 - Depth = `(Pamb - Psurf) * k`; `Psurf` is **learned at boot** (only relative accuracy matters,
   +/-2 mbar ~ 2 cm, not the +/-200 mbar absolute spec). Salinity configurable (fresh 1.000,
   salt 1.025). Learned Psurf also gates air calibration.
@@ -756,11 +772,18 @@ bench procedure.
 
 ## 16. Test strategy
 
-**Current state (2026-11-20): `pio test -e native` is green — 94 cases across seven suites
-(`test_voting`, `test_gas`, `test_zhl`, `test_boot`, `test_adc`, `test_pins`, `test_sim`);
-`pio run -e esp32` links **and is flashed and running on the devkit** with two ADS1115 modules,
-an SSD1306 and an Adafruit BMP085 actually attached (the converters measure as clones — risk 16,
-decision 31; the BMP085 measures as genuine — decision 36). The
+**Current state (2026-11-20): `pio test -e native` is green — 102 cases across eight suites
+(`test_voting`, `test_gas`, `test_zhl`, `test_boot`, `test_adc`, `test_pins`, `test_sim`,
+`test_baro`); `pio run -e esp32` links **and is flashed and running on the devkit** with two
+ADS1115 modules, an SSD1306 and an Adafruit BMP085 actually attached (the converters measure as
+clones — risk 16, decision 31; the BMP085 measures as genuine — decision 36). **Caveat on the
+Bosch baro path (M3, same day):** `Bmp085`/`BaroBosch`/`checkBaro()`/extended bench `b` are
+built and link, but **not yet flashed or captured** — the devkit stopped enumerating on USB
+(no `/dev/cu.usbserial-*` node; recorded as a fact, no defect inferred, §20 item 16's lesson).
+The acceptance test that closes item 17's second half — a real ~1013 mbar conversion on the
+fitted module, moving when squeezed, agreeing with the Adafruit library — is **still open** until
+the board comes back and `b` is captured. The claims below are from the previously flashed
+image.** The
 positive-ACK caveat that M0 left open is closed: `I2C1: 2 device(s) [0x48 0x49]`,
 `I2C0: 2 device(s) [0x77 0x3C]`, and the corresponding faults clear while the missing ones stay
 raised — including the designed fallback behaviour: with only the BMP085 answering,
@@ -776,7 +799,10 @@ calculations (risk 20). The alternating-mux pair walker runs in `loop()` and is 
 with zero I2C errors, zero conversion timeouts and the board responsive afterwards.**
 Layout note: PlatformIO only collects suites from `test/test_<name>/` folders (a bare `test/native/`
 group folder collects nothing), so the suites are `test/test_voting/`, `test/test_gas/`,
-`test/test_zhl/`, `test/test_boot/`, `test/test_adc/`, `test/test_pins/`, `test/test_sim/`. `test_build_src = no` in the
+`test/test_zhl/`, `test/test_boot/`, `test/test_adc/`, `test/test_pins/`, `test/test_sim/`,
+`test/test_baro/`. Suite convention: the entry point is a plain `int main()` — PlatformIO's native
+test glue links against it; a named `test_baro_suite()` entry produced an undefined-`_main` link
+error. `test_build_src = no` in the
 `native` env: `src/` is ESP32-only by design and is not built on the host. `lib/core` is built
 natively and linked into every suite.
 
@@ -799,6 +825,9 @@ exhaustion keeps the earliest faults, **the fault tables walked in full** (every
 a name and a non-INFO default severity, so a code added to the enum and forgotten in a `switch` fails
 immediately — it caught a real omission the day it was written), wrong-ADC-part and bad-conversion
 block arming while a bare unknown-ID warning must **not**, and an unlisted FATAL still blocks.
+`BARO_CONV_BAD` (a baro that ACKs but has a corrupt cal ROM, no conversion, or an out-of-range
+result) is ERROR and blocks arming — the depth analogue of `ADC_CONV_BAD`; the 9 m-range banner
+stays a non-blocking ERROR as §13 requires.
 `test_adc`: config-register field masks tile 0xFFFF exactly once and the rate field sits below PGA;
 the measured power-on word 0x8583 decodes as single-shot / PGA gain 2 / 8 SPS; the design config
 selects gain 16 + 32 SPS + explicit single-shot; the PGA gain/FSR/LSB tables (7.8125 uV at gain 16);
@@ -824,6 +853,17 @@ from the other side (fraction -> mV -> cal -> vote) including the stuck-cell cas
 fail; source stamping; bit-identical repeat runs; and the assertion harness itself — ring overwrite
 with `histDropped` accounting, strides, and `NO DATA`/`unevaluated` so an empty window can never
 "pass" an assertion.
+`test_baro`: the DS command/timing table (0x34/0x74/0xB4/0xF4, 4.5/7.5/13.5/25.5 ms, clamped oss);
+the cal-ROM rule is the **datasheet's 0/0xFFFF check, not a value check** — the bench module's
+measured AC1=0x219C passes, and each of the 11 Table-5 positions poisoned with 0 and with 0xFFFF
+is caught at its own index; `assembleUp` bit alignment per oss asserted as the **truncation chain**
+(34321 / 68643 / 137286 / 274572 from wire word 0x861180 — the resolution loss *is* oversampling);
+the deployed library's "use datasheet numbers!" example reproduced exactly (B5=2400, T=15.0 °C,
+p=69964 Pa — the discriminator that proved the corrected `mc << 11`; the wrong `<< 16` gave
+431.6 °C); a 64-point grid match against a second verbatim copy of the deployed reference
+arithmetic; monotonicity in the sane band plus **oss scale invariance** (the UP reporting 1013 mbar
+is 34321<<oss within truncation granularity); out-of-range results flagged, not hidden; and a
+corrupt cal ROM refused before any arithmetic (`converted=false`, no divide-by-zero).
 
 - `pio test -e native` covers `lib/core/` **and** `lib/sim/` — the same physics models run on the
   host with no hardware. (They live under `lib/`, not `src/core`, so they build natively; `src/` is
@@ -845,7 +885,7 @@ with `histDropped` accounting, strides, and `NO DATA`/`unevaluated` so an empty 
 | M0 | installer, build, flash, I2C scan, boot report | `pio run -t upload` works on this Mac | **DONE** — flashed and verified on the devkit (CP2102, ESP32-D0WD-V3): "Hash of data verified", clean boot banner, boot report correct on an empty bench, `[arm] REFUSED`. Section 15 holds the evidence. |
 | M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **DONE (2026-11-19).** Boot/bench and the simulator were verified earlier; the last open item, the **alternating-mux scheduler**, is now implemented and measured: `AdcPairWalker` in `src/sensors/Ads1115Bus` — non-blocking pair-step state machine, sized from the boot-measured conversion period (never the datasheet), polled OS bit at 10 ms cadence (DRDY still unwired, open item 14), I2C-error backoff, and a coil/ADC interlock window carried per converter. Bench `t` measures it: **7.2 SPS per cell achieved** on the fitted clones (design 16, clone-sized 8), in-walk periods 65.5-67.1 ms, interlock busy duty **95-96%** → decision 34: M5 must carve explicit pulse slots. `lib/sim` runs the fixed 26-min profile headless on the board (bench `v`) at hand-computed pulse demand; **94 native cases green** in seven suites. Open item 13's outstanding action (order two Adafruit #1085 breakouts — decision 35 — and re-run `d`/`a`/`t`) stands — the walker re-sizes itself from the new parts' own measurement at boot. |
 | M2 | air cal + voting + diluent-flush check + alarms | native voting tests pass | voting + diluent-flush + cal sigma gate done natively; on-device wiring not started |
-| M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds **0x76/0x77** (datasheet 7-bit forms, decision 36 — the old 0x3E/0x3B were phantoms) and raises `BARO_RANGE_9M` when only the BMP085 answers — **measured on the bench 2026-11-20: the fitted Adafruit BMP085 is found at 0x77 and `BARO_RANGE_9M depth clamps 9 m` fires**; drivers not written |
+| M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds **0x76/0x77** (datasheet 7-bit forms, decision 36 — the old 0x3E/0x3B were phantoms) and raises `BARO_RANGE_9M` when only the BMP085 answers — **measured on the bench 2026-11-20: the fitted Adafruit BMP085 is found at 0x77 and `BARO_RANGE_9M depth clamps 9 m` fires**. **BMP085 driver now written** (2026-11-20): `lib/core/src/BaroBosch.h` (register map + cal-ROM rule + compensation, pinned by 8 native cases in `test/test_baro/`) + `src/sensors/Bmp085.h` + `checkBaro()` active identity check + bench `b` extended with a live conversion and an Adafruit-library cross-check — **built and linking, not yet flashed: the devkit is not enumerating on USB**. M3's remaining work: flash + capture `b` (real ~1013 mbar, moves when squeezed, agrees with the library — closes item 17's second half), `Ms5837` driver (waits for the part; PROM read confirms identity), `Depth` (learned Psurf, salinity, 9 m clamp), README wiring |
 | M4 | ZHL-16C 3-gas + GF + ICD + CNS + MOD/END/density | validated natively **before** hardware depends on it | **engine complete and regression-anchored natively** (47 cases); *not* validated against a trusted computer yet — risk 13 |
 | M5 | pulse-driven solenoid + click verification + breathing-state machine + bailout | three-way solenoid fault taxonomy + ADC-window interlock | not started |
 | M6 | web + WS + settings + cal UI + dive-log graphs | phone on SoftAP, all tabs, offline graphs render | not started (deps resolve and compile) |
@@ -912,6 +952,7 @@ Re-open only with the user's explicit agreement.
 | 34 | **The M5 coil-pulse scheduler must carve explicit conversion-free slots into the ADC cycle; the incidental inter-conversion gap is measured ~2–3 ms and shall not be designed against.** | Implemented-and-measured 2026-11-19, before M5 exists: the alternating-mux walker (`AdcPairWalker`) keeps both converters integrating 95–96% of wall time at the fitted clones' rate (mean in-walk conversion period 66.4 ms, bench `t`). §8's "pulses queue into the gap" assumed a gap exists; at 20–250 ms pulse widths it does not. Recorded now so M5 is designed against a measured figure instead of discovering the collision at the water. This is **inherent to the walk scheme, not an artifact of the clones**: the walker re-arms the next conversion immediately, so back-to-back conversions leave the same ~µs gap at genuine-part rates too — only the window size changes (62 ms → ~31 ms). |
 | 35 | **The two ppO2 converters are specified as Adafruit "ADS1115 16-Bit ADC – 4 Channel with PGA" breakouts (product #1085), 2x.** This is the named procurement that satisfies decision 31; it changes nothing about driver or acceptance. | User's call, 2026-11-19. Facts checked against the Adafruit product page and the 4-Channel ADC Breakouts guide: the board carries the TI ADS1115 (chip spec SBAS444 — the same table `AdcRegs.h` implements and `test/test_adc/` asserts, so **no register-map, PGA, LSB or rate change anywhere**), VIN 2.0–5.5 V (run at 3.3 V), default address 0x48 with one back-side `A0` solder jumper giving 0x49 — exactly this design's 0x48/0x49 pair — ALRT/DRDY broken out on the header (open item 14 becomes wireable), and on-board 10k I2C pull-ups (two boards ≈ 5k total; add none externally). Caveats kept on the record: **identity remains a measurement claim, never a brand claim** (decision 29) — the arrival acceptance test is unchanged (`d` measures the eight datasheet rates, `a` reads ID `0x85`, `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` clear by themselves); decision 27 also stands — the Adafruit ADS1X15 library is a bring-up cross-check at most, never in the dive path. Two board revisions (STEMMA QT / header-only) are both acceptable. |
 | 36 | **I2C address policy: take the 7-bit form the datasheet itself states; never do arithmetic on a quoted address byte. Probe-table baro addresses become 0x76 (MS5837) and 0x77 (BMP085/180).** Corrects the 2026-11-19 note that "datasheets quote 8-bit forms, halve them" — that produced phantom 0x3E/0x3B, which no part has ever answered at. | Evidence, read from the primary sources on 2026-11-20 (copies in the session temp dir): Bosch BMP180 DS (BST-BMP180-DS000-09) Table 7 — "BMP180 addresses: A7..A1 = 1 1 1 0 1 1 1, W/R", i.e. 7-bit **0x77**, bus bytes 0xEE write / 0xEF read; there is no 0x3B anywhere in the part. TE MS5837-07BA DS — "Module ref / Mode / Pins used / Address (7 bits): MS5837-07BA, I2C, SDA SCL, **0x76 (1110110 b)**"; "0x7C" is the 8-bit write byte that circulates in driver code, and 0xA0–0xAC in the PROM-read diagrams are **command bytes**, not slave addresses — two separate traps in one datasheet. The immediate proof: the bench's Adafruit BMP085 is found at 0x77 and is a genuine part (see item 17's closure); boot now reports `I2C0: [0x77 0x3C]` + `BARO_RANGE_9M` instead of `ERROR BARO`. Also recorded: **0x76/0x77 are shared by BMP280/BME280 (CSB strap)**, so presence at 0x76 is not identity for the MS5837 — the PROM read confirms it (M3) — and one baro per I2C0 max without a clash. The failure mode this decision closes is the general one (risk 21): a wrong yardstick makes honest measurements look like part failures, and on this project the *next* suspect was already in the log as a bogus procurement action. |
+| 37 | **The Bosch pressure-compensation arithmetic is a transcription of the deployed Adafruit BMP085 library, kept int32/uint32-faithful, and anchored on that library's "use datasheet numbers!" example set — never on remembered constants and never on datasheet text (the DS has none).** | M3, 2026-11-20. The first transcription of `computeB5`/`convertPressure` (written partly from memory into `lib/core/src/BaroBosch.h`) was cross-checked line-by-line against `Adafruit_BMP085.cpp` (cloned and read that day) and found wrong in **four places**: `mc << 11` (not `<<16`), `B3` scaled by `(<< oversampling)` (not a fixed `<<2`), `B7` multiplied by `(50000UL >> oss)` (not a fixed 50000), and the B4-path `X2` built from `b1` with the B7 overflow branch `(B7/B4)*2` for B7 ≥ 2^31 / `(B7*2)/B4` below (a remembered variant swapped the branches and used `ac1` for the X2 term). The discriminator was **self-consistency at the documented example**: with `mc << 11` the library's debug block (ac1=408 … md=2868, UT=27898, UP=23843, oss=0) yields B5=2400 → T=15.0 °C exactly and p=69964 Pa; with `<< 16` it yields 431.6 °C. What is **banned as an anchor**: the "famous" AC1=7295 / UP=23843 pairing — searched, it appears zero times in the BMP180 DS text layer and is not self-consistent with any published form (a memory chimera, the same defect class as decision 36 and risk 21). `test/test_baro/` pins the example exactly, matches a second verbatim copy of the reference over 64 grid points, and pins the oss truncation chain (34321/68643/137286/274572). Deliberate non-widening: int32/uint32 semantics match the deployed reference so bench `b` can cross-check the firmware driver against the Adafruit library on the same physical module — that hardware agreement is the acceptance test, and it is still open (the board is not enumerating on USB). Rule that follows for every future driver: when a datasheet defers the algorithm to vendor code ("ANSI C available from Bosch"), the deployed code **is** the datasheet — transcribe it, anchor it at a self-consistent documented example, and say so in the provenance block. |
 
 ---
 
@@ -1421,3 +1462,43 @@ Re-open only with the user's explicit agreement.
   logic changed; only probe addresses and bench text. Native suite re-run: 94 green. App 489,973 B
   flash (31.2%), 63,864 B RAM (19.5%); the corrected image is flashed and the boot output above is
   from the board.
+
+- 2026-11-20 (M3, Bosch baro driver): **the fallback depth sensor has a real driver — and its
+  compensation was wrong in four places until a deployed reference caught it.** Written:
+  `lib/core/src/BaroBosch.h` (register map, DS cal-ROM validity rule, command/timing table,
+  `assembleUp`/`assembleUt`, `b5FromUt`, `compensate`, full provenance block),
+  `test/test_baro/` (8 native cases), `src/sensors/Bmp085.h` (header-only `Barometer` driver:
+  CHIPID + cal-ROM + blocking T+P cycle with DS waits, oss=2, XLSB always read, raw UT/UP/B5
+  exposed for the bench), `checkBaro()` in `main.cpp` (active identity check at boot and on BARO
+  presence transitions — CHIPID, cal ROM, **one real conversion**; writes ctrl_meas, so boot/
+  transition only, same rule as `checkAdcs`), and bench `b` extended to run the firmware driver
+  twice plus the **Adafruit BMP085 library on the same module**, with "squeeze the module and
+  re-run 'b': the mbar MUST move". New fault code `BARO_CONV_BAD = 26` (ERROR, blocks arming —
+  a baro that ACKs but cannot measure is not a depth source; the 9 m banner stays non-blocking).
+  Defects found before anything ran, all of the risk-13/risk-21 class:
+  1. **four transcription faults** in `compensate()`/`b5FromUt()` — `mc << 16` (should be `<< 11`),
+     a hard-coded `<< 2` in B3 (should be `<< oversampling`), a fixed 50000 in B7 (should be
+     `50000UL >> oss`), and the B4-path X2 built from `ac1` with the overflow branches swapped
+     (reference: X2 from `b1`; `(B7/B4)*2` when B7 ≥ 2^31, `(B7*2)/B4` below). Found by cloning
+     the field-deployed Adafruit BMP085 library and cross-checking line-by-line — **decision 37**.
+  2. **the anchor I "remembered" was a chimera**: AC1=7295 with UP=23843 → 15.0 °C. Text-extracted
+     DS: zero hits for 7295/23843/27898; and the set is not self-consistent with any published
+     form. The real anchor is the library's debug block commented "use datasheet numbers!"
+     (ac1=408 … md=2868): under the corrected arithmetic it gives **B5=2400, T=15.0 °C exactly,
+     p=69964 Pa**; under my `<< 16` it gave 431.6 °C — self-consistency at the documented result
+     was the discriminator. My first attempts to hunt example constants in the DS text (grep for
+     408/14383/8711 in the text layer: zero — the appendix is page images) and to cross-check
+     against a second independent implementation (the Linux kernel's bmp085 driver — fetches all
+     failed, then abandoned) are recorded so the next reader does not repeat the chase.
+  3. **two test-writing arithmetic errors of my own**, both caught by running the suite: asserting
+     `u1 = u0*2` across oss steps ignores XLSB truncation (68643 = 2×34321+1 — the chain is
+     asserted as measured now: 34321/68643/137286/274572), and a 4×4×4 grid counted as 48.
+  PlatformIO suite convention learned: native suites need a plain `int main()` entry — a named
+  `test_baro_suite()` function gives an undefined-`_main` link error.
+  **Status honestly stated: built (`pio run -e esp32` SUCCESS, links with the Adafruit lib) but
+  NOT flashed** — the devkit stopped enumerating on USB (`/dev/cu.usbserial-*` gone; recorded as
+  a fact, no defect inferred, item 16's lesson). **`pio test -e native` is 102 green across eight
+  suites** (test_boot gap list now {27,29}, walked count 44 with BARO_CONV_BAD in all three
+  tables). The acceptance test that closes item 17's second half — ~1013 mbar at the surface,
+  moving when squeezed, driver agreeing with the Adafruit library on the same silicon — runs the
+  moment the board enumerates again.
