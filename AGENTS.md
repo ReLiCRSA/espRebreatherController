@@ -120,9 +120,15 @@ the Adafruit product page and the Adafruit 4-Channel ADC Breakouts guide (2026-1
   **Not yet fitted**: 0x76 is datasheet-derived, not bench-measured on this project yet.
 - **BMP085** (datasheet 7-bit **0x77** — Bosch DS Table 7: address bits `1110111` + R/W, bus
   bytes 0xEE write / 0xEF read; the Adafruit breakout uses this address) fallback only:
-  300–1100 hPa => **~9 m usable depth ceiling**. If it is what is
-  fitted, arm is allowed but a permanent `DEPTH RANGE 9m` banner shows and all depth-dependent
-  logic clamps at 9 m. Never extrapolate.
+  300–1100 hPa absolute => **a water column UNDER 1 m at sea level (~1.2 m at the 978 mbar
+  Stockholm bench)** — decision 38 corrected the record's earlier "~9 m" claim, which was 10x
+  wrong (1100 mbar abs − ~1013 mbar surface = ~87 mbar gauge; 1 mbar supports ~1.02 cm of water;
+  `test/test_depth/` pins the hydrostatics). If it is what is
+  fitted, arm is allowed but a permanent `BARO_RANGE_CLAMP` banner shows, quoting the **computed**
+  ceiling (`clamps %.1fm@%.0fmbar` against learned Psurf, `clamps %.1fm SL%.0fmbar` on the
+  standard-atmosphere reference before Psurf is learned), and all depth-dependent
+  logic clamps there. Never extrapolate. The fallback's honest role on a dive unit is presence /
+  sanity cross-check, not depth — the MS5837 primary is not optional in practice.
 - Boot probe order: 0x76 then 0x77. Selected driver reported in `/api/health` and on OLED boot line.
 - **Address correction (2026-11-20, decision 36): 0x3E and 0x3B were phantoms.** The probe table
   previously "halved" the datasheet bytes (0x7C->0x3E, 0x77->0x3B); neither is any real address, and
@@ -135,7 +141,9 @@ the Adafruit product page and the Adafruit 4-Channel ADC Breakouts guide (2026-1
   per-chip factory trim (the DS's 7295 is its worked-example value), and 8604 is normal. The
   Adafruit BMP085/BMP180 breakout is exactly this part at exactly this address. It is now found at
   boot (`I2C0: [0x77 0x3C]`) and the fallback path raises `BARO_RANGE_9M depth clamps 9 m` as
-  designed. Corroborated independently by Adafruit's own BMP085/180 guide: "if an Adafruit BMP085
+  designed *(string as captured that morning; the "9 m" figure was corrected the same day by
+  decision 38 — the code string is now `BARO_RANGE_CLAMP` quoting a computed ceiling, see §2
+  above)*. Corroborated independently by Adafruit's own BMP085/180 guide: "if an Adafruit BMP085
   Breakout is properly connected it should show up at **0x77**". `b` re-measures the fingerprint (it writes the Bosch pointer register — bench only,
   same class as `a`/`d`). Caution kept: BMP280/BME280 also live at 7-bit 0x76/0x77 (CSB strap), so
   an ACK at 0x76 is not proof of an MS5837 until its PROM read says so — and only one baro fits
@@ -155,7 +163,9 @@ the Adafruit product page and the Adafruit 4-Channel ADC Breakouts guide (2026-1
   blocks arming — a baro that ACKs but cannot measure is not a depth source).
 - **Measured on the part (M3, 2026-11-20 — flashed and captured).** Boot:
   `BARO @0x77 BMP180: 977.72 mbar  25.2 C  (UT=28474 UP=162080 B5=4034 oss=2) — fallback, 9 m
-  clamp`, no `BARO_CONV_BAD`, `[arm] checklist: sensors ok` unchanged. Bench `b` cross-checks two
+  clamp` *(the "9 m clamp" string is superseded the same day by decision 38 — the banner now
+  prints a computed ceiling: `clamps 0.9m SL1013mbar` pre-Psurf, `clamps 1.2m@978mbar` after)*,
+  no `BARO_CONV_BAD`, `[arm] checklist: sensors ok` unchanged. Bench `b` cross-checks two
   independent implementations on the same module: driver 977.75/977.78 vs Adafruit library 977.76
   mbar at rest (**0.02 mbar**; 0.00–0.15 settled, worst 0.5 from reads 0.5 s apart during a fast
   thermal transient), and a **host hand recompute** from the cal ROM + raw wire words the bench
@@ -185,6 +195,41 @@ the Adafruit product page and the Adafruit 4-Channel ADC Breakouts guide (2026-1
 - Depth = `(Pamb - Psurf) * k`; `Psurf` is **learned at boot** (only relative accuracy matters,
   +/-2 mbar ~ 2 cm, not the +/-200 mbar absolute spec). Salinity configurable (fresh 1.000,
   salt 1.025). Learned Psurf also gates air calibration.
+  **As built (M3, 2026-11-20):** `lib/core/src/Depth.h` — `ceilingMeters()`, `metersPerBar()`
+  (salt 9.9484, fresh 10.1972 m/bar at g=9.80665; 1 mbar ≈ 1.02 cm water) and
+  `depth::SurfaceLearner` (16-sample window, lock at σ ≤ 2 mbar, 24-sample/120 ms budget — a
+  breathed-on or drifting module must NOT lock). Pinned by `test/test_depth/` (6 cases, incl. the
+  decision-38 sub-1 m derivation). On-target: boot learns **977.89 mbar, σ 0.06 mbar over 16
+  samples → depth = gauge × 9.948 m/bar (SG 1.025)**. No lock ⇒ `BARO_CONV_BAD` (no new code —
+  an unstable baro is exactly what that code means). `Salinity` is a compile-time 1.025
+  placeholder until RuntimeConfig (M6).
+- **MS5837 driver (M3, 2026-11-20) — written and natively pinned, NOT yet measured on a part.**
+  The part is unprocured, so everything here is datasheet-derived until a Bar30 arrives.
+  `lib/core/src/BaroMs5837.h` (PROM map, CRC-4, C1-band model classification, compensation) +
+  `src/sensors/Ms5837.h` (I2C driver, D1/D2 at OSR4096 with the DS-MAX 9.04 ms waits — "maximum
+  values must be used for waits") + `checkMs5837()` in main.cpp + a `b`-command identity section.
+  **Identity gate = factory PROM read + CRC-4 + C1 band** (necessary, not sufficient — the
+  deployed-library note says the MS5637 also answers 0x76 and passes CRC; and DS C6/C2 revisions
+  contradict on the W0 product-type suffix, so type bits are **reported, never gated** — decision
+  36/risk 21's rule applied). A 0x76 squatter (BMP280/BME280 class) or dead PROM raises
+  `BARO_CONV_BAD` and blocks arming while a working BMP180 keeps the fallback + clamp banner.
+  Compensation follows the deployed BlueRobotics division semantics (truncate-toward-zero); the
+  DS worked example's columns use floor semantics, so the code gives 1982 / 2381323465 /
+  1145816756 where the DS prints 1981 / 2381323464 / 1145816755 — ≤1 LSB, stated not papered
+  over, test anchors use the code values (decision 37's pattern: the deployed code is the
+  algorithm reference). `rangeCeilingBar()` is model-aware (an 02BA die that passes CRC is a
+  2-bar part with a ~10 m ceiling — the banner says so). Arrival acceptance: `b` PROM+CRC, DS-MAX
+  timing, a Stockholm-station mbar (named place/hour/source, risk 21), and the reading must move
+  when the port is squeezed.
+- **INA219 (M3, 2026-11-20) — written and natively pinned, part not fitted.** No CHIPID exists,
+  so identity is fully active: CONFIG write-verify + CAL read-back + a real bus-voltage reading
+  in the 2.5–5.5 V window (asks "is this sensor measuring", not "is the pack charged").
+  `lib/core/src/PwrRegs.h` + `src/sensors/Ina219.h` + `checkPower()` + bench `w`. Presets assume
+  the Adafruit #904-class **0.1 Ω** shunt — every ampere figure carries that assumption openly
+  until a meter cross-check runs when the part arrives. `pwr::calRegister` is exact integer math
+  (nA × nΩ): the float form truncated the exact 4096 anchor to 4095, caught by `test/test_power/`.
+  CONFIG+CAL are re-written before every current/power read (the deployed library's sharp-load
+  reset defence — load-bearing with solenoid pulses).
 
 ### Solenoid / power
 - Valve **not yet purchased**. Default assumption: pilot-operated **normally closed** valve at
@@ -760,7 +805,13 @@ pull-up/pull-down and output behaviour on pads with nothing wired,
 and `b` baro identity — Bosch-family CHIPID/version/cal-ROM reads at the candidate addresses, which
 is how the fitted BMP085 was established as genuine — and, equally instructively, how a wrong
 expectation (phantom 0x3B) was measured against a good part and produced a false "clone" verdict
-(§2, decision 36, risk 21). `g` is what settled §3, and `v`
+(§2, decision 36, risk 21); since M3 `b` also runs the **MS5837 identity chain** on anything at
+0x76 — PROM read + CRC-4 + C1 band + a real D1/D2 conversion at OSR4096 — which is the arrival
+acceptance test when a Bar30 is fitted. New bench command **`w`** — INA219 battery rail: config
+write-verify + raw register dump through the dive driver; currently prints the honest "no INA219
+at 0x40" plus the meter cross-check recipe, and every ampere figure in the firmware carries the
+0.1 Ω shunt assumption openly until it runs against a fitted part and a meter.
+`g` is what settled §3, and `v`
 runs the fixed headless sim profile (see §11): it prints per-minute SIM-stamped lines plus a
 measured **worst-tick cost** line — per-tick compute cost is derived from the target, never assumed
 from the host (risk 19).
@@ -798,9 +849,10 @@ bench procedure.
 
 ## 16. Test strategy
 
-**Current state (2026-11-20): `pio test -e native` is green — 102 cases across eight suites
+**Current state (2026-11-20 late): `pio test -e native` is green — 117 cases across eleven suites
 (`test_voting`, `test_gas`, `test_zhl`, `test_boot`, `test_adc`, `test_pins`, `test_sim`,
-`test_baro`); `pio run -e esp32` links **and is flashed and running on the devkit** with two
+`test_baro`, `test_depth`, `test_ms5837`, `test_power`); `pio run -e esp32` links **and is flashed
+and running on the devkit** with two
 ADS1115 modules, an SSD1306 and an Adafruit BMP085 actually attached (the converters measure as
 clones — risk 16, decision 31; the BMP085 measures as genuine — decision 36). **The M3 Bosch
 baro path (`Bmp085`/`BaroBosch`/`checkBaro()`/extended bench `b`) is now flashed and measured on
@@ -816,7 +868,9 @@ them, and the baro numbers are from the current image.** The
 positive-ACK caveat that M0 left open is closed: `I2C1: 2 device(s) [0x48 0x49]`,
 `I2C0: 2 device(s) [0x77 0x3C]`, and the corresponding faults clear while the missing ones stay
 raised — including the designed fallback behaviour: with only the BMP085 answering,
-`BARO_RANGE_9M depth clamps 9 m` is raised and arming stays allowed with the banner (§13).
+`BARO_RANGE_CLAMP clamps 1.2m@978mbar` (computed ceiling, decision 38; the string read
+`BARO_RANGE_9M depth clamps 9 m` until corrected the same day) is raised and arming stays allowed
+with the banner (§13).
 Reads and writes on the attached converter are verified, not assumed: `a` write-verifies a register
 and restores it, `d` measures the conversion period field by field — which is how the register-map
 faults and the non-standard rate table in section 2 were found — and `g` measures who owns each GPIO
@@ -829,7 +883,7 @@ with zero I2C errors, zero conversion timeouts and the board responsive afterwar
 Layout note: PlatformIO only collects suites from `test/test_<name>/` folders (a bare `test/native/`
 group folder collects nothing), so the suites are `test/test_voting/`, `test/test_gas/`,
 `test/test_zhl/`, `test/test_boot/`, `test/test_adc/`, `test/test_pins/`, `test/test_sim/`,
-`test/test_baro/`. Suite convention: the entry point is a plain `int main()` — PlatformIO's native
+`test/test_baro/`, `test/test_depth/`, `test/test_ms5837/`, `test/test_power/`. Suite convention: the entry point is a plain `int main()` — PlatformIO's native
 test glue links against it; a named `test_baro_suite()` entry produced an undefined-`_main` link
 error. `test_build_src = no` in the
 `native` env: `src/` is ESP32-only by design and is not built on the host. `lib/core` is built
@@ -855,7 +909,7 @@ a name and a non-INFO default severity, so a code added to the enum and forgotte
 immediately — it caught a real omission the day it was written), wrong-ADC-part and bad-conversion
 block arming while a bare unknown-ID warning must **not**, and an unlisted FATAL still blocks.
 `BARO_CONV_BAD` (a baro that ACKs but has a corrupt cal ROM, no conversion, or an out-of-range
-result) is ERROR and blocks arming — the depth analogue of `ADC_CONV_BAD`; the 9 m-range banner
+result) is ERROR and blocks arming — the depth analogue of `ADC_CONV_BAD`; the range-clamp banner
 stays a non-blocking ERROR as §13 requires.
 `test_adc`: config-register field masks tile 0xFFFF exactly once and the rate field sits below PGA;
 the measured power-on word 0x8583 decodes as single-shot / PGA gain 2 / 8 SPS; the design config
@@ -893,6 +947,22 @@ p=69964 Pa — the discriminator that proved the corrected `mc << 11`; the wrong
 arithmetic; monotonicity in the sane band plus **oss scale invariance** (the UP reporting 1013 mbar
 is 34321<<oss within truncation granularity); out-of-range results flagged, not hidden; and a
 corrupt cal ROM refused before any arithmetic (`converted=false`, no divide-by-zero).
+`test_depth`: the water-hydrostatics anchors (1 mbar ≈ 1.02 cm; salt 9.9484 / fresh 10.1972
+m/bar) and **the decision-38 conclusion itself** — the BMP180 fallback's whole gauge range is
+under 1 m at a sea-level surface, ~1.2 m at the measured bench Psurf — plus
+`SurfaceLearner`: lock at σ ≤ 2 mbar, refusal to lock on a drifting or breathed-on series,
+and no half-learned state leaking out.
+`test_ms5837`: the CRC-4 computed against a **verbatim copy of the DS C6 published example**
+(the checksum is the identity gate, so its implementation gets a reference copy, decision 37's
+pattern); C1-band model classification (30BA/02BA/outside); the compensation anchored against a
+**verbatim BlueRobotics `br_pressure` copy** on the same inputs — the discriminator that pins
+division-truncation semantics (code 1982 / 2381323465 / 1145816756 vs the DS's floor-semantics
+columns 1981 / ...464 / ...755, ≤1 LSB, stated in the provenance, tests use the code values);
+and W0/W7 field extraction (type bits reported, never gated — the DS revisions contradict).
+`test_power`: `pwr::calRegister` exact integer math — the 0.1 Ω/32 A preset lands the datasheet's
+**exact 4096** anchor (the float form truncated it to 4095: caught here, not on hardware),
+shunt/current/power LSB conversions, and the preset table against the deployed Adafruit
+library's constants.
 
 - `pio test -e native` covers `lib/core/` **and** `lib/sim/` — the same physics models run on the
   host with no hardware. (They live under `lib/`, not `src/core`, so they build natively; `src/` is
@@ -914,7 +984,7 @@ corrupt cal ROM refused before any arithmetic (`converted=false`, no divide-by-z
 | M0 | installer, build, flash, I2C scan, boot report | `pio run -t upload` works on this Mac | **DONE** — flashed and verified on the devkit (CP2102, ESP32-D0WD-V3): "Hash of data verified", clean boot banner, boot report correct on an empty bench, `[arm] REFUSED`. Section 15 holds the evidence. |
 | M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **DONE (2026-11-19).** Boot/bench and the simulator were verified earlier; the last open item, the **alternating-mux scheduler**, is now implemented and measured: `AdcPairWalker` in `src/sensors/Ads1115Bus` — non-blocking pair-step state machine, sized from the boot-measured conversion period (never the datasheet), polled OS bit at 10 ms cadence (DRDY still unwired, open item 14), I2C-error backoff, and a coil/ADC interlock window carried per converter. Bench `t` measures it: **7.2 SPS per cell achieved** on the fitted clones (design 16, clone-sized 8), in-walk periods 65.5-67.1 ms, interlock busy duty **95-96%** → decision 34: M5 must carve explicit pulse slots. `lib/sim` runs the fixed 26-min profile headless on the board (bench `v`) at hand-computed pulse demand; **94 native cases green** in seven suites. Open item 13's outstanding action (order two Adafruit #1085 breakouts — decision 35 — and re-run `d`/`a`/`t`) stands — the walker re-sizes itself from the new parts' own measurement at boot. |
 | M2 | air cal + voting + diluent-flush check + alarms | native voting tests pass | voting + diluent-flush + cal sigma gate done natively; on-device wiring not started |
-| M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds **0x76/0x77** (datasheet 7-bit forms, decision 36 — the old 0x3E/0x3B were phantoms) and raises `BARO_RANGE_9M` when only the BMP085 answers — **measured on the bench 2026-11-20: the fitted Adafruit BMP085 is found at 0x77 and `BARO_RANGE_9M depth clamps 9 m` fires**. **BMP085 driver now written** (2026-11-20): `lib/core/src/BaroBosch.h` (register map + cal-ROM rule + compensation, pinned by 8 native cases in `test/test_baro/`) + `src/sensors/Bmp085.h` + `checkBaro()` active identity check + bench `b` extended with a live conversion, a full cal-ROM dump, and an Adafruit-library cross-check — **flashed and proven on the part 2026-11-20**: boot prints `BARO @0x77 BMP180: 977.72 mbar 25.2 C (UT=28474 UP=162080 B5=4034 oss=2)` with no `BARO_CONV_BAD`; `b`: driver 977.75/977.78 vs library 977.76 mbar (0.02 mbar), hand recompute from the dumped words reproduces the on-target arithmetic, squeeze/port stimulus moves the reading and T tracks — **item 17's second half closed**. It also raised **item 18 — closed the same day: the "−27…−39 hPa out of spec" anomaly was a wrong-city reference (Cape Town weather; bench in Stockholm); against SMHI/Bromma (SLP 984–987 hPa) the module's absolute reading is consistent with the DS accuracy window**. M3's remaining work: `Ms5837` driver (waits for the part; PROM read confirms identity), `Depth` (learned Psurf, salinity, 9 m clamp), `Ina219`, README wiring |
+| M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds **0x76/0x77** (datasheet 7-bit forms, decision 36 — the old 0x3E/0x3B were phantoms) and raises `BARO_RANGE_9M` when only the BMP085 answers — **measured on the bench 2026-11-20: the fitted Adafruit BMP085 is found at 0x77 and `BARO_RANGE_9M depth clamps 9 m` fires**. **BMP085 driver now written** (2026-11-20): `lib/core/src/BaroBosch.h` (register map + cal-ROM rule + compensation, pinned by 8 native cases in `test/test_baro/`) + `src/sensors/Bmp085.h` + `checkBaro()` active identity check + bench `b` extended with a live conversion, a full cal-ROM dump, and an Adafruit-library cross-check — **flashed and proven on the part 2026-11-20**: boot prints `BARO @0x77 BMP180: 977.72 mbar 25.2 C (UT=28474 UP=162080 B5=4034 oss=2)` with no `BARO_CONV_BAD`; `b`: driver 977.75/977.78 vs library 977.76 mbar (0.02 mbar), hand recompute from the dumped words reproduces the on-target arithmetic, squeeze/port stimulus moves the reading and T tracks — **item 17's second half closed**. It also raised **item 18 — closed the same day: the "−27…−39 hPa out of spec" anomaly was a wrong-city reference (Cape Town weather; bench in Stockholm); against SMHI/Bromma (SLP 984–987 hPa) the module's absolute reading is consistent with the DS accuracy window**. M3's remaining work: `Ms5837` driver (waits for the part; PROM read confirms identity), `Depth` (learned Psurf, salinity, 9 m clamp), `Ina219`, README wiring. **Status update same day (2026-11-20 late): the "9 m" figures quoted in this row are superseded by decision 38 (<1 m) — see §2 and risk 1.** And the remaining work landed, with one honest caveat: `Depth.h` + `SurfaceLearner` (learned Psurf on-target: 977.89 mbar σ 0.06), `BaroMs5837.h` + `Ms5837.h` + `checkMs5837()` (PROM/CRC/C1 identity chain, written-not-measured — part unprocured), `PwrRegs.h` + `Ina219.h` + `checkPower()` + bench `w` (part not fitted), and `README.md` per §15. **117 native cases, 11 suites green.** M3's *gate* ("fallback verified by removing the MS5837") still cannot run until a Bar30 is fitted — until then the fallback is the only depth source on the bench, and the MS5837 side of every claim is datasheet-derived. |
 | M4 | ZHL-16C 3-gas + GF + ICD + CNS + MOD/END/density | validated natively **before** hardware depends on it | **engine complete and regression-anchored natively** (47 cases); *not* validated against a trusted computer yet — risk 13 |
 | M5 | pulse-driven solenoid + click verification + breathing-state machine + bailout | three-way solenoid fault taxonomy + ADC-window interlock | not started |
 | M6 | web + WS + settings + cal UI + dive-log graphs | phone on SoftAP, all tabs, offline graphs render | not started (deps resolve and compile) |
@@ -951,7 +1021,7 @@ Re-open only with the user's explicit agreement.
 | 4 | Full automatic O2 injection control loop | Chosen by user over manual-only and dry-contact-alarm-only. |
 | 5 | WebSocket push ~2 Hz (ESP32Async ESPAsyncWebServer 3.12.x) | Chosen by user over HTTP JSON polling. |
 | 6 | ESP32 classic (WROOM devkit) | Chosen by user; drives the pin map in section 3. |
-| 7 | **MS5837 primary, BMP085 fallback**; wiring documented in README | Chosen by user. BMP085 caps at ~9 m — fallback only. |
+| 7 | **MS5837 primary, BMP085 fallback**; wiring documented in README | Chosen by user. BMP085 caps at ~9 m — fallback only. *(Range figure corrected 2026-11-20 by decision 38: **under 1 m** of water column, not 9 m. The decision itself — MS5837 primary, BMP085 fallback only — is unchanged and stands.)* |
 | 8 | **Two ADS1115s, differential pairs** | Chosen by user. Better CMRR than single-ended on one ADC; cells 1+2 still share a converter (see 19). |
 | 9 | **Galvanic cells** | Chosen by user. No bias supply, ~10 mV in air, gain 16. |
 | 10 | **This is the PRIMARY dive computer** | Chosen by user. Inverts the original "screen/baro optional" stance: optional for bench, **required for arming**. Adds external watchdog, arming gates, second-computer requirement. |
@@ -982,12 +1052,16 @@ Re-open only with the user's explicit agreement.
 | 35 | **The two ppO2 converters are specified as Adafruit "ADS1115 16-Bit ADC – 4 Channel with PGA" breakouts (product #1085), 2x.** This is the named procurement that satisfies decision 31; it changes nothing about driver or acceptance. | User's call, 2026-11-19. Facts checked against the Adafruit product page and the 4-Channel ADC Breakouts guide: the board carries the TI ADS1115 (chip spec SBAS444 — the same table `AdcRegs.h` implements and `test/test_adc/` asserts, so **no register-map, PGA, LSB or rate change anywhere**), VIN 2.0–5.5 V (run at 3.3 V), default address 0x48 with one back-side `A0` solder jumper giving 0x49 — exactly this design's 0x48/0x49 pair — ALRT/DRDY broken out on the header (open item 14 becomes wireable), and on-board 10k I2C pull-ups (two boards ≈ 5k total; add none externally). Caveats kept on the record: **identity remains a measurement claim, never a brand claim** (decision 29) — the arrival acceptance test is unchanged (`d` measures the eight datasheet rates, `a` reads ID `0x85`, `ADC_ID_UNKNOWN`/`ADC_RATE_MISMATCH` clear by themselves); decision 27 also stands — the Adafruit ADS1X15 library is a bring-up cross-check at most, never in the dive path. Two board revisions (STEMMA QT / header-only) are both acceptable. |
 | 36 | **I2C address policy: take the 7-bit form the datasheet itself states; never do arithmetic on a quoted address byte. Probe-table baro addresses become 0x76 (MS5837) and 0x77 (BMP085/180).** Corrects the 2026-11-19 note that "datasheets quote 8-bit forms, halve them" — that produced phantom 0x3E/0x3B, which no part has ever answered at. | Evidence, read from the primary sources on 2026-11-20 (copies in the session temp dir): Bosch BMP180 DS (BST-BMP180-DS000-09) Table 7 — "BMP180 addresses: A7..A1 = 1 1 1 0 1 1 1, W/R", i.e. 7-bit **0x77**, bus bytes 0xEE write / 0xEF read; there is no 0x3B anywhere in the part. TE MS5837-07BA DS — "Module ref / Mode / Pins used / Address (7 bits): MS5837-07BA, I2C, SDA SCL, **0x76 (1110110 b)**"; "0x7C" is the 8-bit write byte that circulates in driver code, and 0xA0–0xAC in the PROM-read diagrams are **command bytes**, not slave addresses — two separate traps in one datasheet. The immediate proof: the bench's Adafruit BMP085 is found at 0x77 and is a genuine part (see item 17's closure); boot now reports `I2C0: [0x77 0x3C]` + `BARO_RANGE_9M` instead of `ERROR BARO`. Also recorded: **0x76/0x77 are shared by BMP280/BME280 (CSB strap)**, so presence at 0x76 is not identity for the MS5837 — the PROM read confirms it (M3) — and one baro per I2C0 max without a clash. The failure mode this decision closes is the general one (risk 21): a wrong yardstick makes honest measurements look like part failures, and on this project the *next* suspect was already in the log as a bogus procurement action. |
 | 37 | **The Bosch pressure-compensation arithmetic is a transcription of the deployed Adafruit BMP085 library, kept int32/uint32-faithful, and anchored on that library's "use datasheet numbers!" example set — never on remembered constants and never on datasheet text (the DS has none).** | M3, 2026-11-20. The first transcription of `computeB5`/`convertPressure` (written partly from memory into `lib/core/src/BaroBosch.h`) was cross-checked line-by-line against `Adafruit_BMP085.cpp` (cloned and read that day) and found wrong in **four places**: `mc << 11` (not `<<16`), `B3` scaled by `(<< oversampling)` (not a fixed `<<2`), `B7` multiplied by `(50000UL >> oss)` (not a fixed 50000), and the B4-path `X2` built from `b1` with the B7 overflow branch `(B7/B4)*2` for B7 ≥ 2^31 / `(B7*2)/B4` below (a remembered variant swapped the branches and used `ac1` for the X2 term). The discriminator was **self-consistency at the documented example**: with `mc << 11` the library's debug block (ac1=408 … md=2868, UT=27898, UP=23843, oss=0) yields B5=2400 → T=15.0 °C exactly and p=69964 Pa; with `<< 16` it yields 431.6 °C. What is **banned as an anchor**: the "famous" AC1=7295 / UP=23843 pairing — searched, it appears zero times in the BMP180 DS text layer and is not self-consistent with any published form (a memory chimera, the same defect class as decision 36 and risk 21). `test/test_baro/` pins the example exactly, matches a second verbatim copy of the reference over 64 grid points, and pins the oss truncation chain (34321/68643/137286/274572). Deliberate non-widening: int32/uint32 semantics match the deployed reference so bench `b` can cross-check the firmware driver against the Adafruit library on the same physical module — that hardware agreement is the acceptance test, and it is still open (the board is not enumerating on USB). Rule that follows for every future driver: when a datasheet defers the algorithm to vendor code ("ANSI C available from Bosch"), the deployed code **is** the datasheet — transcribe it, anchor it at a self-consistent documented example, and say so in the provenance block. |
+| 38 | **The BMP085/BMP180 fallback's usable depth ceiling is UNDER 1 m of water at sea level (~1.2 m at the 978 mbar bench), not the "~9 m" the design record asserted — a 10x error. The `BARO_RANGE` banner now quotes a COMPUTED ceiling (`depth::ceilingMeters()`), never a recited figure; the display string becomes `BARO_RANGE_CLAMP` (enum value 13 unchanged).** | M3, 2026-11-20, found while writing `Depth.h` — the arithmetic the code had to do forced the claim to be checked. The record's "~9 m" appears nowhere derivable: 1100 mbar abs − ~1013 mbar surface = ~87 mbar **gauge**, and 1 mbar supports ~1.02 cm of water (10.1972 m/bar fresh, 9.9484 salt at g=9.80665), so the part's whole water column is ~0.86–0.88 m; at the measured Stockholm bench Psurf of 977.9 mbar the ceiling is ~1.2 m. "~9 m" would need ~880 mbar gauge — a number the part's own 300–1100 hPa spec rules out. **test/test_depth/** pins the hydrostatics and the sub-1 m conclusion. This is risk 21's fourth instance of the same defect class in four days: a plausible number asserted, never derived — phantom addresses from halved bytes, a bench-intervention inference, wrong-city weather, and now a range figure nobody multiplied out. The lesson generalises past baros: **any number that gates behaviour gets derived in code from primary-spec inputs and printed with its reference, so a wrong figure cannot survive by being recited.** Consequences: the < 50 m banner gate is a stated design heuristic (the design's primary covers ~288 m; anything shallower wears the banner), the banner stays ERROR/non-blocking per §13 ("arm shallow or not at all"), decision 7 stands unchanged (MS5837 primary, fallback only — if anything the correction strengthens it), and the MS5837 procurement is now unambiguously load-bearing: **the fitted fallback is not a dive depth source.** |
 
 ---
 
 ## 19. Known risks — do not regress
 
-1. **BMP085 fallback saturates at ~9 m.** Never let depth-dependent logic extrapolate past it.
+1. **BMP085 fallback saturates at 1.1 bar absolute — under 1 m of water at sea level, not the
+"~9 m" the record claimed until decision 38 corrected it 10x over.** Never let depth-dependent
+logic extrapolate past it, and never treat the fallback as a dive depth source: the MS5837
+primary is load-bearing.
 2. **Cells 1 and 2 share one ADS1115** (one mux, reference, supply). Voting is not protection
    against that correlated failure. Diluent-flush verification and the arming gate exist because of
    this; do not remove them for flash or RAM reasons.
@@ -1127,7 +1201,7 @@ Re-open only with the user's explicit agreement.
 | 14 | **DRDY is wired to GPIO 23 but the line has only ever been read pulled-up and idle** | The driver currently polls the OS bit over I2C (348 us/poll measured). DRDY would cut that to an interrupt and make the coil/ADC interlock exact rather than polled. Needs the module's DRDY actually connected and the polarity/behavior measured (open-drain, needs a pull-up) before the scheduler can depend on it. The Adafruit #1085 (decision 35) **breaks ALRT out on its header**, so once those boards are fitted this is one jumper + one pull-up per converter — not a board-modification project. Still must be measured before the scheduler trusts it, and settled against the pin budget (item 15). |
 | 15 | **Display panel vs the pin budget** (new, from closing item 12): a SPI panel needs four pads (SCK/MOSI/DC/CS) and after the current map **only GPIO 17 is spare and output-capable** | The core's own SPI defaults (18/19/23) collide with I2C1 and ADS_U1_DRDY, so a panel cannot simply take `SPI.begin()` defaults. Options, none free: free the two DRDY pads by polling the OS bit instead (costs 348 us/poll and an exact interlock, item 14), take strapping pins against the §3 policy, or keep the panel on I2C and accept the frame-time cost (§12 says a >128x64 panel must not go on I2C). Must be argued with item 6 when the panel is chosen — not during bring-up at the water. |
 | 16 | **The ADS1115 module stopped answering on I2C1** (`SDA held low before init`, probes returning **err 5 = timeout**, nine clocks + port re-init did not free it) | **CLOSED 2026-11-19 — not a fault.** The user confirms the dropouts were **their own intervention on the bench** (the module being unplugged/re-fitted), not a flaky connection. Nothing to fix and no maintenance action. What the episode is kept for is the diagnostic it produced: `err 5` (bus being held) vs `err 2` (address unanswered) are different hardware stories, and **a converter that has lost its supply clamps SDA/SCL through its protection diodes** — that is exactly what a disconnected or unpowered module looks like, and exactly what a converter failing mid-dive will look like in the log. Securing jumpers for the dive build stays good practice (§20 item 9, enclosure/connector work), but it is not a corrective action for anything seen so far. |
-| 17 | **"The fitted BMP085 is a Bosch-family clone" (ACKs 0x77, silent 0x3B; `0xD1=0x02` not 0x43, AC1=8604 not 7295) — recorded 2026-11-20 by bench `b`** | **CLOSED 2026-11-20 — misdiagnosis, the module is fine.** All three "disagreements" were the *report's* errors, not the part's: 0x3B was a phantom produced by halving the datasheet's 0x77 (Bosch DS Table 7: bits `1110111`+R/W = 7-bit **0x77**, which is where the module correctly answers); 0xD1 is undefined in the BMP180 datasheet, so its readback 0x02 proves nothing (0x43 is BMP085-only); the 0xAA–0xBF cal block is per-chip factory trim, 8604 is normal, 7295 is the DS's worked example. The module is an Adafruit BMP085 (BMP180 die) behaving exactly as specified. The real defect was in the probe table — fixed to 0x76/0x77 (decision 36), and boot now finds it: `I2C0: [0x77 0x3C]`, `BARO_RANGE_9M depth clamps 9 m`, correct fallback behaviour. The fallback part question is therefore **resolved: the fitted module is the fallback**. What stays open in miniature: the MS5837 (0x76) is still unprocured/unfitted, so its side of the table is datasheet-derived until one is measured; and the BMP180's conversion behaviour is trusted only once `Bmp085.cpp` makes it produce a real, sane pressure (identity by register reads is necessary, not sufficient). |
+| 17 | **"The fitted BMP085 is a Bosch-family clone" (ACKs 0x77, silent 0x3B; `0xD1=0x02` not 0x43, AC1=8604 not 7295) — recorded 2026-11-20 by bench `b`** | **CLOSED 2026-11-20 — misdiagnosis, the module is fine.** All three "disagreements" were the *report's* errors, not the part's: 0x3B was a phantom produced by halving the datasheet's 0x77 (Bosch DS Table 7: bits `1110111`+R/W = 7-bit **0x77**, which is where the module correctly answers); 0xD1 is undefined in the BMP180 datasheet, so its readback 0x02 proves nothing (0x43 is BMP085-only); the 0xAA–0xBF cal block is per-chip factory trim, 8604 is normal, 7295 is the DS's worked example. The module is an Adafruit BMP085 (BMP180 die) behaving exactly as specified. The real defect was in the probe table — fixed to 0x76/0x77 (decision 36), and boot now finds it: `I2C0: [0x77 0x3C]`, `BARO_RANGE_9M depth clamps 9 m`, correct fallback behaviour *(the "9 m" string superseded the same day by decision 38 — `BARO_RANGE_CLAMP` with a computed <1 m ceiling)*. The fallback part question is therefore **resolved: the fitted module is the fallback** *(but decision 38 bounds what it is fit for: sub-1 m — a sanity cross-check, not a dive depth source)*. What stays open in miniature: the MS5837 (0x76) is still unprocured/unfitted, so its side of the table is datasheet-derived until one is measured; and the BMP180's conversion behaviour is trusted only once `Bmp085.cpp` makes it produce a real, sane pressure (identity by register reads is necessary, not sufficient) — **now closed: the driver produces 977.8–978.1 mbar on the part (§2)**. |
 | 18 | **Apparent absolute-pressure defect in the fitted BMP180**: it reads 977.7 mbar at a bench user-confirmed at 0–100 m elevation, cross-checked — in error — against a 1017 hPa sea-level reference, giving an apparent **−27…−39 hPa** offset vs the DS's "Absolute accuracy pressure VDD = 3.3V 300 . . . 1100 hPa 0 . . . +65 °C −4.0 / −1.0* / +2.0 hPa". Module reading reproduced to ±0.2 mbar across three `b` captures and two USB sessions | **CLOSED 2026-11-20 — misdiagnosis; the defect was in the reference, not the part.** The 1017 hPa figure was **Cape Town** weather; the bench is in **Stockholm, Sweden** — now a named fact (HANDOFF §6), and the location assumption was never in the record. Same-morning Stockholm stations: SMHI Observatoriekullen **986.7 hPa**, Bromma SYNOP **987 hPa**, NOAA ESSB altimeter 984 hPa (older) ⇒ SLP 984–987. Module 977.7 mbar at a 0–100 m bench ⇒ implied offset **−9…+3 hPa** (DS: 1 hPa ≈ 8.43 m), consistent with the DS accuracy window for elevations ≈40–90 m and within the references' own ±3 hPa spread at Stockholm's typical 15–30 m. Every module measurement in the original entry stands — the yardstick did not. The offset-vs-gain alarm (3.8%) is void: worst implied error across the band is ≤0.9%. MS5837 procurement returns to normal priority (still the primary, still unprocured). Residual, optional: absolute accuracy is not certifiable tighter than ~±3 hPa without exact bench elevation + same-hour station reference, or a trend correlation (module delta vs station delta over hours) — needed only if that claim is ever wanted; the dive path is covered by learned `Psurf` + the independently corroborated relative behaviour (§2). |
 
 ---
@@ -1589,3 +1663,52 @@ Re-open only with the user's explicit agreement.
   city — **a reference is a measurement with a place, an hour and a source; write all three
   down before calling anything an anomaly.** Docs-only correction; `pio test -e native`
   unchanged at 102 green.
+
+- 2026-11-20 (M3, depth + power): **the rest of M3's code landed — and writing the depth math
+  caught a 10x error in the design record itself (decision 38).** Written:
+  `lib/core/src/Depth.h` (`ceilingMeters`/`metersPerBar` — salt 9.9484, fresh 10.1972 m/bar at
+  g=9.80665 — and `depth::SurfaceLearner`: 16-sample window, lock at σ ≤ 2 mbar, 24-sample/
+  120 ms budget), `lib/core/src/BaroMs5837.h` (PROM map, CRC-4, C1-band model classification,
+  compensation transcribed from the deployed BlueRobotics library per decision 37's pattern,
+  provenance stated incl. the ≤1 LSB floor-vs-truncate difference against the DS worked
+  example), `lib/core/src/PwrRegs.h` (INA219 register map + exact-integer `calRegister`),
+  `src/sensors/Ms5837.h` + `src/sensors/Ina219.h` (hand-rolled drivers, honest Status chains,
+  raw words exposed for the bench), and main.cpp integration: identity-based baro selection
+  (`checkMs5837()` = PROM+CRC+C1 band+D1/D2 at OSR4096 with DS-MAX 9.04 ms waits+900–1100 mbar
+  surface window; a 0x76 squatter raising it gets `BARO_CONV_BAD` and blocks arming while a
+  working fallback keeps its clamp banner), `learnSurface()`, `checkPower()` (INA219 has no
+  CHIPID — identity is CONFIG write-verify + CAL read-back + a real bus-voltage read),
+  hot-plug `powerChanged`, bench `b` gained the MS5837 PROM/CRC/conversion section, new bench
+  `w`. New suites `test/test_depth/` (6), `test/test_ms5837/` (5, incl. verbatim DS-CRC and
+  BlueRobotics `br_pressure` discriminator copies), `test/test_power/` (4) — **`pio test -e
+  native` is 117 cases green across 11 suites**; `pio run -e esp32` 503,509 B flash (32.0%),
+  64,112 B RAM (19.6%), flashed and running.
+  **Decision 38 — the correction:** writing `Depth.h` forced the record's "BMP085 fallback
+  saturates ~9 m" claim (risk 1, §2, decision 7 — repeated in the M3 row and boot banners for
+  a day) to be multiplied out, and it was **10x wrong**: 1100 mbar abs − ~1013 mbar surface =
+  ~87 mbar gauge ≈ **0.86 m of water** (~1.2 m at the measured 977.9 mbar bench Psurf). "~9 m"
+  would need ~880 mbar gauge — the part's own 300–1100 hPa spec rules it out. Found by the
+  arithmetic the code had to do, not by any test. Fixed: the banner quotes a **computed**
+  ceiling with its reference (`clamps 0.9m SL1013mbar` pre-Psurf on the standard-atmosphere
+  reference, `clamps 1.2m@978mbar` after learning), `faultName` `BARO_RANGE_9M` →
+  `BARO_RANGE_CLAMP` (enum 13 stable), FaultCode/SensorIf/Bmp085 comments corrected, risk 1 +
+  decision 7 + §2 rewritten, `test/test_depth` pins the hydrostatics. **Risk 21's fourth
+  instance in four days** (phantom addresses, bench-intervention inference, wrong-city weather,
+  now a recited range figure): the rule that closes the class — *any number that gates
+  behaviour gets derived in code from primary-spec inputs and printed with its reference, never
+  recited.* Consequence stated plainly: **the fitted fallback is not a dive depth source; the
+  unprocured MS5837 is load-bearing, and M3's gate cannot close until one is fitted.**
+  **On-target capture (honest split between measured and written-not-measured):** boot learns
+  `Psurf 977.89 mbar (sigma 0.06 mbar over 16 samples) — depth = gauge x 9.948 m/bar (SG
+  1.025)`; report `ERROR BARO_RANGE_CLAMP x2 clamps 1.2m@978mbar`; `[arm] checklist: sensors
+  ok` unchanged; INA219 absent (`0x40 err 2`, honest ERROR). `b`: BMP180 driver 977.80→978.03
+  vs Adafruit library 978.07 mbar. `w`: "no INA219 at 0x40" plus the meter cross-check recipe.
+  **MS5837 and INA219: drivers written, natively pinned, NOT measured on parts** — those parts
+  are unprocured/unfitted, and every claim about them in §2 is datasheet-derived until the
+  arrival tests run (`b` PROM+timing+Stockholm mbar; `w` + meter).
+  `README.md` created per §15's must-contain list: safety statement, BOM, pin map, full wiring
+  (Bar30 DF13 colours, 7-bit 0x76/0x77 forms, the 1 MΩ/10 Ω/RC cell network, solenoid drive
+  stage), ten common wiring mistakes (including the address-arithmetic trap and the sub-1 m
+  fallback), power budget, valve selection table, maintenance (MS5837 24 h gel limit, annual
+  cells), and the 11-step pre-water bench procedure. `test_boot` updated for the rename; no
+  new fault codes (the Psurf no-lock case reuses `BARO_CONV_BAD` — gap list stays {27,29}).
