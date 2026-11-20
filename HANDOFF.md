@@ -2,8 +2,10 @@
 
 **Written:** 2026-11-19, after the headless dive simulator was written and run on real hardware.
 **Updated:** 2026-11-20 (late), after the M3 Bosch baro driver was **flashed and proven on the
-part** — and the acceptance capture opened a new part-level finding, absolute pressure out of
-spec (§5g, AGENTS.md §20 item 18).
+part** — and after the same capture's absolute-pressure cross-check was itself corrected the
+same day: the first reference was the wrong city's weather; against Stockholm's own stations the
+module is consistent with spec (§5g, AGENTS.md §20 item 18 closed). **Bench location, now a
+named fact: Stockholm, Sweden** (§6).
 **Purpose:** everything needed to continue this project on a different machine. `AGENTS.md` is still
 the binding design record (decisions §18, risks §19, milestones §16); this file holds the
 *machine-specific and hardware-measured* state that `AGENTS.md` does not, plus the immediate
@@ -32,8 +34,10 @@ on the same module plus a full cal-ROM dump, and `BARO_CONV_BAD = 26` (ERROR, bl
 flashes verified). Item 17's second half closed — driver 977.75/977.78 vs Adafruit library
 977.76 mbar on the same module, host hand recompute from the dumped words matches the on-target
 driver, and squeeze/port stimulus moves the reading while T tracks (§5g). The same capture
-**opened AGENTS.md item 18: the module reads ~27–39 hPa below the weather reference at a
-near-sea-level bench — arithmetic exonerated three ways, the offset is in the part.** Bench `v` runs the fixed 26-min profile **headless on the board**, closed
+**opened and closed AGENTS.md item 18 the same day: the first absolute cross-check used Cape
+Town weather — the wrong city; against Stockholm's own stations (SMHI 986.7 / Bromma 987 hPa)
+the module's 977.7 mbar is consistent with the DS absolute-accuracy window for the confirmed
+0–100 m elevation band.** Bench `v` runs the fixed 26-min profile **headless on the board**, closed
 loop through the real voter/gas/ZHL stack, mole-balanced against hand calculations (136 pulses /
 20.40 amb L, 2 pulses/min at the 30 m bottom — risk 20), SIM-stamped, ~30 s wall, worst tick
 **41.5 ms measured on-target** (risk 19 — this was the "hang" that turned out to be cost). M1's last
@@ -440,17 +444,18 @@ as `a`/`d`), at I2C0, after the fix:
   T=25.9 °C, 97786 Pa) reproducing the on-target driver — xtensa == host arithmetic on real
   words. Stimulus: finger-squeeze drove die temp 25.2→31.0 °C (B5 4034→4953) with the reading
   held inside ±0.4 mbar (temperature rejection works); pressing the port moved it coherently
-  (977.7→978.4). **But the capture opened item 18:** at a bench user-confirmed at 0–100 m, with
-  Cape Town sea-level pressure 1017 hPa that day (yr.no hourly 1017–1018, NOAA FCW corroborates),
-  the module reads **977.7 mbar — −27…−39 hPa**, 7–10x worse than the BMP180 DS's absolute
-  accuracy worst case ("−4.0 / −1.0* / +2.0 hPa, 300–1100 hPa, 0…+65 °C"). Arithmetic is
-  exonerated three ways (the agreements above), so the offset is in the part — trim, front end,
-  or an emulated-map die (CHIPID 0x55 necessary, not sufficient). Harmless for depth IF it is a
-  static offset (learned Psurf absorbs it; the ±0.12 hPa relative spec is corroborated by the
-  T-rejection data) — NOT harmless if it is ~3.8% gain. The closing test (item 18): trend
-  correlation against the published pressure curve over hours. And the lesson repeats one level
-  up: **the "~1013 mbar at the surface" expectation was itself never verified** — acceptance
-  against a nominal number is risk 21 again; use a measured local reference.
+  (977.7→978.4). **The capture also produced — and same-day corrected — item 18:** the first
+  absolute-pressure cross-check used **Cape Town** sea-level pressure (1017 hPa) — the wrong
+  city, an assumption; the bench is in **Stockholm, Sweden** (§6). Against same-morning local
+  stations (SMHI Stockholm-Observatoriekullen 986.7 hPa, Bromma SYNOP 987 hPa, NOAA ESSB
+  altimeter 984 hPa, older), the module's 977.7 mbar at the user-confirmed 0–100 m elevation
+  band implies **−9…+3 hPa** — consistent with the BMP180 absolute-accuracy window
+  ("−4.0 / −1.0* / +2.0 hPa") for a bench at ~40–90 m, and inside the references' own ±3 hPa
+  spread at Stockholm's typical 15–30 m. Item 18 closed; nothing indicts the part; the
+  offset-vs-gain alarm (3.8%) is void. Lesson stack, all risk 21: the "~1013 mbar at the
+  surface" expectation was never verified, and its replacement "anomaly" was computed against
+  weather for a city the bench is not in. **A pressure reference is a measurement with a place,
+  an hour and a source — state all three before calling anything an anomaly.**
 - **The MS5837 (0x76) is still not procured/fitted.** Its probe-table entry is datasheet-derived,
   not measured here. And 0x76/0x77 are shared with BMP280/BME280 (CSB strap), so an MS5837 at 0x76
   is confirmed by its PROM read, never by the ACK; one baro per I2C0 max.
@@ -460,6 +465,10 @@ as `a`/`d`), at I2C0, after the fix:
 
 ## 6. What is on the bench right now
 
+- **Bench location: Stockholm, Sweden** (user, 2026-11-20), ground elevation inside the
+  user-confirmed 0–100 m band. Any weather cross-check uses local stations — SMHI
+  Stockholm-Observatoriekullen (986.7 hPa on 2026-11-20 04:00), Stockholm/Bromma SYNOP
+  (987 hPa), ESSB METAR — never a city picked by assumption (item 18's lesson).
 - ESP32 Doit devkit V3 over USB. **Wired: two ADS1115 modules on I2C1 — 0x48 (ADDR->GND) and 0x49
   (ADDR->VDD), both VDD 3.3 / SDA 18 / SCL 19 — one SSD1306 and one Adafruit BMP085 (BMP180 die,
   0x77, §5g) on I2C0.** These two ADC
@@ -473,7 +482,8 @@ as `a`/`d`), at I2C0, after the fix:
   uploads verified ("Hash of data verified"). Boot now prints a real conversion line:
   `BARO @0x77 BMP180: 977.72 mbar  25.2 C  (UT=28474 UP=162080 B5=4034 oss=2) — fallback, 9 m
   clamp`, with no `BARO_CONV_BAD`. (977.7, not the ~1013 previously assumed here — that nominal
-  expectation was never verified; the measured station-vs-reference discrepancy is item 18.)
+  expectation was never verified; and the item-18 "anomaly" computed against it was a wrong-city
+  reference, corrected the same day — Stockholm's own SLP is 984–987 hPa, see §5g.)
   Captured boot output with exactly the above fitted, verbatim:
 
 ```
@@ -579,9 +589,10 @@ measured — 7.2 SPS/cell achieved, sized from the boot-measured period, interlo
    shows driver 977.75/977.78 vs Adafruit library 977.76 mbar (0.02 mbar, same °C), and the
    squeeze/port tests move the reading while T tracks 25.2→31.0 °C inside ±0.4 mbar. Numbers
    recorded in AGENTS.md §2 and §5g — **item 17's second half closed**. The "~1013 mbar"
-   criterion was the wrong expectation (never verified against a local reference); the module
-   reads −27…−39 hPa below today's Cape Town sea-level pressure — **new AGENTS.md item 18**,
-   with the trend-correlation test that discriminates offset-vs-gain.
+   criterion was the wrong expectation (never verified against a local reference), and its
+   replacement was wrong too — Cape Town weather, the wrong city. Against Stockholm stations
+   (SLP 984–987 hPa) the module is consistent with the DS accuracy window: **item 18 opened
+   and closed the same day** (§5g).
 1. **Order 2x Adafruit ADS1115 breakout #1085** (AGENTS.md decision 31, procurement named by
    decision 35 — an outstanding action, not a question; **both** fitted modules measure as clones, so
    that is two boards). Fit: VIN+GND from the 3.3 V rail (never the A+/A- rails — those are the
@@ -668,13 +679,13 @@ mistake).
   written** (`BaroBosch.h` + `Bmp085.h` + `checkBaro()`, decision 37) and pinned by `test/test_baro/`;
   its **second half — the proving conversion on the part** is now closed too (bench `b`: driver
   977.75/977.78 vs library 977.76 mbar, hand recompute matching, squeeze/port stimulus moving the
-  reading, T tracking — §5g). Item 17 is fully closed. What it opened instead: **open item 18
-  (AGENTS.md) — the module's absolute pressure reads −27…−39 hPa below the weather reference at
-  a near-sea-level bench, 7–10x the DS absolute-accuracy spec.** Arithmetic exonerated three ways;
-  the offset is in the part. Harmless for depth if it is a static offset (learned Psurf absorbs
-  it), not harmless if gain (≈3.8% → ~0.4 m at 10 m). Closing test: module delta vs the published
-  pressure trend over hours. MS5837 procurement is now more load-bearing. What remains genuinely
-  open on the baro: the MS5837 (0x76) is unprocured, so that half of the table is
+  reading, T tracking — §5g). Item 17 is fully closed. Item 18 (the module's absolute pressure
+  "7–10x out of spec") **opened and closed the same day — wrong-city reference**: the check used
+  Cape Town weather; the bench is in Stockholm (now a named fact, §6). Against SMHI/Bromma
+  (SLP 984–987 hPa) the module's 977.7 mbar is consistent with the DS absolute-accuracy window
+  for the confirmed 0–100 m band, and the offset-vs-gain concern is void. Lesson kept: a
+  pressure reference has a place, an hour and a source — state all three. What remains
+  genuinely open on the baro: the MS5837 (0x76) is unprocured, so that half of the table is
   datasheet-derived and unmeasured here.
 - **Open item 16 is closed** (§6): the `err 5` / `SDA held low` boot was the module being unplugged by
   hand, not a fault. No action. The `2`-vs-`5` reading is still worth knowing.

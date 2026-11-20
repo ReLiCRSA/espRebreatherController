@@ -12,9 +12,11 @@
 // algorithm still comes from hardware: bench 'b' must show a real local-station mbar that moves
 // when the port is stimulated, and agreement with the Adafruit library on the same physical
 // module. (Captured 2026-11-20: agreement 0.02 mbar, stimulus proven, hand recompute from the
-// dumped words matches the on-target driver. The absolute value read 977.7 mbar at a near-sea-
-// level bench against a 1017 hPa weather reference — an open part-level finding, AGENTS.md
-// §20 item 18 — so ~1013 was the wrong expectation to state here; arithmetic is exonerated.)
+// dumped words matches the on-target driver. The absolute value read 977.7 mbar, consistent
+// with Stockholm-area SLP 984-987 hPa for the bench elevation band once the cross-check used
+// the right city — AGENTS.md §20 item 18, opened and closed the same day. So ~1013 was the
+// wrong expectation to state here; arithmetic is exonerated, and any future cross-check needs
+// a reference with a named place, hour and source.)
 #include "BaroBosch.h"
 #include "unity.h"
 

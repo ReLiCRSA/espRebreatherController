@@ -166,21 +166,22 @@ the Adafruit product page and the Adafruit 4-Channel ADC Breakouts guide (2026-1
   reading stayed inside ±0.4 mbar — the compensation rejects temperature; pressing the port
   moved it coherently (977.7→978.4). This closes item 17's second half (conversion behaviour
   proven on the die).
-- **Open finding (item 18): the module's absolute pressure is far out of spec.** The bench is at
-  0–100 m elevation (user-confirmed) and today's Cape Town sea-level pressure is **1017 hPa**
-  (yr.no hourly 1017–1018, NOAA FCW corroborates) — expected station pressure 1005–1017 hPa,
-  measured **977.7 mbar**, reproduced to ±0.2 mbar across three `b` captures and two USB
-  sessions. The BMP180 DS's own table: "Absolute accuracy pressure VDD = 3.3V 300 . . . 1100 hPa
-  0 . . . +65 °C **-4.0** -1.0* +2.0 hPa" (Min/Typ/Max) — the offset is 7–10x worse than the
-  worst case. Arithmetic is ruled out three ways (driver, deployed library, hand recompute all
-  agree to 0.1 mbar on the same words), so the error is **in the part**: its trim, its analog
-  front end, or a die emulating the BMP180 map — CHIPID 0x55 is necessary, not sufficient
-  (decision 36's lesson inverted: an emulated fingerprint is possible even when the map works).
-  Design impact is bounded because depth uses **learned Psurf** + relative accuracy (DS:
-  "Relative accuracy 950 . . . 1050 hPa @25 °C ±0.12 hPa ±1.0 m"), and the 900–1100 mbar
-  air-cal gate passes at 977.7; what is **not** yet discriminated is offset (harmless under
-  learned Psurf) vs ~3.8% gain error (~0.4 m depth error at 10 m). Item 18 holds the trend test
-  that discriminates them, and this makes the MS5837 primary procurement more load-bearing.
+- **Absolute-pressure cross-check (item 18 — CLOSED the same day: the anomaly was a
+  wrong-city reference).** Bench location is now a named fact: **Stockholm, Sweden**, ground
+  elevation inside the user-confirmed 0–100 m band. Same-morning Stockholm-area sea-level
+  pressure: SMHI Stockholm-Observatoriekullen **986.7 hPa** (04:00), Stockholm/Bromma SYNOP
+  **987 hPa** (hourly), NOAA ESSB altimeter 984 hPa (older obs) — SLP ≈ 984–987 hPa. The
+  module's **977.7 mbar** (reproduced ±0.2 across three captures) then implies an absolute
+  offset of **−9…+3 hPa across the elevation band** (DS: 1 hPa ≈ 8.43 m) — consistent with the
+  DS absolute-accuracy window "Absolute accuracy pressure VDD = 3.3V 300 . . . 1100 hPa
+  0 . . . +65 °C -4.0 / -1.0* / +2.0 hPa" for a bench at ~40–90 m, and inside the references'
+  own ±3 hPa spread even at Stockholm's typical 15–30 m. Nothing indicts the part. The earlier
+  "−27…−39 hPa, 7–10x out of spec" finding was computed against **Cape Town** weather — the
+  wrong city, assumed, never verified: risk 21's third instance. Relative accuracy is
+  corroborated independently (±0.4 mbar across a 5.8 °C die rise), depth is unaffected either
+  way (learned Psurf), and the 900–1100 mbar air-cal gate passes at 977.7. Absolute accuracy
+  is not certifiable tighter than ~±3 hPa without the exact bench elevation plus a same-hour
+  station reference — only needed if that claim is ever wanted, not for the dive path.
 - Depth = `(Pamb - Psurf) * k`; `Psurf` is **learned at boot** (only relative accuracy matters,
   +/-2 mbar ~ 2 cm, not the +/-200 mbar absolute spec). Salinity configurable (fresh 1.000,
   salt 1.025). Learned Psurf also gates air calibration.
@@ -807,9 +808,10 @@ the part** — the USB dropout cleared by itself (port reappeared; two flashes v
 as a fact, no defect inferred, item 16's lesson). The acceptance conversion is captured §2:
 driver-vs-Adafruit-library agreement 0.02 mbar, stimulus response proven, hand recompute of the
 dumped words matches the on-target driver — item 17's second half **closed**. The same capture
-**opened item 18: the module reads ~27–39 hPa below the weather reference at a near-sea-level
-bench, 7–10x the DS absolute-accuracy worst case — a part-level offset, arithmetic exonerated
-three ways.** The ADC/pin claims below were captured on the pre-M3 image; nothing in M3 touches
+**item 18 opened and closed the same day: the first absolute cross-check used Cape Town weather
+— the wrong city; against Stockholm's own stations (SMHI 986.7 / Bromma 987 hPa SLP) the
+module's 977.7 mbar is consistent with the DS absolute-accuracy window for the confirmed
+0–100 m elevation band.** The ADC/pin claims below were captured on the pre-M3 image; nothing in M3 touches
 them, and the baro numbers are from the current image.** The
 positive-ACK caveat that M0 left open is closed: `I2C1: 2 device(s) [0x48 0x49]`,
 `I2C0: 2 device(s) [0x77 0x3C]`, and the corresponding faults clear while the missing ones stay
@@ -912,7 +914,7 @@ corrupt cal ROM refused before any arithmetic (`converted=false`, no divide-by-z
 | M0 | installer, build, flash, I2C scan, boot report | `pio run -t upload` works on this Mac | **DONE** — flashed and verified on the devkit (CP2102, ESP32-D0WD-V3): "Hash of data verified", clean boot banner, boot report correct on an empty bench, `[arm] REFUSED`. Section 15 holds the evidence. |
 | M1 | **Simulator + bench mode + boot fault report**; 2x ADS1115 driver with alternating mux | boots with zero sensors and reports every miss; sim profile runs headless | **DONE (2026-11-19).** Boot/bench and the simulator were verified earlier; the last open item, the **alternating-mux scheduler**, is now implemented and measured: `AdcPairWalker` in `src/sensors/Ads1115Bus` — non-blocking pair-step state machine, sized from the boot-measured conversion period (never the datasheet), polled OS bit at 10 ms cadence (DRDY still unwired, open item 14), I2C-error backoff, and a coil/ADC interlock window carried per converter. Bench `t` measures it: **7.2 SPS per cell achieved** on the fitted clones (design 16, clone-sized 8), in-walk periods 65.5-67.1 ms, interlock busy duty **95-96%** → decision 34: M5 must carve explicit pulse slots. `lib/sim` runs the fixed 26-min profile headless on the board (bench `v`) at hand-computed pulse demand; **94 native cases green** in seven suites. Open item 13's outstanding action (order two Adafruit #1085 breakouts — decision 35 — and re-run `d`/`a`/`t`) stands — the walker re-sizes itself from the new parts' own measurement at boot. |
 | M2 | air cal + voting + diluent-flush check + alarms | native voting tests pass | voting + diluent-flush + cal sigma gate done natively; on-device wiring not started |
-| M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds **0x76/0x77** (datasheet 7-bit forms, decision 36 — the old 0x3E/0x3B were phantoms) and raises `BARO_RANGE_9M` when only the BMP085 answers — **measured on the bench 2026-11-20: the fitted Adafruit BMP085 is found at 0x77 and `BARO_RANGE_9M depth clamps 9 m` fires**. **BMP085 driver now written** (2026-11-20): `lib/core/src/BaroBosch.h` (register map + cal-ROM rule + compensation, pinned by 8 native cases in `test/test_baro/`) + `src/sensors/Bmp085.h` + `checkBaro()` active identity check + bench `b` extended with a live conversion, a full cal-ROM dump, and an Adafruit-library cross-check — **flashed and proven on the part 2026-11-20**: boot prints `BARO @0x77 BMP180: 977.72 mbar 25.2 C (UT=28474 UP=162080 B5=4034 oss=2)` with no `BARO_CONV_BAD`; `b`: driver 977.75/977.78 vs library 977.76 mbar (0.02 mbar), hand recompute from the dumped words reproduces the on-target arithmetic, squeeze/port stimulus moves the reading and T tracks — **item 17's second half closed**. The capture also raised **item 18: absolute pressure −27…−39 hPa vs the weather reference at a near-sea-level bench, ~7–10x the DS absolute-accuracy spec; arithmetic ruled out three ways, the offset is in the part**. M3's remaining work: `Ms5837` driver (waits for the part — item 18 makes it more load-bearing; PROM read confirms identity), `Depth` (learned Psurf, salinity, 9 m clamp), `Ina219`, README wiring |
+| M3 | `Barometer` iface + MS5837 + BMP085 fallback + learned Psurf + README wiring | fallback verified by removing the MS5837 | presence probe finds **0x76/0x77** (datasheet 7-bit forms, decision 36 — the old 0x3E/0x3B were phantoms) and raises `BARO_RANGE_9M` when only the BMP085 answers — **measured on the bench 2026-11-20: the fitted Adafruit BMP085 is found at 0x77 and `BARO_RANGE_9M depth clamps 9 m` fires**. **BMP085 driver now written** (2026-11-20): `lib/core/src/BaroBosch.h` (register map + cal-ROM rule + compensation, pinned by 8 native cases in `test/test_baro/`) + `src/sensors/Bmp085.h` + `checkBaro()` active identity check + bench `b` extended with a live conversion, a full cal-ROM dump, and an Adafruit-library cross-check — **flashed and proven on the part 2026-11-20**: boot prints `BARO @0x77 BMP180: 977.72 mbar 25.2 C (UT=28474 UP=162080 B5=4034 oss=2)` with no `BARO_CONV_BAD`; `b`: driver 977.75/977.78 vs library 977.76 mbar (0.02 mbar), hand recompute from the dumped words reproduces the on-target arithmetic, squeeze/port stimulus moves the reading and T tracks — **item 17's second half closed**. It also raised **item 18 — closed the same day: the "−27…−39 hPa out of spec" anomaly was a wrong-city reference (Cape Town weather; bench in Stockholm); against SMHI/Bromma (SLP 984–987 hPa) the module's absolute reading is consistent with the DS accuracy window**. M3's remaining work: `Ms5837` driver (waits for the part; PROM read confirms identity), `Depth` (learned Psurf, salinity, 9 m clamp), `Ina219`, README wiring |
 | M4 | ZHL-16C 3-gas + GF + ICD + CNS + MOD/END/density | validated natively **before** hardware depends on it | **engine complete and regression-anchored natively** (47 cases); *not* validated against a trusted computer yet — risk 13 |
 | M5 | pulse-driven solenoid + click verification + breathing-state machine + bailout | three-way solenoid fault taxonomy + ADC-window interlock | not started |
 | M6 | web + WS + settings + cal UI + dive-log graphs | phone on SoftAP, all tabs, offline graphs render | not started (deps resolve and compile) |
@@ -1097,7 +1099,11 @@ Re-open only with the user's explicit agreement.
     alone — a sweep is what shows a device at an address the table forgot; and remember 0x76/0x77
     are shared with BMP280/BME280, so at these two addresses presence never proves identity — the
     PROM read (MS5837) or a real conversion (Bosch) does. "Presence is not identity" cuts both
-    ways: **identity is also not a comparison against an unverified expectation.**
+    ways: **identity is also not a comparison against an unverified expectation.** Third instance
+    (2026-11-20, item 18): the yardstick was the weather of the **wrong city** — the bench is in
+    Stockholm and the cross-check used Cape Town's pressure, nearly condemning a good BMP180.
+    A barometric reference is itself a measurement, with a **place, an hour, and a source —
+    state all three before calling any reading an anomaly.**
 
 ---
 
@@ -1122,7 +1128,7 @@ Re-open only with the user's explicit agreement.
 | 15 | **Display panel vs the pin budget** (new, from closing item 12): a SPI panel needs four pads (SCK/MOSI/DC/CS) and after the current map **only GPIO 17 is spare and output-capable** | The core's own SPI defaults (18/19/23) collide with I2C1 and ADS_U1_DRDY, so a panel cannot simply take `SPI.begin()` defaults. Options, none free: free the two DRDY pads by polling the OS bit instead (costs 348 us/poll and an exact interlock, item 14), take strapping pins against the §3 policy, or keep the panel on I2C and accept the frame-time cost (§12 says a >128x64 panel must not go on I2C). Must be argued with item 6 when the panel is chosen — not during bring-up at the water. |
 | 16 | **The ADS1115 module stopped answering on I2C1** (`SDA held low before init`, probes returning **err 5 = timeout**, nine clocks + port re-init did not free it) | **CLOSED 2026-11-19 — not a fault.** The user confirms the dropouts were **their own intervention on the bench** (the module being unplugged/re-fitted), not a flaky connection. Nothing to fix and no maintenance action. What the episode is kept for is the diagnostic it produced: `err 5` (bus being held) vs `err 2` (address unanswered) are different hardware stories, and **a converter that has lost its supply clamps SDA/SCL through its protection diodes** — that is exactly what a disconnected or unpowered module looks like, and exactly what a converter failing mid-dive will look like in the log. Securing jumpers for the dive build stays good practice (§20 item 9, enclosure/connector work), but it is not a corrective action for anything seen so far. |
 | 17 | **"The fitted BMP085 is a Bosch-family clone" (ACKs 0x77, silent 0x3B; `0xD1=0x02` not 0x43, AC1=8604 not 7295) — recorded 2026-11-20 by bench `b`** | **CLOSED 2026-11-20 — misdiagnosis, the module is fine.** All three "disagreements" were the *report's* errors, not the part's: 0x3B was a phantom produced by halving the datasheet's 0x77 (Bosch DS Table 7: bits `1110111`+R/W = 7-bit **0x77**, which is where the module correctly answers); 0xD1 is undefined in the BMP180 datasheet, so its readback 0x02 proves nothing (0x43 is BMP085-only); the 0xAA–0xBF cal block is per-chip factory trim, 8604 is normal, 7295 is the DS's worked example. The module is an Adafruit BMP085 (BMP180 die) behaving exactly as specified. The real defect was in the probe table — fixed to 0x76/0x77 (decision 36), and boot now finds it: `I2C0: [0x77 0x3C]`, `BARO_RANGE_9M depth clamps 9 m`, correct fallback behaviour. The fallback part question is therefore **resolved: the fitted module is the fallback**. What stays open in miniature: the MS5837 (0x76) is still unprocured/unfitted, so its side of the table is datasheet-derived until one is measured; and the BMP180's conversion behaviour is trusted only once `Bmp085.cpp` makes it produce a real, sane pressure (identity by register reads is necessary, not sufficient). |
-| 18 | **The fitted BMP180's absolute pressure is far out of spec**: it reads 977.7 mbar at a bench user-confirmed at 0–100 m elevation, while Cape Town sea-level pressure that day is 1017 hPa (yr.no hourly 1017–1018; NOAA FCW corroborates) — an offset of **−27…−39 hPa** against the DS's own "Absolute accuracy pressure VDD = 3.3V 300 . . . 1100 hPa 0 . . . +65 °C −4.0 / −1.0* / +2.0 hPa". Reproduced to ±0.2 mbar across three `b` captures and two USB sessions | **OPEN, diagnosed as far as the evidence goes.** Arithmetic is exonerated three ways — firmware driver, deployed Adafruit library on the same module, and a host hand recompute from the dumped cal ROM + raw wire words all agree within 0.1 mbar — so the offset lives in the part: its trim (all 11 words dumped and sane against the DS validity rule), its analog front end, or a die wearing an emulated BMP180 map (CHIPID 0x55 is necessary, not sufficient — decision 36 inverted). The T channel is sane (25.2–25.9 °C at rest, tracks to 31.0 under a finger; ±0.4 mbar rejection across a 5.8 °C die rise) and port-press moves it coherently, so it is measuring. **Design impact bounded:** depth uses learned `Psurf`, so a pure static offset is invisible to depth (the ±0.12 hPa relative spec is what matters, corroborated by the T-rejection data), and the 900–1100 mbar air-cal gate passes at 977.7. **Not yet discriminated:** pure offset (harmless) vs ~3.8% gain error (~0.4 m depth error at 10 m, ~1.9 m at 50 m). Closing test: trend correlation — module delta vs the published pressure trend over hours (that day's yr.no curve: 1018→1014); Δmodule ≈ Δreference ⇒ gain ≈ 1, offset-only. Actions: this **elevates MS5837 procurement** (0–30 bar, PROM-confirmed identity; the fallback's absolute channel is untrusted until quantified); cross-compare against a second known-good barometer if one is handy; do **not** firmware-compensate an unquantified offset — learned `Psurf` already absorbs whatever is static. |
+| 18 | **Apparent absolute-pressure defect in the fitted BMP180**: it reads 977.7 mbar at a bench user-confirmed at 0–100 m elevation, cross-checked — in error — against a 1017 hPa sea-level reference, giving an apparent **−27…−39 hPa** offset vs the DS's "Absolute accuracy pressure VDD = 3.3V 300 . . . 1100 hPa 0 . . . +65 °C −4.0 / −1.0* / +2.0 hPa". Module reading reproduced to ±0.2 mbar across three `b` captures and two USB sessions | **CLOSED 2026-11-20 — misdiagnosis; the defect was in the reference, not the part.** The 1017 hPa figure was **Cape Town** weather; the bench is in **Stockholm, Sweden** — now a named fact (HANDOFF §6), and the location assumption was never in the record. Same-morning Stockholm stations: SMHI Observatoriekullen **986.7 hPa**, Bromma SYNOP **987 hPa**, NOAA ESSB altimeter 984 hPa (older) ⇒ SLP 984–987. Module 977.7 mbar at a 0–100 m bench ⇒ implied offset **−9…+3 hPa** (DS: 1 hPa ≈ 8.43 m), consistent with the DS accuracy window for elevations ≈40–90 m and within the references' own ±3 hPa spread at Stockholm's typical 15–30 m. Every module measurement in the original entry stands — the yardstick did not. The offset-vs-gain alarm (3.8%) is void: worst implied error across the band is ≤0.9%. MS5837 procurement returns to normal priority (still the primary, still unprocured). Residual, optional: absolute accuracy is not certifiable tighter than ~±3 hPa without exact bench elevation + same-hour station reference, or a trend correlation (module delta vs station delta over hours) — needed only if that claim is ever wanted; the dive path is covered by learned `Psurf` + the independently corroborated relative behaviour (§2). |
 
 ---
 
@@ -1564,3 +1570,22 @@ Re-open only with the user's explicit agreement.
   passes at 977.7; offset-vs-gain is discriminated by a trend correlation the item spells out.
   The MS5837 primary procurement is now more load-bearing. `pio test -e native` re-run:
   **102 green**. Code + docs committed.
+
+- 2026-11-20 (correction, logged because the wrong yardstick has now bitten three times):
+  **item 18 was a wrong-city reference, not a part defect — the entry above stands as history,
+  the finding in it does not.** The −27…−39 hPa anomaly was computed against Cape Town sea-level
+  pressure (1017 hPa) — an assumption; the user's bench is in **Stockholm, Sweden** (elevation
+  band 0–100 m as previously confirmed). Same-morning local stations: SMHI
+  Stockholm-Observatoriekullen **986.7 hPa** (04:00), Stockholm/Bromma SYNOP **987 hPa** (hourly
+  through the capture window), NOAA ESSB altimeter 984 hPa (older obs). Against SLP 984–987,
+  the module's 977.7 mbar implies **−9…+3 hPa across the elevation band** — consistent with the
+  BMP180 absolute-accuracy window (−4.0/−1.0/+2.0) at bench elevations ≈40–90 m, and inside the
+  references' own spread at Stockholm's typical 15–30 m. Nothing indicts the part; the
+  offset-vs-gain concern is void (≤0.9% worst implied). Item 18 closed with its resolution;
+  MS5837 procurement back to normal priority. **Bench location is now a named fact in the
+  record** (HANDOFF §6): any future weather cross-check uses the local stations above, never a
+  city picked by assumption. The pattern (risk 21, third instance in two days): phantom I2C
+  addresses from arithmetic, a bench-intervention inference, and now weather from the wrong
+  city — **a reference is a measurement with a place, an hour and a source; write all three
+  down before calling anything an anomaly.** Docs-only correction; `pio test -e native`
+  unchanged at 102 green.
