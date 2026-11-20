@@ -68,10 +68,13 @@ void test_severity_only_escalates() {
 }
 
 void test_bmp085_fallback_marks_the_depth_ceiling() {
-    // Risk 1: the fallback baro saturates near 9 m and that must be visible, never inferred.
+    // Risk 1: the fallback baro saturates at its 1.1 bar absolute limit — under 1 m of water at
+    // sea level, ~1.2 m at the Stockholm bench (decision 38 corrected the "9 m" claim 10x over) —
+    // and the clamp must be visible, never inferred. The detail is what the firmware computes at
+    // runtime from depth::ceilingMeters(); this test pins one instance of that string shape.
     boot::Report r;
-    r.raise(FaultCode::BARO_RANGE, Severity::ERROR, T0, "depth clamps 9 m");
-    TEST_ASSERT_EQUAL_STRING("BARO_RANGE_9M", faultName(FaultCode::BARO_RANGE));
+    r.raise(FaultCode::BARO_RANGE, Severity::ERROR, T0, "clamps 1.2m@978mbar");
+    TEST_ASSERT_EQUAL_STRING("BARO_RANGE_CLAMP", faultName(FaultCode::BARO_RANGE));
     TEST_ASSERT_TRUE(r.active(FaultCode::BARO_RANGE));
 }
 

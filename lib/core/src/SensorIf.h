@@ -49,7 +49,8 @@ class Barometer {
 
     // Largest absolute pressure this sensor can actually measure, bar. The firmware clamps
     // depth-dependent logic at this value and never extrapolates past it — AGENTS.md 19 risk 1,
-    // because the BMP085 fallback saturates at ~1.1 bar (~9 m) and a computer that extrapolates
+    // because the BMP085 fallback saturates at ~1.1 bar (<1 m of water — decision 38 corrected
+    // the record's "~9 m", 10x too generous) and a computer that extrapolates
     // through that wall reports a depth that does not exist. 0 means "no ceiling to report".
     virtual float rangeCeilingBar() const { return 0.0f; }
 

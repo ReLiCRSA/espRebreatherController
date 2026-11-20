@@ -27,6 +27,8 @@
 #include "sensors/Ads1115Bus.h"
 #include "sensors/BusProbe.h"
 #include "sensors/Bmp085.h"
+#include "sensors/Ina219.h"
+#include "sensors/Ms5837.h"
 
 // Bench path only ('b'): the field-deployed Adafruit implementation of the same Bosch API, used
 // as a second compensation implementation cross-checking lib/core/src/BaroBosch.h on the same
@@ -35,6 +37,7 @@
 
 // lib/core is a library directory, so these resolve from lib/core/src.
 #include "BootReport.h"
+#include "Depth.h"  // learned Psurf, salinity, computed range clamp (M3; pinned by test_depth)
 
 // lib/sim is also a library directory. The headless bench run ('v') drives the same sim stack
 // the native test suite exercises (AGENTS.md 11, M1 gate: "sim profile runs headless"); it is
@@ -80,11 +83,27 @@ sensors::Ads1115 g_ads2(Wire1, 0x49, pins::ADS_U2_DRDY);
 sensors::Ads1115* g_adcs[] = {&g_ads1, &g_ads2};
 constexpr size_t kAdcCount = sizeof(g_adcs) / sizeof(g_adcs[0]);
 
-// The fallback baro gets a real driver object too, for the same reason (checkBaro below): the
-// presence table answers "is 0x77 answered", not "does the part there measure pressure". The
-// MS5837 driver waits for the part — its side of the address table stays datasheet-derived
-// until one is fitted and its PROM read confirms identity (risk 21).
+// Every sensor-class address gets a real driver object, for the same reason (checkBaro/checkPower
+// below): the presence table answers "is this address answered", not "does the part there do what
+// its label claims" (risk 21). The MS5837 driver and its PROM/CRC math are written and natively
+// pinned (test_ms5837), but the PART is unprocured as of 2026-11-20 — its side of the address
+// table stays datasheet-derived until a Bar30 is fitted and bench 'b' measures its PROM, its
+// conversion period at the design OSR, and a Stockholm-station mbar (decision 29's rule).
 sensors::Bmp085 g_bmp085(Wire, 0x77, /*oss=*/2);
+sensors::Ms5837 g_ms5837(Wire, ms5837::kAddr7);   // 7-bit form straight from the DS (decision 36)
+sensors::Ina219 g_ina219(Wire, pwr::kAddr7);
+
+// Which barometer the dive path will actually use, established by ACTIVE checks at boot and on
+// presence transitions — never by which address ACKed (0x76/0x77 are shared with BMP280/BME280,
+// decision 36). Null until a part passes identity + a real conversion.
+Barometer* g_activeBaro = nullptr;
+
+// Psurf is LEARNED at the surface (AGENTS.md 2), from the fitted barometer itself: a hard-coded
+// 1013.25 mbar is the wrong-city-reference error class (risk 21). Locked by learnSurface() at
+// boot; the dive path (M4+) reads g_psurfBar only when locked.
+depth::SurfaceLearner g_psurf;
+float g_psurfBar = 0.0f;
+float g_salinity = 1.025f;  // placeholder until RuntimeConfig (M6); salt default
 
 // The alternating-mux pair walkers (AGENTS.md 2): U1 walks cell 1 (AIN0/1) -> cell 2 (AIN2/3),
 // U2 walks cell 3 (AIN0/1) -> coil shunt (AIN2/3). The coil slot reads a floating input until
@@ -123,6 +142,34 @@ bool busUp(TwoWire* w) {
     return false;
 }
 
+// The BARO_RANGE banner quotes a COMPUTED ceiling, never a recited one (decision 38: the record's
+// "~9 m" for the BMP180 fallback was 10x wrong — 1.1 bar abs minus ~1.013 bar surface is ~87 mbar
+// gauge, and 1 mbar supports ~1.02 cm of water, so the real figure is UNDER 1 m at sea level,
+// ~1.2 m at the 978 mbar Stockholm bench; test_depth pins the arithmetic). Before Psurf is
+// learned there is no measured reference, so the banner says so and uses standard atmosphere —
+// flagged "SL ref", because a reference is a measurement with a source (risk 21).
+//
+// The < 50 m gate is a stated design heuristic, not a datasheet number: the design's primary
+// covers ~288 m, and any fitted part whose water column tops out below 50 m is fallback-class
+// and must wear the banner. The banner is ERROR-class and does NOT block arming (AGENTS.md 13 —
+// the gate is "arm shallow or not at all"); what blocks is BARO_CONV_BAD, raised separately.
+float baroRangeBanner(char* detail, size_t cap) {
+    if (!g_activeBaro) return -1.0f;
+    const bool havePsurf = g_psurf.locked();
+    const float refPsurf = havePsurf ? g_psurfBar : 1.01325f;
+    const float ceilM = depth::ceilingMeters(refPsurf, g_activeBaro->rangeCeilingBar(), g_salinity);
+    if (ceilM >= 50.0f) return ceilM;  // full-range part: no banner owed
+    snprintf(detail, cap, "clamps %.1fm%s%.0fmbar", ceilM, havePsurf ? "@" : " SL",
+                             refPsurf * 1000.0f);
+    return ceilM;
+}
+
+void raiseRangeBanner() {
+    char detail[32];
+    if (baroRangeBanner(detail, sizeof(detail)) >= 0.0f)
+        g_faults.raise(FaultCode::BARO_RANGE, Severity::ERROR, millis(), detail);
+}
+
 void probeDevices() {
     for (DevSpec& d : g_devices) {
         if (!busUp(d.bus)) {
@@ -143,20 +190,26 @@ void probeDevices() {
         }
     }
 
-    // Baro selection: MS5837 primary; BMP085 only arms with a permanent 9 m clamp banner.
+    // Baro selection. Identity, never ACK: 0x76 counts as the MS5837 primary only after
+// checkBaro()'s PROM+CRC+conversion chain verified it (BMP280/BME280 squat at 0x76/0x77 —
+// decision 36 — and the deployed-library note says the MS5637 shares 0x76 and passes CRC).
+// A 0x76 part that ACKs but fails identity while the BMP180 works gets BOTH banners: the range
+// clamp for the fallback in use, and BARO_CONV_BAD for the squatter, which blocks arming until
+// it is replaced. This runs before checkBaro() at boot, so the identity flag may be from the
+// last transition — checkBaro() re-derives everything and re-raises the banner after.
     bool ms5837 = false, bmp085 = false;
     for (const DevSpec& d : g_devices) {
         if (d.code != FaultCode::BARO || !d.present) continue;
-        if (d.addr == 0x76) ms5837 = true;
+        if (d.addr == ms5837::kAddr7 && g_ms5837.identityVerified()) ms5837 = true;
         if (d.addr == 0x77) bmp085 = true;
     }
     if (ms5837) {
-        // Either the MS5837 answered at boot, or it hot-plugged later: in both cases the
+        // Either the MS5837 was verified at boot, or it hot-plugged later: in both cases the
         // fallback clamp no longer applies.
         g_faults.clear(FaultCode::BARO_RANGE, millis());
         g_faults.clear(FaultCode::BARO, millis());
     } else if (bmp085) {
-        g_faults.raise(FaultCode::BARO_RANGE, Severity::ERROR, millis(), "depth clamps 9 m");
+        raiseRangeBanner();  // computed ceiling in the detail, never a recited figure
         g_faults.clear(FaultCode::BARO, millis());
     } else {
         g_faults.raise(FaultCode::BARO, Severity::ERROR, millis(), "no MS5837/BMP085");
@@ -259,52 +312,200 @@ void checkAdcs() {
 }
 
 // Presence is not identity, and this applies at the depth sensor as hard as at the ADCs (risk 21).
-// The boot probe says 0x77 is answered; this says whether the part there reads a usable cal ROM
-// (the DS's own 0/0xFFFF rule), converts, and lands inside its own 300-1100 hPa range. It writes
-// ctrl_meas, so it runs at boot and on a presence transition — not on every 5 s re-probe. The
-// first real conversion of the bench BMP180 is what closes AGENTS.md 20 item 17's second half:
-// register reads were necessary, not sufficient.
-void checkBaro() {
-    bool bmp085 = false;
-    for (const DevSpec& d : g_devices)
-        if (d.code == FaultCode::BARO && d.addr == 0x77 && d.present && busUp(&Wire)) bmp085 = true;
-    if (!bmp085) {  // BARO covers absence; nothing for this check to say
-        g_faults.clear(FaultCode::BARO_CONV_BAD, millis());
-        return;
-    }
-
+// The boot probe says an address is answered; this says whether the part there IS what it claims
+// and MEASURES. MS5837 is tried first — identity = factory PROM read + CRC-4 verify + C1 band
+// classification + one real D1/D2 pair landing in the surface window (900-1100 mbar, the same
+// window as the air-cal gate, AGENTS.md 6). An ACKing 0x76 that fails any of that is a squatter
+// (BMP280/BME280 class, decision 36) or a dead PROM: BARO_CONV_BAD, ERROR, blocks arming —
+// "something answers at the primary address" is not a depth source.
+// BMP180 fallback: CHIPID + cal ROM + one real conversion (the chain that closed item 17). Both
+// paths write commands, so this runs at boot and on presence transitions only — never on the 5 s
+// re-probe. The 02BA classification is reported and refused for the dive path (a 2-bar die is a
+// ~10 m ceiling, the wrong part for this design); it falls through to the BMP180 if one is fitted.
+void checkMs5837() {
     char detail[40];
-    if (!g_bmp085.init()) {
-        if (g_bmp085.lastStatus() == sensors::Bmp085::Status::CAL_ROM_BAD) {
-            snprintf(detail, sizeof(detail), "0x%02X cal word %d bad", 0x77,
-                     g_bmp085.calRomBadIndex());
-            g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
-            Serial.printf("  BARO @0x77 ** cal ROM fails the DS 0/0xFFFF rule (word %d) **\n",
-                          g_bmp085.calRomBadIndex());
-        } else {
-            g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), "0x77 no CHIPID");
-            Serial.println(F("  BARO @0x77 ** D0 != 0x55 — not reading as BMP085/180 **"));
-        }
+    if (!g_ms5837.init()) {
+        const auto st = g_ms5837.lastStatus();
+        const char* why = st == sensors::Ms5837::Status::CRC_FAIL
+                              ? "PROM CRC fail"
+                              : st == sensors::Ms5837::Status::IO_FAIL ? "IO fail" : "init fail";
+        snprintf(detail, sizeof(detail), "0x76 %s", why);
+        g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
+        Serial.printf("  BARO @0x76 ** %s — not a CRC-verified MS5837 PROM **\n", why);
         return;
     }
-
-    float ambBar = 0.0f, tempC = 0.0f;
-    if (!g_bmp085.read(&ambBar, &tempC)) {
-        const char* why = g_bmp085.lastStatus() == sensors::Bmp085::Status::OUT_OF_RANGE
-                              ? "outside 300-1100 hPa"
-                              : "no conversion";
-        snprintf(detail, sizeof(detail), "0x77 %s", why);
+    const auto model = g_ms5837.model();
+    if (model != ms5837::Model::k30BA) {
+        const char* m = model == ms5837::Model::k02BA ? "MS5837-02BA (2 bar)" : "C1 outside both bands";
+        snprintf(detail, sizeof(detail), "0x76 %s — wrong range", m);
         g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
-        Serial.printf("  BARO @0x77 ** %s — raw UT=%u UP=%lu **\n", why, g_bmp085.lastUt(),
-                      static_cast<unsigned long>(g_bmp085.lastUp()));
+        Serial.printf("  BARO @0x76 PROM OK but %s — not the design's 30 mbar-range depth source\n", m);
+        return;
+    }
+    float ambBar = 0.0f, tempC = 0.0f;
+    if (!g_ms5837.read(&ambBar, &tempC)) {
+        const auto st = g_ms5837.lastStatus();
+        const char* why = st == sensors::Ms5837::Status::ZERO_ADC
+                              ? "ADC words 0 (DS: no conversion behind the read)"
+                              : "read fail";
+        snprintf(detail, sizeof(detail), "0x76 %s", why);
+        g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
+        Serial.printf("  BARO @0x76 ** %s — D1=%lu D2=%lu **\n", why,
+                      (unsigned long)g_ms5837.lastD1(), (unsigned long)g_ms5837.lastD2());
+        return;
+    }
+    if (ambBar < 0.90f || ambBar > 1.10f) {
+        // Same surface window the air-cal gate uses; the expectation's source is stated: bench at
+        // 0-100 m elevation, Stockholm-area SLP 984-987 hPa measured 2026-11-20 (risk 21's
+        // place/hour/source rule). Outside it, the part converts to a number nobody should trust.
+        snprintf(detail, sizeof(detail), "0x76 surface %.0fmbar odd", ambBar * 1000.0f);
+        g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
+        Serial.printf("  BARO @0x76 ** %.1f mbar at the surface — outside 900-1100 **\n",
+                      ambBar * 1000.0f);
         return;
     }
     g_faults.clear(FaultCode::BARO_CONV_BAD, millis());
-    // A real pressure at the bench is the whole point: identity by register read is necessary,
-    // not sufficient (item 17 closure). ~1 atm expected indoors; 'b' shows it moving when squeezed.
-    Serial.printf("  BARO @0x77 BMP180: %.2f mbar  %.1f C  (UT=%u UP=%lu B5=%ld oss=2) — fallback, 9 m clamp\n",
-                  ambBar * 1000.0f, tempC, g_bmp085.lastUt(),
-                  static_cast<unsigned long>(g_bmp085.lastUp()), (long)g_bmp085.lastB5());
+    g_activeBaro = &g_ms5837;
+    g_faults.clear(FaultCode::BARO, millis());
+    raiseRangeBanner();  // clears itself for a full-range part, re-quotes a computed figure otherwise
+    Serial.printf("  BARO @0x76 MS5837-30BA: %.2f mbar  %.2f C  (D1=%lu D2=%lu CRC ok W0=0x%04X "
+                  "type=%u) — primary\n",
+                  ambBar * 1000.0f, tempC, (unsigned long)g_ms5837.lastD1(),
+                  (unsigned long)g_ms5837.lastD2(), g_ms5837.prom().w[0],
+                  ms5837::w0TypeBits(g_ms5837.prom().w[0]));
+}
+
+void selectBaroFallback() {
+    g_activeBaro = &g_bmp085;
+    raiseRangeBanner();  // computed sub-1 m clamp, decision 38 — never "9 m" again
+}
+
+void checkBaro() {
+    bool ack76 = false, ack77 = false;
+    for (const DevSpec& d : g_devices) {
+        if (d.code != FaultCode::BARO || !d.present || !busUp(&Wire)) continue;
+        if (d.addr == ms5837::kAddr7) ack76 = true;
+        if (d.addr == 0x77) ack77 = true;
+    }
+    g_activeBaro = nullptr;
+
+    if (ack76) checkMs5837();
+
+    char detail[40];
+    if (!g_activeBaro && ack77) {  // fallback, or the primary failed its identity chain
+        if (!g_bmp085.init()) {
+            if (g_bmp085.lastStatus() == sensors::Bmp085::Status::CAL_ROM_BAD) {
+                snprintf(detail, sizeof(detail), "0x77 cal word %d bad", g_bmp085.calRomBadIndex());
+                g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
+                Serial.printf("  BARO @0x77 ** cal ROM fails the DS 0/0xFFFF rule (word %d) **\n",
+                              g_bmp085.calRomBadIndex());
+            } else {
+                g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), "0x77 no CHIPID");
+                Serial.println(F("  BARO @0x77 ** D0 != 0x55 — not reading as BMP085/180 **"));
+            }
+        } else {
+            float ambBar = 0.0f, tempC = 0.0f;
+            if (!g_bmp085.read(&ambBar, &tempC)) {
+                const char* why = g_bmp085.lastStatus() == sensors::Bmp085::Status::OUT_OF_RANGE
+                                      ? "outside 300-1100 hPa"
+                                      : "no conversion";
+                snprintf(detail, sizeof(detail), "0x77 %s", why);
+                g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
+                Serial.printf("  BARO @0x77 ** %s — raw UT=%u UP=%lu **\n", why, g_bmp085.lastUt(),
+                              static_cast<unsigned long>(g_bmp085.lastUp()));
+            } else {
+                g_faults.clear(FaultCode::BARO_CONV_BAD, millis());
+                // A real pressure at the bench is the whole point: identity by register read is
+                // necessary, not sufficient (item 17 closure). ~1 atm expected indoors; 'b' shows
+                // it moving when squeezed. The clamp figure is computed, decision 38.
+                selectBaroFallback();
+                g_faults.clear(FaultCode::BARO, millis());
+                char banner[32];
+                baroRangeBanner(banner, sizeof(banner));
+                Serial.printf("  BARO @0x77 BMP180: %.2f mbar  %.1f C  (UT=%u UP=%lu B5=%ld "
+                              "oss=2) — fallback, %s\n",
+                              ambBar * 1000.0f, tempC, g_bmp085.lastUt(),
+                              static_cast<unsigned long>(g_bmp085.lastUp()),
+                              (long)g_bmp085.lastB5(), banner);
+            }
+        }
+    }
+    if (!g_activeBaro) g_faults.clear(FaultCode::BARO_RANGE, millis());  // no depth source at all:
+    // BARO_RANGE would blame the wrong part. The active fault is BARO (none fitted) or
+    // BARO_CONV_BAD (something ACKs but cannot be trusted), and both block arming.
+}
+
+// The baro that selects itself at presence transitions must also re-learn nothing stale: Psurf
+// belongs to a surface moment, so the dive path (M4+) re-arms learning on every descent gate —
+// for now learnSurface() runs once at boot and says exactly what it measured.
+void learnSurface() {
+    if (!g_activeBaro) {
+        Serial.println(F("[psurf] no trusted depth source — Psurf NOT learned (depth has no reference)"));
+        return;
+    }
+    depth::SurfaceLearner l;
+    float lastAmb = 0.0f, lastAmbAgain = 0.0f, tempC = 0.0f;
+    for (int i = 0; i < 24 && !l.locked(); ++i) {
+        float a = 0.0f, t = 0.0f;
+        if (!g_activeBaro->read(&a, &t)) continue;
+        lastAmbAgain = lastAmb;
+        lastAmb = a;
+        tempC = t;
+        l.push(a);
+        delay(120);  // samples spread over ~3 s: a breathed-on or drifting module must NOT lock
+    }
+    if (!l.locked()) {
+        char detail[40];
+        snprintf(detail, sizeof(detail), "Psurf sigma %.1fmbar", l.sigmaBar() * 1000.0f);
+        g_faults.raise(FaultCode::BARO_CONV_BAD, Severity::ERROR, millis(), detail);
+        Serial.printf("  [psurf] ** no lock in 24 samples — sigma %.2f mbar, samples %.2f/%.2f mbar "
+                      "** (baro stable enough to arm? no)\n",
+                      l.sigmaBar() * 1000.0f, lastAmbAgain * 1000.0f, lastAmb * 1000.0f);
+        return;
+    }
+    g_psurf = l;
+    g_psurfBar = l.psurfBar();
+    g_faults.clear(FaultCode::BARO_CONV_BAD, millis());
+    raiseRangeBanner();  // re-quote the clamp against a LEARNED reference: "SL ref" disappears
+    Serial.printf("[psurf] learned %.2f mbar (sigma %.2f mbar over %d samples, %.1f C) — "
+                  "depth = gauge pressure x %.3f m/bar (SG %.3f)\n",
+                  g_psurfBar * 1000.0f, l.sigmaBar() * 1000.0f, l.samples(), tempC,
+                  depth::metersPerBar(g_salinity), g_salinity);
+}
+
+// The INA219 has no CHIPID, so identity here is fully active: config write-verify + cal read-back
+// + a real bus-voltage reading inside the rail window (2.5-5.5 V — wider than every operating
+// threshold, the check asks "is this sensor measuring", not "is the pack charged"; PwrRegs.h).
+// Writes registers, so boot and presence transitions only. V_BAT is an arming requirement
+// (AGENTS.md 13), so an ACKing part that cannot do this blocks arming via INA219 (ERROR).
+void checkPower() {
+    bool present = false;
+    for (const DevSpec& d : g_devices)
+        if (d.code == FaultCode::INA219 && d.present && busUp(&Wire)) present = true;
+    if (!present) return;  // absence is already the INA219 fault from probeDevices
+
+    char detail[40];
+    if (!g_ina219.init()) {
+        snprintf(detail, sizeof(detail), "0x40 init status %d", (int)g_ina219.lastStatus());
+        g_faults.raise(FaultCode::INA219, Severity::ERROR, millis(), detail);
+        Serial.printf("  PWR @0x40 ** init failed (status %d) — ACKs, not trusted for V_BAT **\n",
+                      (int)g_ina219.lastStatus());
+        return;
+    }
+    float v = 0.0f, a = 0.0f;
+    if (!g_ina219.read(&v, &a)) {
+        snprintf(detail, sizeof(detail), "0x40 read status %d", (int)g_ina219.lastStatus());
+        g_faults.raise(FaultCode::INA219, Severity::ERROR, millis(), detail);
+        Serial.printf("  PWR @0x40 ** read failed (status %d, bus word 0x%04X) **\n",
+                      (int)g_ina219.lastStatus(), g_ina219.lastBusWord());
+        return;
+    }
+    g_faults.clear(FaultCode::INA219, millis());
+    Serial.printf("  PWR @0x40 INA219: V_BAT=%.3f V  I=%+.1f mA  shunt=%+.2f mV  (cfg 0x%04X "
+                  "verify-ok)\n",
+                  v, a * 1000.0f, g_ina219.shuntmV(), g_ina219.lastConfigWord());
+    Serial.println(F("       caveat: current figures assume the 0.1 ohm breakout shunt "
+                     "(PwrRegs.h) — meter cross-check pending, part not fitted on this bench"));
 }
 
 void adcSelfTests() {
@@ -367,6 +568,57 @@ void baroIdentity() {
         for (uint8_t a : kBaro) {
             if (!sensors::probeAddress(*b.wire, a).ok) continue;
             any = true;
+
+            // MS5837 identity lives in its factory PROM, not in a CHIPID register (M3). Run the
+            // real dive driver's chain: RESET -> PROM read -> CRC-4 -> C1 band -> one D1/D2 pair
+            // with DS-MAX waits. Writes the reset/conversion commands, so bench path, same class
+            // as the Bosch pointer writes below and 'a'/'d' on the ADCs.
+            if (a == ms5837::kAddr7 && b.wire == &Wire) {
+                if (!g_ms5837.init()) {
+                    Serial.printf("    MS5837 driver: init FAILED (status %d) — no CRC-verified "
+                                  "PROM, 0x76 is not proven to be an MS5837\n",
+                                  (int)g_ms5837.lastStatus());
+                } else {
+                    const ms5837::Prom& pr = g_ms5837.prom();
+                    Serial.printf("    PROM: W0=0x%04X (crc=%X type=%u factory=0x%02X)  "
+                                  "C1=%u C2=%u C3=%u C4=%u C5=%u C6=%u  W7=0x%04X serial=%u\n",
+                                  pr.w[0], ms5837::w0Crc(pr.w[0]), ms5837::w0TypeBits(pr.w[0]),
+                                  ms5837::w0FactoryBits(pr.w[0]), pr.w[1], pr.w[2], pr.w[3],
+                                  pr.w[4], pr.w[5], pr.w[6], pr.w[7], ms5837::w7Serial(pr.w[7]));
+                    Serial.printf("    CRC: read %u computed %u -> %s   C1 %u -> %s\n",
+                                  g_ms5837.crcRead(), g_ms5837.crcComputed(),
+                                  g_ms5837.crcRead() == g_ms5837.crcComputed() ? "VERIFIED" : "FAIL",
+                                  pr.w[1],
+                                  g_ms5837.model() == ms5837::Model::k30BA ? "30BA band"
+                                  : g_ms5837.model() == ms5837::Model::k02BA ? "02BA band (2 bar — wrong part for this design)"
+                                                                             : "OUTSIDE both bands");
+                    // DS C6 programs W0 bits[11:5] per product, but the revisions disagree on the
+                    // suffix (-30BA01 vs -30BA26), so type bits are REPORTED, never gated: an
+                    // unverified expectation is what condemned a good BMP180 here once (item 17).
+                    Serial.printf("    W0 type bits %u reported, not gated (DS revisions contradict "
+                                  "on the product suffix — see BaroMs5837.h provenance)\n",
+                                  ms5837::w0TypeBits(pr.w[0]));
+                    float a1 = 0, a2 = 0, t1 = 0;
+                    if (g_ms5837.read(&a1, &t1) && g_ms5837.read(&a2, &t1)) {
+                        Serial.printf("    driver (OSR4096, DS-MAX 9.04ms waits): %.2f mbar -> %.2f mbar  "
+                                      "%.2f C  D1=%lu D2=%lu\n",
+                                      a1 * 1000.0f, a2 * 1000.0f, t1,
+                                      (unsigned long)g_ms5837.lastD1(), (unsigned long)g_ms5837.lastD2());
+                        Serial.println(F("    acceptance when a Bar30 arrives: Stockholm-station mbar "
+                                         "(SLP 984-987 hPa band, 2026-11-20 — named place/hour/source, "
+                                         "risk 21), and the mbar MUST move when the port is squeezed"));
+                    } else {
+                        Serial.printf("    driver read FAILED status %d (D1=%lu D2=%lu) — zero words "
+                                      "mean no conversion completed behind the ADC read (DS)\n",
+                                      (int)g_ms5837.lastStatus(), (unsigned long)g_ms5837.lastD1(),
+                                      (unsigned long)g_ms5837.lastD2());
+                    }
+                    Serial.println(F("    caveat: MS5837 compensation is written-not-measured "
+                                     "(part unprocured) — the math is DS-C6 + deployed-library "
+                                     "anchored (test_ms5837); this is its first run on silicon"));
+                }
+            }
+
             uint8_t d0 = 0x00, r30 = 0x00, d1 = 0x00, ac1msb = 0x00, ac1lsb = 0x00;
             bool gotD0 = false, got30 = false, gotD1 = false, gotAc1 = false;
             auto readReg = [&](uint8_t reg, uint8_t& out, bool& ok) {
@@ -388,7 +640,7 @@ void baroIdentity() {
             else if (d0 == 0x60) who = "BME280 (CHIPID 0xD0=0x60)";
             else if (r30 == 0x03) who = "BMP388-class (CHIPID 0x30=0x03)";
             else if (r30 == 0x01) who = "BMP390-class (CHIPID 0x30=0x01)";
-            else if (a == 0x76) who = "no Bosch CHIPID — MS5837-class? confirm by PROM read (M3)";
+            else if (a == 0x76) who = "no Bosch CHIPID — MS5837-class? identity = the PROM/CRC chain above, not this ACK";
             Serial.printf("  %s @0x%02X ACK  0xD0=%s0x%02X  0xD1=%s0x%02X(BMP085:0x43,BMP180:none)  "
                           "AC1=0x%02X%02X  0x30=%s0x%02X  -> %s\n",
                           b.label, a,
@@ -802,10 +1054,48 @@ void handleCommand(char c) {
             for (sensors::AdcPairWalker* w : g_walkers) w->report(Serial, millis());
             break;
         case 'b':
-            Serial.println(F("[baro] identity: CHIPID/cal-ROM reads plus a REAL conversion through "
-                             "the dive driver and the Adafruit library (writes ctrl_meas — bench "
-                             "only, same class as 'a'/'d'):"));
+            Serial.println(F("[baro] identity: Bosch CHIPID/cal-ROM + a REAL conversion through the "
+                             "dive driver and the Adafruit library, and the MS5837 PROM/CRC + "
+                             "OSR4096 conversion chain (writes commands — bench only, same class "
+                             "as 'a'/'d'):"));
             baroIdentity();
+            break;
+        case 'w':
+            Serial.println(F("[pwr] INA219 battery rail: config write-verify + raw register dump "
+                             "through the dive driver (writes CONFIG/CAL — bench only):"));
+            if (!busUp(&Wire)) {
+                Serial.println(F("  I2C0 is down — nothing to test"));
+                break;
+            }
+            if (!sensors::probeAddress(Wire, pwr::kAddr7).ok) {
+                Serial.println(F("  no INA219 at 0x40 — the part is not fitted on this bench yet; "
+                                 "no current figure in this firmware is trusted until it is, and "
+                                 "the 0.1 ohm shunt assumption in PwrRegs.h gets a meter "
+                                 "cross-check the day it is"));
+            } else if (!g_ina219.init()) {
+                Serial.printf("  init FAILED status %d (cfg readback 0x%04X) — ACKs, not an "
+                              "INA219 that holds config\n",
+                              (int)g_ina219.lastStatus(), g_ina219.lastConfigWord());
+            } else {
+                float v = 0, a = 0;
+                if (!g_ina219.read(&v, &a)) {
+                    Serial.printf("  read FAILED status %d (bus word 0x%04X)\n",
+                                  (int)g_ina219.lastStatus(), g_ina219.lastBusWord());
+                } else {
+                    Serial.printf("  V_BAT=%.3f V  I=%+.1f mA  P=%.0f mW  shunt=%+.2f mV\n",
+                                  v, a * 1000.0f, g_ina219.power_mW(), g_ina219.shuntmV());
+                    Serial.printf("  raw: CFG=0x%04X (written 0x%04X, verified) BUS=0x%04X "
+                                  "SHNT=%d CUR=%d PWR=%d  CAL=%u (preset 32V_2A)\n",
+                                  g_ina219.lastConfigWord(), pwr::kConfig32V2A,
+                                  g_ina219.lastBusWord(), g_ina219.lastShuntRaw(),
+                                  g_ina219.lastCurrentRaw(), g_ina219.lastPowerRaw(),
+                                  (unsigned)pwr::kPreset32V2A.cal);
+                    Serial.println(F("  cross-check recipe: meter across V_BAT must match within the "
+                                     "meter's own spec; meter in series with a known load must "
+                                     "match I — until then every ampere figure carries the 0.1 ohm "
+                                     "assumption (stated in PwrRegs.h, risk 21)"));
+                }
+            }
             break;
         case 'g':
             gpioMapReport();
@@ -818,7 +1108,8 @@ void handleCommand(char c) {
             Serial.println(F("bench commands: s=full bus scan  p=probe table + report  "
                              "r=raw probe codes (destructive, bench only)  c=bus recovery  "
                              "a=ADC self-test  d=ADC rate characterisation  t=pair-walker rate + "
-                             "interlock window  b=baro identity + live mbar/C reading  g=pad map + pad test  "
+                             "interlock window  b=baro identity + live mbar/C reading  w=INA219 "
+                             "battery rail + raw registers  g=pad map + pad test  "
                              "v=headless sim profile (SIM-stamped, touches no hardware)"));
             break;
     }
@@ -871,6 +1162,11 @@ void setup() {
     knownScan();
     checkAdcs();
     checkBaro();
+    checkPower();
+    // Psurf is learned from the barometer that just passed its identity chain — never from a
+    // reference pressure looked up for some city (risk 21, item 18: a reference is a measurement
+    // with a place, an hour and a source; here the source is the fitted part, at this bench, now).
+    learnSurface();
     printBootReport();
 
     // Start the pair walkers only after checkAdcs() has timed a real conversion on each present
@@ -899,6 +1195,7 @@ void loop() {
         }
         bool adcChanged = false;
         bool baroChanged = false;
+        bool powerChanged = false;
         for (DevSpec& d : g_devices) {
             if (!busUp(d.bus)) continue;
             const bool was = d.present;
@@ -908,10 +1205,12 @@ void loop() {
                 g_faults.clear(d.code, millis());
                 if (d.bus == &Wire1) adcChanged = true;
                 if (d.code == FaultCode::BARO) baroChanged = true;
+                if (d.code == FaultCode::INA219) powerChanged = true;
             } else if (!d.present && was) {
                 Serial.printf("ERROR: %s OFFLINE\n", d.label);
                 if (d.bus == &Wire1) adcChanged = true;
                 if (d.code == FaultCode::BARO) baroChanged = true;
+                if (d.code == FaultCode::INA219) powerChanged = true;
             }
         }
         probeDevices();
@@ -923,8 +1222,10 @@ void loop() {
             // achieved-rate counters restart with it, so 't' never mixes two parts' history.
             for (sensors::AdcPairWalker* w : g_walkers) w->begin();
         }
-        // Same rule one bus over: an ACK at 0x77 does not say the part measures pressure.
+        // Same rule one bus over: an ACK at 0x76/0x77 does not say the part is a depth source.
         if (baroChanged) checkBaro();
+        // And the same rule again for the rail monitor: plenty of parts ACK at 0x40.
+        if (powerChanged) checkPower();
     }
 
     // External watchdog heartbeat: HIGH 20 ms, LOW 30 ms, same shape as before. The delays are

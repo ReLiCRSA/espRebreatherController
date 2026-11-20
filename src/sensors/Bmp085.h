@@ -11,7 +11,9 @@
 // cal-ROM read and its DS validity rule, and the honest flag chain: a reading is only true when
 // the conversion completed AND the result sits inside the part's 300-1100 hPa range.
 //
-// Range: this part measures 300-1100 hPa absolute, i.e. ~9 m of water. rangeCeilingBar() reports
+// Range: this part measures 300-1100 hPa absolute — a water column UNDER 1 m at sea level
+// (~1.2 m at a 978 mbar bench), not the "~9 m" the early design record asserted (decision 38;
+// test/test_depth pins the hydrostatics). rangeCeilingBar() reports
 // that ceiling so Depth can clamp — the part must never be extrapolated past it (risk 1).
 #pragma once
 
@@ -28,7 +30,7 @@ class Bmp085 : public Barometer {
     // addr: the DS-quoted 7-bit 0x77 (Bosch DS Table 7 bits 1110111+R/W) — not 0x3B, which was a
     // phantom from address arithmetic (decision 36).
     // oss=2 (13.5 ms): 18 mm resolution, and the part has no 300 m depth to chase here — its own
-    // ceiling is ~9 m. oss=3 would add 12 ms per sample for resolution this sensor cannot use.
+    // ceiling is under 1 m. oss=3 would add 12 ms per sample for resolution this sensor cannot use.
     explicit Bmp085(TwoWire& wire, uint8_t addr = 0x77, int oss = 2)
         : wire_(wire), addr_(addr), oss_(oss) {}
 

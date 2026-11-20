@@ -10,7 +10,11 @@ enum class FaultCode : uint16_t {
     ADS1115_U1 = 10,
     ADS1115_U2 = 11,
     BARO = 12,
-    BARO_RANGE = 13, // BMP085 fallback: depth saturates ~9 m
+    BARO_RANGE = 13, // fitted baro cannot cover the design depth range: BMP085 fallback
+                     // saturates at 1.1 bar abs — under 1 m of water at sea level (~1.2 m at
+                     // a 978 mbar bench), NOT the "~9 m" the early design record asserted
+                     // (decision 38; test/test_depth pins the arithmetic). The banner quotes
+                     // the computed ceiling from depth::ceilingMeters(), never a recited figure.
     OLED = 14,
     INA219 = 15,
     I2C_BUS_STUCK = 16,
@@ -196,7 +200,11 @@ inline const char* faultName(FaultCode c) {
         case FaultCode::ADC_ID_UNKNOWN: return "ADC_ID_UNKNOWN";
         case FaultCode::ADC_RATE_MISMATCH: return "ADC_RATE_MISMATCH";
         case FaultCode::BARO: return "BARO";
-        case FaultCode::BARO_RANGE: return "BARO_RANGE_9M";
+        // Renamed from "BARO_RANGE_9M" 2026-11-20 (decision 38): the "9 m" in the name was a
+        // 10x error (real fallback ceiling < 1 m at sea level). The enum VALUE (13) is stable —
+        // only the display name changed, and any log predating this date showing BARO_RANGE_9M
+        // should be read as this same code with the corrected ceiling.
+        case FaultCode::BARO_RANGE: return "BARO_RANGE_CLAMP";
         case FaultCode::BARO_CONV_BAD: return "BARO_CONV_BAD";
         case FaultCode::OLED: return "OLED";
         case FaultCode::INA219: return "INA219";
