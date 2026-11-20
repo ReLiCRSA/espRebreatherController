@@ -754,10 +754,11 @@ fit report and render end-to-end, and bench `o` demonstrates the whole gate on-t
   (§12's ~25 ms at 400 kHz — and the clock change to 400 kHz on I2C0 is stated in the driver
   header, since the bus-wide co-residents are 400 kHz-rated). App 528,505 B flash (33.6%),
   85,920 B RAM (26.2%).
-* **Still open on the panel:** whether the 0x3C module is a genuine SSD1306 or an SH1106-class
-  clone — the frame push succeeds either way, but a clone paints offset/garbled. `o` prints the
-  ASCII preview beside the "compare first" instruction precisely so that verdict is visual:
-  user confirmation pending. The library's `SH1106Wire` is the drop-in fallback if needed.
+* **Panel identity — CLOSED 2026-11-20:** the user confirms the 0x3C module paints the demo
+  pattern **readable and correct** — genuine SSD1306-class, not an SH1106 clone. The `SH1106Wire`
+  fallback documented in the driver header stays exactly that: a documented fallback, unused.
+  (Stated as a bench fact with its source: the user's eyes on the fitted module — the same
+  rule that closes any measurement: place, method, source.)
 * Browser preview + the web Display tab ride on M6; `SimDisplay` already renders frames to
   text/JSON natively (exercised in the suite), so only the HTTP wrapper is missing.
 
@@ -1136,7 +1137,7 @@ the test_pins spare budget.
 | M4 | ZHL-16C 3-gas + GF + ICD + CNS + MOD/END/density | validated natively **before** hardware depends on it | **engine complete and regression-anchored natively** (47 cases); *not* validated against a trusted computer yet — risk 13 |
 | M5 | pulse-driven solenoid + click verification + breathing-state machine + bailout | three-way solenoid fault taxonomy + ADC-window interlock | not started |
 | M6 | web + WS + settings + cal UI + dive-log graphs | phone on SoftAP, all tabs, offline graphs render | not started (deps resolve and compile) |
-| M7 | display template engine + FieldRegistry + SSD1306 scenes + browser preview | template fit report and validator rejections | **DONE (2026-11-20)** for the engine/registry/panel path — the gate ran **on-target**: bench `o` prints parse+validate OK over all bundled templates, the validator rejection (`SAFETY field depth_m may not be inside @if (page 1)`), the §12 fit report verbatim (`template needs 9 lines, panel has 8 - dropped: temp_c, cal_age_h`), a SIM-stamped demo render (1426 µs) + ASCII preview, and a real 1024 B panel frame in 22 ms (§12 budgets ~25 ms); live 5 Hz render runs from boot, 17 native cases in `test_display`, 140 total. `wide_256x64`/`color_128x128` bundles and the browser preview defer honestly — no SPI panel exists (items 6/15) and the web server is M6; `SimDisplay` (the preview's engine) is already native-tested. Panel-clone question (SSD1306 vs SH1106) awaits the user's visual check of `o`'s ASCII-vs-panel comparison |
+| M7 | display template engine + FieldRegistry + SSD1306 scenes + browser preview | template fit report and validator rejections | **DONE (2026-11-20)** for the engine/registry/panel path — the gate ran **on-target**: bench `o` prints parse+validate OK over all bundled templates, the validator rejection (`SAFETY field depth_m may not be inside @if (page 1)`), the §12 fit report verbatim (`template needs 9 lines, panel has 8 - dropped: temp_c, cal_age_h`), a SIM-stamped demo render (1426 µs) + ASCII preview, and a real 1024 B panel frame in 22 ms (§12 budgets ~25 ms); live 5 Hz render runs from boot, 17 native cases in `test_display`, 140 total. `wide_256x64`/`color_128x128` bundles and the browser preview defer honestly — no SPI panel exists (items 6/15) and the web server is M6; `SimDisplay` (the preview's engine) is already native-tested. Panel-clone question CLOSED: user confirms the panel paints the pattern readable and correct — genuine SSD1306-class |
 | M8 | hardening: watchdog, brown-out, persistence, GF-anchor + tissue flush, soak at discharged pack | measured watchdog bite, recovery tests | not started; the GF-anchor half is done in `lib/core` (decision 24) |
 | M9 | in-water readiness: arming sequence, displayless alarms, WiFi-off default, bypass paths | arm refusal matrix tested | not started; `blocksArming()` is the hook and is tested |
 
@@ -1963,8 +1964,8 @@ depth logic clamps there too, quoted computed, never recited.)*
   (`[oled] bench frame clipped…` counted once per change — §12's fit-report-in-waiting, reported
   rather than hidden). App **528,505 B flash (33.6%), 85,920 B RAM (26.2%)**, flashed, hash
   verified; boot baseline otherwise unchanged from decision 39 (`BARO_BENCH_ONLY`, `[arm] REFUSED`
-  — intended). Still open: whether the 0x3C module is an SSD1306 or SH1106-class clone — the frame
-  push and the ASCII-vs-panel comparison are ready for the user's eyes, `SH1106Wire` is the
-  drop-in fallback. §12 gained its implemented-grammar notes, the ASCII-hyphen fit-message note,
-  the bundled/deferred template list, and the "As built" memory rules; §14/§15/§16 updated;
+  — intended). Panel identity closed same session: the user confirms the 0x3C module paints the
+  demo pattern **readable and correct** — genuine SSD1306-class; the `SH1106Wire` fallback stays
+  documented and unused. §12 gained its implemented-grammar notes, the ASCII-hyphen fit-message
+  note, the bundled/deferred template list, and the "As built" memory rules; §14/§15/§16 updated;
   decision 40 logged.

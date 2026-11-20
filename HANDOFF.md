@@ -8,8 +8,8 @@ frame 22 ms), live 5 Hz render from boot, boot `[oled] SSD1306 up @0x3C`. Along 
 boot-looped (`TG1WDT_SYS_RESET`) and the cause was a struct, not a driver: a ~18 KB `Template`
 local on the 8 KB loopTask — decision 40's memory rules close it (one shared scratch, footprint
 pinned by test). 140 native cases, 13 suites, ASan-clean; flashed 528,505 B (33.6%), RAM 85,920 B
-(26.2%). **Open visual check: does the 0x3C panel show `o`'s pattern correctly, or garbled/offset
-(SH1106-class clone)?** See §7 step A.
+(26.2%). **Panel check: DONE — the user confirms the 0x3C module paints `o`'s pattern readable
+and correct: genuine SSD1306-class, `SH1106Wire` fallback documented and unused.**
 **Previously (third pass), 2026-11-20,** after **decision 39: three-tier depth sensing** —
 MS5837-30BA primary → LPS28DFW (mode 2) armable fallback → BMP180 bench-only. `BaroLps28.h` +
 `Lps28dfw.h` + `checkLps28()` + bench `b`'s LPS28 section written (part unprocured, ST vendor
@@ -669,14 +669,11 @@ primary → LPS28DFW mode-2 armable fallback → BMP180 bench-only), so the BMP-
 now `[arm] REFUSED` with `BARO_BENCH_ONLY` (§6's current verbatim capture — intended policy, not a
 regression). Next, in order:
 
- A. **Panel visual confirmation (M7, awaiting the user, minutes on the bench).** Send `o` and look
-    at the 0x3C module: it should show the bench_128x64 demo — ppO2/depth big line, NDL/TTS/CEIL
-    row, setpoint/CNS/gas/MOD row, V_BAT + fault-banner row (clipped at the right edge — expected),
-    and a `SIM` line — matching the ASCII preview `o` prints above it. **Correct pattern** = genuine
-    SSD1306, done. **Garbled or horizontally offset (~2 columns)** = SH1106-class clone: the drop-in
-    is `SH1106Wire` from the same installed library (one base-class swap in `src/ui/Ssd1306I2C.h`),
-    and the ASCII-vs-panel comparison already separates software from controller fault. This is the
-    only M7 claim still open.
+ A. **[DONE 2026-11-20] Panel visual confirmation.** The user confirms the 0x3C module paints
+    `o`'s pattern **readable and correct** — genuine SSD1306-class controller, not an SH1106 clone.
+    `src/ui/Ssd1306I2C.h` stands as written; `SH1106Wire` stays a documented fallback, unused.
+    Keep the `o` ASCII-vs-panel comparison in the procedure (§7b of the README) — it is the cheap
+    discriminator if a future panel swap ever misbehaves.
  0. **[DONE 2026-11-20] Flash + capture the M3 acceptance run.** The port reappeared on its own
    (§3), two flashes verified, and the run passed with one expectation corrected:
    boot prints `BARO @0x77 BMP180: 977.72 mbar  25.2 C (UT=28474 UP=162080 B5=4034 oss=2) —
