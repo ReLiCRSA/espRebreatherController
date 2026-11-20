@@ -670,12 +670,22 @@ row  V_BAT {{v_bat:2.2f}}  {{fault_banner}}
 Primitives: text row, right/left aligned value, `bar` gauge, glyph/alarm icon, blink, page
 breaks, `@if` conditions. Format spec is printf-style.
 
+**As implemented (M7, 2026-11-20, pinned by `test/test_display/`):** `@size/@font/@page` may share
+one line (the §12 example above is legal input as written). `{{name:fmt}}` accepts only **bare**
+printf conversions (`%`-prefix is added by the engine; a user-typed `%`, width overflow, unknown
+field, or a format on a string field is a parse rejection, not a runtime surprise). `@if <field>
+<text>` gates a whole line on the field being truthy. `blink` parses and flags but renders as plain
+text until M8 (stated, not hidden). A page over parse capacity is a parse rejection; a page that
+parses but exceeds the panel's line count is a **fit report** case.
+
 ### Fit and priority
 Every field has a priority class: `SAFETY`, `PRIMARY`, `SECONDARY`, `DETAIL`. The renderer lays the
 template out for the target panel; if it does not fit it drops the lowest-priority cells and emits a
 **fit report** back to the web editor ("template needs 9 lines, panel has 8 — dropped: fhe, end_m,
 gas_density"). This is what makes "will this layout survive a bigger screen?" a question the tool
-answers instead of a surprise at the water.
+answers instead of a surprise at the water. *Implemented message uses an ASCII hyphen with spaces
+(`"... panel has 8 - dropped: ..."`), not the em-dash of the example — `test/test_display/` pins the
+exact sentence, so compare against the hyphen.*
 
 ### Safety invariants (validator-enforced, not advisory)
 - The alarm/ppO2 banner region is **reserved**. A template may restyle `SAFETY`-class fields but may
@@ -689,6 +699,13 @@ answers instead of a surprise at the water.
 `default_128x64`, `compact_128x32`, `wide_256x64`, `color_128x128`, `bench_128x64` (shows `SIM`
 marker, per-cell mV, and active faults).
 
+**As shipped in M7:** `default_128x64`, `compact_128x32`, `bench_128x64` (in
+`lib/core/src/TemplateBundles.h`, all validator-clean), plus two test-only bundles that exist to
+demonstrate the gate — `fitdemo_9on8` (nine lines on an eight-line panel → the §12 fit report) and
+`invalid_missing_safety` (hides `depth_m` inside `@if` → validator rejection). `wide_256x64` and
+`color_128x128` are **deferred with the SPI-panel decision** (open items 6/15): nothing can render
+them yet, so they are stated-not-stubbed rather than bundled as dead weight.
+
 ### Browser preview
 `GET /api/display/preview?template=wide_256x64&res=256x64` returns a rendered frame from
 `SimDisplay`, and the editor can live-preview against the running WebSocket state. Layout iteration
@@ -697,6 +714,52 @@ happens in the browser with no hardware attached.
 ### OLED care (a dive computer shows a static layout for an hour)
 Auto-dim after N seconds, scheduled pixel-shift, contrast ceiling in config, and a brightness
 schedule for battery. Burn-in is a real failure mode here, not a cosmetic one.
+
+### As built (M7, 2026-11-20) — and the two memory rules it established
+The engine is live on the fitted panel; `test/test_display/` (17 cases) pins grammar, validator,
+fit report and render end-to-end, and bench `o` demonstrates the whole gate on-target.
+
+* **Placement (decision 40):** the entire engine — `Template.h` (parse/validate/layout/render),
+  `Fields.h` (FieldRegistry), `Framebuf.h`, `Font6x8.h`, `LiveState.h`, `DisplayDriver.h` (the
+  interface — now in `lib/core`, a deliberate deviation from §14's tree, which listed it under
+  `src/ui/`), `SimDisplay.h`, `TemplateBundles.h` — is pure C++ in `lib/core/src/` and natively
+  testable (decision 28's pattern). Only the transport, `src/ui/Ssd1306I2C.h`, touches hardware.
+  Unlike every sensor path, this transport is **the thingpulse library** (`SSD1306Wire`, sda/scl=-1
+  so it never re-begins our I2C0; decision 27's hand-roll rule is a sensor-path rule, and the init
+  sequences are the risk-21-class thing not to write from memory). Provenance in the header.
+* **Font:** `lib/core/src/Font6x8.h` — the 5x7-in-6x8 cell extracted from Adafruit GFX
+  `glcdfont.c` (fetched 2026-11-20, source line cited), glyph anchors pinned natively. A fixed cell
+  makes text width measurable without a panel — that is what makes the fit report exact.
+* **SAFETY registry class:** `ppo2_used`, `depth_m`, `tts`, `fault_banner`. `sim_flag` is
+  deliberately PRIMARY, not SAFETY: the *validator* rule "a SAFETY field may never sit inside
+  `@if`" would forbid the §12 example's own `@if sim  SIM {{sim_flag}}` line — the SIM stamp is
+  unremovable by rule instead (§11/risk 11 stays enforced; the bench/live frame always stamps).
+* **Rule 1 — a KB-scale struct is never a task-stack local.** A `Template` local in the display
+  service put ~18 KB on the 8 KB `loopTask` and boot-looped the board (`TG1WDT_SYS_RESET`,
+  setup() complete — the M1 SimRunner class). `t = Template{}` inside `parse()` was the same bomb
+  in a different costume (a materialised 18 KB temporary on the caller's stack): parse now memsets.
+* **Rule 2 — static is not free either: ONE shared scratch per serial path.** The first fix
+  (`static` at four call sites) overcorrected and overflowed `dram0_0_seg` by 35 KB. There is now
+  exactly one instance, `g_tmpl` in main.cpp, passed by reference (`renderTemplate` takes the
+  caller's storage); every user runs serially on `loopTask`, and `parse()` re-clears on entry so
+  there is no stale state between users. `test_struct_footprint_kb_scale_never_task_stack` pins
+  `sizeof(Template) == 18442` so a capacity change re-derives the budget at the desk, like the
+  `test_pins` spare budget.
+* **Measured on-target (flashed 2026-11-20):** boot `[oled] SSD1306 up @0x3C`; live 5 Hz
+  `displayService()` runs from boot with zero watchdog events over 45 s captures; bench `o`:
+  all bundled templates parse+validate OK, validator rejection
+  (`SAFETY field depth_m may not be inside @if (page 1)`), fit report
+  (`template needs 9 lines, panel has 8 - dropped: temp_c, cal_age_h`), demo render
+  **1426 µs** (lines=6 truncated=1 fieldErrors=0), full 1024 B panel frame pushed in **22 ms**
+  (§12's ~25 ms at 400 kHz — and the clock change to 400 kHz on I2C0 is stated in the driver
+  header, since the bus-wide co-residents are 400 kHz-rated). App 528,505 B flash (33.6%),
+  85,920 B RAM (26.2%).
+* **Still open on the panel:** whether the 0x3C module is a genuine SSD1306 or an SH1106-class
+  clone — the frame push succeeds either way, but a clone paints offset/garbled. `o` prints the
+  ASCII preview beside the "compare first" instruction precisely so that verdict is visual:
+  user confirmation pending. The library's `SH1106Wire` is the drop-in fallback if needed.
+* Browser preview + the web Display tab ride on M6; `SimDisplay` already renders frames to
+  text/JSON natively (exercised in the suite), so only the HTTP wrapper is missing.
 
 ---
 
@@ -742,16 +805,20 @@ platformio.ini  partitions.csv  README.md  AGENTS.md
 lib/            host-buildable pure C++, no Arduino headers — this is what `pio test -e native`
   core/src/     covers. (Moved out of src/core deliberately: src/ can never compile natively.)
                 FaultCode  BootReport  GasMix  GasModel  Voting  O2Toxicity  Zhl16c  AdcRegs  PinMap
+                SensorIf  Depth  BaroBosch  BaroMs5837  BaroLps28  PwrRegs
+                Template  Fields  Framebuf  Font6x8  LiveState  DisplayDriver(iface)  SimDisplay
+                TemplateBundles                                        (M7 display stack, decision 40)
   sim/          SimBaro  SimCells(+fault injectors)  LoopModel  ValveModel  CcrControlLaw  SimRunner
                 built and running headless on-target (bench `v`); web sim panel + /api/sim/verify await M6
 src/            ESP32-only (Arduino/ESP-IDF headers allowed here)
   main.cpp                     setup(), boot probe, hot re-probe loop, bench command REPL
   config/  Pins.h (alias of core/PinMap.h)  Features.h  RuntimeConfig.{h,cpp}
-  sensors/ BusProbe  Ads1115Bus  CellArray  Barometer(iface)  Ms5837  Bmp085  Depth  Ina219
+  sensors/ BusProbe  Ads1115Bus  CellArray  Barometer(iface)  Ms5837  Bmp085  Lps28dfw  Ina219
   dive/    CcrControl  SolenoidDrive  BreathingState  Alarms  DiveLog  TissuePersist
-  ui/      DisplayDriver(iface)  Ssd1306I2C  TemplateEngine  FieldRegistry  Scenes  Buttons
+  ui/      Ssd1306I2C (thingpulse transport, decision 40)  Buttons   (layout engine lives in lib/core)
   web/     WebServer  Api  assets/(index.html app.js style.css)
-test/      test_voting/ test_gas/ test_zhl/ test_boot/ test_adc/ test_pins/
+test/      test_voting/ test_gas/ test_zhl/ test_boot/ test_adc/ test_pins/ test_sim/ test_baro/
+           test_depth/ test_ms5837/ test_power/ test_lps28/ test_display/
            native Unity suites (test_* required)
 docs/      TUNING.md   (README.md holds wiring + BOM + bench procedure)
 data/      LittleFS: index.html app.js style.css display/templates/*.txt
@@ -760,7 +827,10 @@ data/      LittleFS: index.html app.js style.css display/templates/*.txt
 Note: `GasModel` (inspired-gas resolution), `BootReport`, `AdcRegs` **and `PinMap`** are in `lib/core`,
 not in `src/` — all are pure C++ and all are under native test, which `src/` cannot be. `PinMap.h`
 carries the GPIO capability table and the role assignment; `src/config/Pins.h` includes it rather than
-holding a second copy of the numbers (decision 33).
+holding a second copy of the numbers (decision 33). The M7 display engine — template parse/validate/
+layout/render, FieldRegistry, Framebuf, Font6x8, LiveState, the `DisplayDriver` **interface**,
+SimDisplay, TemplateBundles — lives in `lib/core` for the same reason: fit and validation must be
+testable with no panel attached (decision 40); `src/ui/` keeps only the panel transport and buttons.
 
 ---
 
@@ -849,7 +919,12 @@ at 0x40" plus the meter cross-check recipe, and every ampere figure in the firmw
 `g` is what settled §3, and `v`
 runs the fixed headless sim profile (see §11): it prints per-minute SIM-stamped lines plus a
 measured **worst-tick cost** line — per-tick compute cost is derived from the target, never assumed
-from the host (risk 19).
+from the host (risk 19). New bench command **`o`** — the M7 display gate on-target: parse + SAFETY
+validator over every bundled template, a live validator rejection, the §12 fit report, a
+SIM-stamped demo render through the whole pipeline with measured cost, an **ASCII preview** of the
+rendered framebuffer, then one real panel frame push timed in ms — the ASCII-vs-panel comparison is
+how a software fault (layout) is told apart from a controller fault (SH1106-clone offset/garble)
+before anyone touches wiring. Touches only the OLED.
 Probe error codes mean different hardware stories and are worth reading: **2** = NACK on the address
 (nothing there), **5** = timeout (the bus is being held — measured when an ADS1115 module lost its
 supply and clamped SDA through its protection diodes; nine clocks did not free it).
@@ -884,9 +959,9 @@ bench procedure.
 
 ## 16. Test strategy
 
-**Current state (2026-11-20 late): `pio test -e native` is green — 123 cases across twelve suites
+**Current state (2026-11-20 late): `pio test -e native` is green — 140 cases across thirteen suites
 (`test_voting`, `test_gas`, `test_zhl`, `test_boot`, `test_adc`, `test_pins`, `test_sim`,
-`test_baro`, `test_depth`, `test_ms5837`, `test_power`, `test_lps28`); `pio run -e esp32` links **and is flashed
+`test_baro`, `test_depth`, `test_ms5837`, `test_power`, `test_lps28`, `test_display`); `pio run -e esp32` links **and is flashed
 and running on the devkit** with two
 ADS1115 modules, an SSD1306 and an Adafruit BMP085 actually attached (the converters measure as
 clones — risk 16, decision 31; the BMP085 measures as genuine — decision 36). **The M3 Bosch
@@ -916,12 +991,17 @@ and what its pads can do, which is how the pin map in section 3 was settled. The
 calculations (risk 20). The alternating-mux pair walker runs in `loop()` and is measured by bench
 `t`: **7.2 SPS per cell achieved** on the fitted clones, in-walk conversion periods 65.5-67.1 ms
 (boot-timed 61.9 ms + OS-poll detection lag), interlock busy duty 95-96%, and a 60 s continuous run
-with zero I2C errors, zero conversion timeouts and the board responsive afterwards.**
+with zero I2C errors, zero conversion timeouts and the board responsive afterwards. The M7 display
+stack runs on the fitted 0x3C panel: `[oled] SSD1306 up @0x3C` at boot, live 5 Hz render from boot
+with no watchdog events across 45 s captures (after fixing a ~18 KB `Template` stack local that
+boot-looped the board — decision 40's memory rules), and bench `o` prints the gate evidence:
+validator OK/rejection, the §12 fit report verbatim, demo render 1426 µs, full frame push 22 ms
+against §12's ~25 ms figure.**
 Layout note: PlatformIO only collects suites from `test/test_<name>/` folders (a bare `test/native/`
 group folder collects nothing), so the suites are `test/test_voting/`, `test/test_gas/`,
 `test/test_zhl/`, `test/test_boot/`, `test/test_adc/`, `test/test_pins/`, `test/test_sim/`,
 `test/test_baro/`, `test/test_depth/`, `test/test_ms5837/`, `test/test_power/`,
-`test/test_lps28/`. Suite convention: the entry point is a plain `int main()` — PlatformIO's native
+`test/test_lps28/`, `test/test_display/`. Suite convention: the entry point is a plain `int main()` — PlatformIO's native
 test glue links against it; a named `test_baro_suite()` entry produced an undefined-`_main` link
 error. `test_build_src = no` in the
 `native` env: `src/` is ESP32-only by design and is not built on the host. `lib/core` is built
@@ -1016,6 +1096,21 @@ claims 4.06 bar), the in-range window edges, and **the derived tier-2 ceiling it
 at the measured bench Psurf / ~30.3 m at SL, asserted under the "40 m underwater" marketing
 figure (decision 38's derive-never-recite rule applied to a product page) and more than 10x the
 BMP180 bench tier — the arithmetic that makes tier 2 armable-with-banner and tier 3 bench-only.
+`test_display` (M7, 17 cases): Font6x8 glyph anchors against the fetched glcdfont source; Framebuf
+text/clip/gauge/shift; the fmt-sanitizer matrix (user-typed `%`, unknown conversions, width
+overflow, formats on string fields — each a parse rejection, never sanitized into something
+plausible); renderField value formatting per class; parse accepting every bundle plus 10 named
+rejections; the validator accepting every bundle and rejecting the hidden-SAFETY template (inside
+`@if` and by omission, checked on every page); the §12 fit-report sentence pinned **verbatim**
+(ASCII-hyphen form — see §12's note); priority drop order DETAIL→SECONDARY→PRIMARY with a SAFETY
+floor that refuses to report "fits" when the SAFETY lines alone exceed the panel; the SIM `@if`
+line rendered when stamped and **absent, not stale, when not** (last-good-frame semantics);
+truncation counted at the panel edge, with a row ending exactly at the edge not counted; `bar` on a
+non-gaugeable field counting a fieldError instead of painting an empty gauge; bad page index
+rejected; and **`test_struct_footprint_kb_scale_never_task_stack`** pinning sizeof Seg/Line/Page/
+Template/Layout exactly — the footprint that boot-looped the board as a stack local and overflowed
+DRAM as four statics (decision 40) is now a number a capacity change must update deliberately, like
+the test_pins spare budget.
 
 - `pio test -e native` covers `lib/core/` **and** `lib/sim/` — the same physics models run on the
   host with no hardware. (They live under `lib/`, not `src/core`, so they build natively; `src/` is
@@ -1041,7 +1136,7 @@ BMP180 bench tier — the arithmetic that makes tier 2 armable-with-banner and t
 | M4 | ZHL-16C 3-gas + GF + ICD + CNS + MOD/END/density | validated natively **before** hardware depends on it | **engine complete and regression-anchored natively** (47 cases); *not* validated against a trusted computer yet — risk 13 |
 | M5 | pulse-driven solenoid + click verification + breathing-state machine + bailout | three-way solenoid fault taxonomy + ADC-window interlock | not started |
 | M6 | web + WS + settings + cal UI + dive-log graphs | phone on SoftAP, all tabs, offline graphs render | not started (deps resolve and compile) |
-| M7 | display template engine + FieldRegistry + SSD1306 scenes + browser preview | template fit report and validator rejections | not started |
+| M7 | display template engine + FieldRegistry + SSD1306 scenes + browser preview | template fit report and validator rejections | **DONE (2026-11-20)** for the engine/registry/panel path — the gate ran **on-target**: bench `o` prints parse+validate OK over all bundled templates, the validator rejection (`SAFETY field depth_m may not be inside @if (page 1)`), the §12 fit report verbatim (`template needs 9 lines, panel has 8 - dropped: temp_c, cal_age_h`), a SIM-stamped demo render (1426 µs) + ASCII preview, and a real 1024 B panel frame in 22 ms (§12 budgets ~25 ms); live 5 Hz render runs from boot, 17 native cases in `test_display`, 140 total. `wide_256x64`/`color_128x128` bundles and the browser preview defer honestly — no SPI panel exists (items 6/15) and the web server is M6; `SimDisplay` (the preview's engine) is already native-tested. Panel-clone question (SSD1306 vs SH1106) awaits the user's visual check of `o`'s ASCII-vs-panel comparison |
 | M8 | hardening: watchdog, brown-out, persistence, GF-anchor + tissue flush, soak at discharged pack | measured watchdog bite, recovery tests | not started; the GF-anchor half is done in `lib/core` (decision 24) |
 | M9 | in-water readiness: arming sequence, displayless alarms, WiFi-off default, bypass paths | arm refusal matrix tested | not started; `blocksArming()` is the hook and is tested |
 
@@ -1106,7 +1201,8 @@ Re-open only with the user's explicit agreement.
 | 36 | **I2C address policy: take the 7-bit form the datasheet itself states; never do arithmetic on a quoted address byte. Probe-table baro addresses become 0x76 (MS5837) and 0x77 (BMP085/180).** Corrects the 2026-11-19 note that "datasheets quote 8-bit forms, halve them" — that produced phantom 0x3E/0x3B, which no part has ever answered at. | Evidence, read from the primary sources on 2026-11-20 (copies in the session temp dir): Bosch BMP180 DS (BST-BMP180-DS000-09) Table 7 — "BMP180 addresses: A7..A1 = 1 1 1 0 1 1 1, W/R", i.e. 7-bit **0x77**, bus bytes 0xEE write / 0xEF read; there is no 0x3B anywhere in the part. TE MS5837-07BA DS — "Module ref / Mode / Pins used / Address (7 bits): MS5837-07BA, I2C, SDA SCL, **0x76 (1110110 b)**"; "0x7C" is the 8-bit write byte that circulates in driver code, and 0xA0–0xAC in the PROM-read diagrams are **command bytes**, not slave addresses — two separate traps in one datasheet. The immediate proof: the bench's Adafruit BMP085 is found at 0x77 and is a genuine part (see item 17's closure); boot now reports `I2C0: [0x77 0x3C]` + `BARO_RANGE_9M` instead of `ERROR BARO`. Also recorded: **0x76/0x77 are shared by BMP280/BME280 (CSB strap)**, so presence at 0x76 is not identity for the MS5837 — the PROM read confirms it (M3) — and one baro per I2C0 max without a clash. The failure mode this decision closes is the general one (risk 21): a wrong yardstick makes honest measurements look like part failures, and on this project the *next* suspect was already in the log as a bogus procurement action. |
 | 37 | **The Bosch pressure-compensation arithmetic is a transcription of the deployed Adafruit BMP085 library, kept int32/uint32-faithful, and anchored on that library's "use datasheet numbers!" example set — never on remembered constants and never on datasheet text (the DS has none).** | M3, 2026-11-20. The first transcription of `computeB5`/`convertPressure` (written partly from memory into `lib/core/src/BaroBosch.h`) was cross-checked line-by-line against `Adafruit_BMP085.cpp` (cloned and read that day) and found wrong in **four places**: `mc << 11` (not `<<16`), `B3` scaled by `(<< oversampling)` (not a fixed `<<2`), `B7` multiplied by `(50000UL >> oss)` (not a fixed 50000), and the B4-path `X2` built from `b1` with the B7 overflow branch `(B7/B4)*2` for B7 ≥ 2^31 / `(B7*2)/B4` below (a remembered variant swapped the branches and used `ac1` for the X2 term). The discriminator was **self-consistency at the documented example**: with `mc << 11` the library's debug block (ac1=408 … md=2868, UT=27898, UP=23843, oss=0) yields B5=2400 → T=15.0 °C exactly and p=69964 Pa; with `<< 16` it yields 431.6 °C. What is **banned as an anchor**: the "famous" AC1=7295 / UP=23843 pairing — searched, it appears zero times in the BMP180 DS text layer and is not self-consistent with any published form (a memory chimera, the same defect class as decision 36 and risk 21). `test/test_baro/` pins the example exactly, matches a second verbatim copy of the reference over 64 grid points, and pins the oss truncation chain (34321/68643/137286/274572). Deliberate non-widening: int32/uint32 semantics match the deployed reference so bench `b` can cross-check the firmware driver against the Adafruit library on the same physical module — that hardware agreement is the acceptance test, and it is still open (the board is not enumerating on USB). Rule that follows for every future driver: when a datasheet defers the algorithm to vendor code ("ANSI C available from Bosch"), the deployed code **is** the datasheet — transcribe it, anchor it at a self-consistent documented example, and say so in the provenance block. |
 | 38 | **The BMP085/BMP180 fallback's usable depth ceiling is UNDER 1 m of water at sea level (~1.2 m at the 978 mbar bench), not the "~9 m" the design record asserted — a 10x error. The `BARO_RANGE` banner now quotes a COMPUTED ceiling (`depth::ceilingMeters()`), never a recited figure; the display string becomes `BARO_RANGE_CLAMP` (enum value 13 unchanged).** | M3, 2026-11-20, found while writing `Depth.h` — the arithmetic the code had to do forced the claim to be checked. The record's "~9 m" appears nowhere derivable: 1100 mbar abs − ~1013 mbar surface = ~87 mbar **gauge**, and 1 mbar supports ~1.02 cm of water (10.1972 m/bar fresh, 9.9484 salt at g=9.80665), so the part's whole water column is ~0.86–0.88 m; at the measured Stockholm bench Psurf of 977.9 mbar the ceiling is ~1.2 m. "~9 m" would need ~880 mbar gauge — a number the part's own 300–1100 hPa spec rules out. **test/test_depth/** pins the hydrostatics and the sub-1 m conclusion. This is risk 21's fourth instance of the same defect class in four days: a plausible number asserted, never derived — phantom addresses from halved bytes, a bench-intervention inference, wrong-city weather, and now a range figure nobody multiplied out. The lesson generalises past baros: **any number that gates behaviour gets derived in code from primary-spec inputs and printed with its reference, so a wrong figure cannot survive by being recited.** Consequences: the < 50 m banner gate is a stated design heuristic (the design's primary covers ~288 m; anything shallower wears the banner), the banner stays ERROR/non-blocking per §13 ("arm shallow or not at all"), decision 7 stands unchanged (MS5837 primary, fallback only — if anything the correction strengthens it), and the MS5837 procurement is now unambiguously load-bearing: **the fitted fallback is not a dive depth source.** |
-| 39 | **Three-tier depth sensing (user-directed): MS5837-30BA primary → LPS28DFW (mode 2, FS 4060 hPa abs) armable fallback → BMP085/180 BENCH-ONLY.** New fault `BARO_BENCH_ONLY = 27` (ERROR, blocks arming; the previously-unassigned value 27 taken deliberately), raised exactly when the BMP is the only depth source that passed identity. Revises decision 7's fallback slot at the user's explicit request; MS5837-as-primary stands. | "Can we include the LPS28DFW, we prefer the MS5837, fail over to LPS28DFW if it is not available, and BMP for bench testing" (2026-11-20). Honest comparison first: the LPS28DFW **beats** the MS5837 in-range (±0.26–0.36% input ≈ ±11–15 cm at 30 m vs the 30BA's ±50 mbar band; no 24 h gel-immersion limit; $12.50 Adafruit #6067; 0x5C/0x5D coexists with everything on I2C0) but only **measures to 4.06 bar abs** — mode 2 is 4060 hPa ABSOLUTE, a ~30.7 m gauge column at this bench, **not** the "40 m underwater" on the product page, which quotes an absolute full scale as if gauge (decision 38's rule applied to marketing text: `depth::ceilingMeters()` computes the banner figure, `test/test_lps28/` asserts it is < 40 m). It survives 10 bar but rail-behaviour above 4.06 is flagged by `inRangeBar`/P_OR, never extrapolated (risk 1's rule, tier-2 edition). Against the MS5837-02BA (2 bar, already wrong-part by `rangeCeilingBar()`) it is strictly better; against the 30BA it is shallower-capable, which is why it is tier 2, not the primary. **Facts read at source, decision 37 pattern:** ST's own vendor driver `lps28dfw_reg.h/.c` (Sensors Software Solution Team, (c) 2024, github.com/STMicroelectronics/lps28dfw) — WHO_AM_I (0x0F) = **0xB4** (an earlier remembered 0xB8 was caught at source before it shipped), address bits `101110xb` = 7-bit 0x5C/0x5D (vendor's 0xB8/0xB9 are the 8-bit bytes — decision 36's form rule), CTRL_REG2: ONESHOT0/SWRESET2/BDU3/**FS_MODE6**/BOOT7, CTRL_REG1 AVG[2:0]/ODR[6:3], sensitivity 4096 LSB/hPa (FS1260) / 2048 (FS4060), temp LSB/100 C. The DS13317 PDF would not re-fetch this week (ST blocks automated fetches) — nothing rests on remembered DS text; the vendor driver carries the tables and is the algorithm reference. **Identity without a PROM** (this silicon has none — stated, not worked around): WHO_AM_I → SWRESET self-clear **polled** (no recited wait) → CTRL_REG1/2 write + readback verify with **FS_MODE=1 latched** → one real conversion inside the latched window (P_OR + `inRangeBar` flagged). The ceiling the dive model clamps at comes from the **latched readback**, never from the write request. Selection order re-derives at boot and on every presence transition; a part that ACKs but fails its chain raises `BARO_CONV_BAD` even when a lower tier works (squatter policy, unchanged). Integration also **fixed a found defect**: the fallback-success paths cleared `BARO_CONV_BAD` unconditionally, erasing the arming block that a failed-identity 0x76 squatter had just raised — clears are now gated on a per-pass squatter flag (`g_baroSquatter`), and `test/test_lps28/` + the extended `test/test_boot/` walk pin the new code. On-target baseline change, intended and captured: the BMP180-only bench now boots `BARO @0x77 BMP180: … — bench-only tier, clamps 0.9m SL1013mbar` (the line prints pre-Psurf on the SL reference; the fault list re-quotes `clamps 1.2m@978mbar` once Psurf is locked), `ERROR BARO_BENCH_ONLY BMP180 sole: bench only`, **`[arm] REFUSED`** — the sub-1 m part that has been quietly carrying "armable" status since M3 no longer is. Procurement gains LPS28DFW #6067; M3's *gate* still waits on the Bar30. 123 native cases green across 12 suites. |
+| 39 | **Three-tier depth sensing (user-directed): MS5837-30BA primary → LPS28DFW (mode 2, FS 4060 hPa abs) armable fallback → BMP085/180 BENCH-ONLY.** New fault `BARO_BENCH_ONLY = 27` (ERROR, blocks arming; the previously-unassigned value 27 taken deliberately), raised exactly when the BMP is the only depth source that passed identity. Revises decision 7's fallback slot at the user's explicit request; MS5837-as-primary stands. | "Can we include the LPS28DFW, we prefer the MS5837, fail over to LPS28DFW if it is not available, and BMP for bench testing" (2026-11-20). Honest comparison first: the LPS28DFW **beats** the MS5837 in-range (±0.26–0.36% input ≈ ±11–15 cm at 30 m vs the 30BA's ±50 mbar band; no 24 h gel-immersion limit; $12.50 Adafruit #6067; 0x5C/0x5D coexists with everything on I2C0) but only **measures to 4.06 bar abs** — mode 2 is 4060 hPa ABSOLUTE, a ~30.7 m gauge column at this bench, **not** the "40 m underwater" on the product page, which quotes an absolute full scale as if gauge (decision 38's rule applied to marketing text: `depth::ceilingMeters()` computes the banner figure, `test/test_lps28/` asserts it is < 40 m). It survives 10 bar but rail-behaviour above 4.06 is flagged by `inRangeBar`/P_OR, never extrapolated (risk 1's rule, tier-2 edition). Against the MS5837-02BA (2 bar, already wrong-part by `rangeCeilingBar()`) it is strictly better; against the 30BA it is shallower-capable, which is why it is tier 2, not the primary. **Facts read at source, decision 37 pattern:** ST's own vendor driver `lps28dfw_reg.h/.c` (Sensors Software Solution Team, (c) 2024, github.com/STMicroelectronics/lps28dfw) — WHO_AM_I (0x0F) = **0xB4** (an earlier remembered 0xB8 was caught at source before it shipped), address bits `101110xb` = 7-bit 0x5C/0x5D (vendor's 0xB8/0xB9 are the 8-bit bytes — decision 36's form rule), CTRL_REG2: ONESHOT0/SWRESET2/BDU3/**FS_MODE6**/BOOT7, CTRL_REG1 AVG[2:0]/ODR[6:3], sensitivity 4096 LSB/hPa (FS1260) / 2048 (FS4060), temp LSB/100 C. The DS13317 PDF would not re-fetch this week (ST blocks automated fetches) — nothing rests on remembered DS text; the vendor driver carries the tables and is the algorithm reference. **Identity without a PROM** (this silicon has none — stated, not worked around): WHO_AM_I → SWRESET self-clear **polled** (no recited wait) → CTRL_REG1/2 write + readback verify with **FS_MODE=1 latched** → one real conversion inside the latched window (P_OR + `inRangeBar` flagged). The ceiling the dive model clamps at comes from the **latched readback**, never from the write request. Selection order re-derives at boot and on every presence transition; a part that ACKs but fails its chain raises `BARO_CONV_BAD` even when a lower tier works (squatter policy, unchanged). Integration also **fixed a found defect**: the fallback-success paths cleared `BARO_CONV_BAD` unconditionally, erasing the arming block that a failed-identity 0x76 squatter had just raised — clears are now gated on a per-pass squatter flag (`g_baroSquatter`), and `test/test_lps28/` + the extended `test/test_boot/` walk pin the new code. On-target baseline change, intended and captured: the BMP180-only bench now boots `BARO @0x77 BMP180: … — bench-only tier, clamps 0.9m SL1013mbar` (the line prints pre-Psurf on the SL reference; the fault list re-quotes `clamps 1.2m@978mbar` once Psurf is locked), `ERROR BARO_BENCH_ONLY BMP180 sole: bench only`, **`[arm] REFUSED`** — the sub-1 m part that has been quietly carrying "armable" status since M3 no longer is. Procurement gains LPS28DFW #6067; M3's *gate* still waits on the Bar30.  123 native cases green across 12 suites. |
+| 40 | **M7 display stack: whole engine (parse/validate/layout/fit/render, FieldRegistry, Framebuf, Font6x8, LiveState, DisplayDriver *interface*, SimDisplay, bundles) in `lib/core`, pure C++ and natively pinned; the thingpulse `SSD1306Wire` library is the panel transport (decision 27's hand-roll rule stays a sensor-path rule); `sim_flag` is a PRIMARY registry field, not SAFETY; and two binding memory rules for KB-scale display structs.** | 2026-11-20, M7. Placement: decision 28's rule — constants and gates that must be assertable live where `pio test -e native` can reach them; the fit report and the SAFETY validator are gates, and a gate nobody can test is a gate that rots. Transport: the init sequences/geometry of a controller not yet identity-proven are precisely the risk-21 material not to transcribe from memory, and §12 never demanded a hand-rolled OLED driver — so the deployed library is the transport (provenance block in `src/ui/Ssd1306I2C.h`, sda/scl=-1 so it never re-begins I2C0 — decision 26; the 400 kHz bus-wide clock change is stated there, co-resident baro parts are 400 kHz-rated). Font6x8 extracted from fetched Adafruit GFX `glcdfont.c`, glyph anchors pinned. `sim_flag` as SAFETY would collide with §12's own example (`@if sim  SIM {{sim_flag}}` — the validator's "never inside @if" rule would reject it); the SIM stamp stays unremovable by construction instead (the frame builder stamps; §11/risk 11 unaffected). **Memory rules, found the hard way on-target:** (1) a KB-scale struct is never a task-stack local — a `Template` local (~18 KB) in the display service smashed the 8 KB loopTask: `TG1WDT_SYS_RESET` every ~10 s with setup() complete, the M1 SimRunner class in a new costume, invisible natively (8 MB host stack); the `t = Template{}` idiom inside `parse()` was the same bomb (a materialised 18 KB temporary on the caller's stack) and parse memsets now. (2) `static` is not free — making all four users static overflowed `dram0_0_seg` by 35 KB; there is exactly ONE shared scratch (`g_tmpl`), passed by reference (`renderTemplate` takes caller storage), valid because every display path runs serially on loopTask and parse re-clears on entry. `test/test_display/` pins `sizeof(Template)==18442` and friends, so a capacity change must re-face the budget deliberately. Fixed by measurement-then-confirmation, not inference: the sizeof was computed on the host, the fix was behaviorally confirmed by 45 s clean captures with the 5 Hz renderer live and bench `o`/`p` responsive. |
 
 ---
 
@@ -1822,3 +1918,53 @@ depth logic clamps there too, quoted computed, never recited.)*
   line corrected — all three tiers coexist at 0x76/0x5C/0x5D/0x77), §13 arm requirement updated,
   risk 1 annotated, decision 7 annotated, §16/§20 updated, open **item 19** opened for the #6067
   procurement + arrival acceptance. HANDOFF.md and README.md follow.
+
+- 2026-11-20 (M7, display): **the template engine runs, its gate fired on-target, and it found a
+  new costume for an old defect — a struct too big for a task stack.** Written: the M7 display
+  stack in `lib/core/src/` — `Font6x8.h` (5x7-in-6x8 cell extracted from fetched Adafruit GFX
+  `glcdfont.c`, provenance cited), `Framebuf.h` (page-major buffer, text/gauge/clip/shift),
+  `LiveState.h` (the immutable snapshot fields the registry reads), `Fields.h` (FieldRegistry:
+  name/type/unit/priority/getter + the fmt sanitizer), `DisplayDriver.h` (the interface — §14
+  updated to match: interface in lib/core, `src/ui/` keeps only transport), `Template.h` (parse →
+  VALIDATE → layout/fit → render; §12 grammar, validator-enforced SAFETY invariants, exact fit
+  report), `TemplateBundles.h`; `src/ui/Ssd1306I2C.h` (thingpulse `SSD1306Wire` transport,
+  sda/scl=-1, 400 kHz stated bus-wide, geometry/null-buffer guards, provenance block) and
+  `src/ui/Buttons.h` (debounced Page/Arm scan). main.cpp: `checkDisplay()` at boot and on
+  OLED-online hot-plug (`[oled] SSD1306 up @0x3C`), `displayService()` at 5 Hz from the service
+  windows (live frame built ONLY from identity-passed sensors — ppO2 shows 0.00 until M2 rather
+  than fake data), Page-button page cycling, new bench command **`o`**, and fault code
+  **`DISPLAY_RENDER_SLOW = 28`** (WARN — a screen failure never mutes alarms, §13; the previously
+  unassigned 28 taken deliberately; `test_boot` gap list {28,29}→**{29,29}**, walked count 45→46).
+  New suite `test/test_display/` (17 cases) — **`pio test -e native` 140 cases, 13 suites green**,
+  and green under ASan/UBSan.
+  **Engine defects found by the tests** (all before any hardware ran): multi-directive lines
+  (`@size … @font … @page …` on one line — the §12 example — were rejected), an `@if` line
+  swallowed as an unknown directive, an off-by-one after `}}` eating the next char, dropped
+  inter-field spaces, bare-format specs (`:2.2f`) not sanitized (a user-typed `%` reached printf),
+  a SAFETY-lines-only page over capacity reported `fits=true`, kMaxSegs too small for
+  field-literal alternation (6→10), and a render tmp buffer that clipped a 25-char banner (24→48).
+  **The on-target defect was new class-locus, old class: footprint.** After flashing, the board
+  reset with `rst:0x8 (TG1WDT_SYS_RESET)` every ~10 s — setup() completed, so the suspect was
+  `loop()`. The debug plan (one-shot `[dbg]` pins) was still being wired when reading the structs
+  settled it on the host: `sizeof(Template) = 18,442` and `displayService()` had one as a **local**
+  on the 8 KB loopTask — the M1 SimRunner smash in a new costume, invisible to 140 host cases (8 MB
+  host stack). A second bomb sat in `parse()`: `t = Template{}` materialises an ~18 KB temporary on
+  the caller's stack; parse memsets now. The first fix — `static` at all four call sites —
+  **overcorrected**: `dram0_0_seg` overflowed by 35 KB. Final shape is one shared scratch
+  (`g_tmpl`, all display paths run serially on loopTask, parse re-clears on entry) passed by
+  reference; `renderTemplate` gained a `Template&` parameter. `sizeof` is pinned natively so a
+  capacity change re-faces the budget deliberately. **Fix confirmed behaviourally, not by
+  inference:** 45 s capture with the 5 Hz renderer live from boot — zero watchdog events, `o` and
+  `p` responsive; the never-captured bench `o` finally printed its gate: all bundles OK, validator
+  rejection `SAFETY field depth_m may not be inside @if (page 1)`, fit report
+  `template needs 9 lines, panel has 8 - dropped: temp_c, cal_age_h`, demo render 1426 µs
+  (lines=6 truncated=1 fieldErrors=0), ASCII preview, and the 1024 B panel frame pushed in
+  **22 ms** — §12's ~25 ms figure at 400 kHz. The live frame's banner clips 1 segment
+  (`[oled] bench frame clipped…` counted once per change — §12's fit-report-in-waiting, reported
+  rather than hidden). App **528,505 B flash (33.6%), 85,920 B RAM (26.2%)**, flashed, hash
+  verified; boot baseline otherwise unchanged from decision 39 (`BARO_BENCH_ONLY`, `[arm] REFUSED`
+  — intended). Still open: whether the 0x3C module is an SSD1306 or SH1106-class clone — the frame
+  push and the ASCII-vs-panel comparison are ready for the user's eyes, `SH1106Wire` is the
+  drop-in fallback. §12 gained its implemented-grammar notes, the ASCII-hyphen fit-message note,
+  the bundled/deferred template list, and the "As built" memory rules; §14/§15/§16 updated;
+  decision 40 logged.

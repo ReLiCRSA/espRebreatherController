@@ -23,12 +23,14 @@ ADC scheduler) are done and measured on hardware. M3 (barometers, depth, power m
 progress: the depth path is **three tiers by decision 39 — MS5837-30BA primary, LPS28DFW (mode 2)
 armable fallback, BMP180 bench-only**; the BMP180 is fitted, proven, and now *refuses* arming as
 the sole depth source (correct for this bench), while the MS5837, LPS28DFW and INA219 drivers are
-written and natively tested but the parts are not fitted. The dive loop, display scenes and web
-server are not written yet. Today's firmware boots into BENCH and reports hardware honestly; it
-does not dive.
+written and natively tested but the parts are not fitted. The dive loop and web server are not
+written yet; the display template engine is (bench `o` runs its gate — validator rejections, fit
+report, demo render — on the fitted 128x64 OLED, with a live bench frame rendering at 5 Hz), but
+the in-water scenes grow with the dive loop. Today's firmware boots into BENCH and reports hardware
+honestly; it does not dive.
 
 ```
-pio test -e native            # 123 cases, 12 suites, no hardware needed
+pio test -e native            # 140 cases, 13 suites, no hardware needed
 pio run -e esp32              # builds
 pio run -e esp32 -t upload    # flash (auto-reset via RTS, no BOOT button needed)
 pio device monitor            # 115200 baud
@@ -319,6 +321,10 @@ diver responses.
    working, not a fault to chase.
 6. `w` — INA219 config write-verify + rail voltage cross-checked against a meter.
 7. `g` — pad map: nothing moved, no pad owned by two roles.
+ 7b. `o` — display gate: every bundled template parses and passes the SAFETY validator, the
+     hidden-SAFETY template is rejected, the fit report prints, and the demo render + ASCII preview
+     must MATCH what the physical panel shows (garbled or ~2-column offset paint = SH1106-class
+     module, not a software fault — see the ASCII comparison `o` prints).
 8. Cell bench checks: bias sanity (each pair within ±250 mV and not railed), air cal flow passes,
    all three cells agree within 20% in air. Diluent-flush check on the sim (`v`) or on gas.
 9. Solenoid (once fitted, dry): bounded `solenoid test` N-pulse run with click verification on the

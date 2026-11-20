@@ -64,6 +64,12 @@ enum class FaultCode : uint16_t {
     // values are stable once shipped, and test_boot's walk keeps the gap list honest.
     BARO_BENCH_ONLY = 27,
 
+    // Display (§12): a template render that exceeded the 50 ms budget was abandoned and
+    // the last good frame kept. WARN deliberately — a screen failure must never suppress
+    // audible/haptic alarms or block an arm (§13); it must still be REPORTED (§17).
+    // Takes the previously-unassigned value 28; gap list in test_boot follows.
+    DISPLAY_RENDER_SLOW = 28,
+
     // Power
     VBAT_LOW = 30,
     RAIL_3V3_LOW = 31,
@@ -168,6 +174,7 @@ inline Severity defaultSeverity(FaultCode c) {
         // loud, not worth grounding the dive unit for. See the enum comment.
         case FaultCode::ADC_ID_UNKNOWN:
         case FaultCode::ADC_RATE_MISMATCH:
+        case FaultCode::DISPLAY_RENDER_SLOW:  // render abandoned, last good frame kept (§12)
             return Severity::WARN;
 
         default:
@@ -212,6 +219,7 @@ inline const char* faultName(FaultCode c) {
         case FaultCode::ADC_CONV_BAD: return "ADC_CONV_BAD";
         case FaultCode::ADC_ID_UNKNOWN: return "ADC_ID_UNKNOWN";
         case FaultCode::ADC_RATE_MISMATCH: return "ADC_RATE_MISMATCH";
+        case FaultCode::DISPLAY_RENDER_SLOW: return "DISPLAY_RENDER_SLOW";
         case FaultCode::BARO: return "BARO";
         // Renamed from "BARO_RANGE_9M" 2026-11-20 (decision 38): the "9 m" in the name was a
         // 10x error (real fallback ceiling < 1 m at sea level). The enum VALUE (13) is stable —

@@ -30,6 +30,8 @@
 #include "sensors/Ina219.h"
 #include "sensors/Lps28dfw.h"
 #include "sensors/Ms5837.h"
+#include "ui/Ssd1306I2C.h"  // M7 panel transport (thingpulse SSD1306Wire subclass; provenance in the header)
+#include "ui/Buttons.h"     // debounced pad scan for paging now, arm sequence (M9) later
 
 // Bench path only ('b'): the field-deployed Adafruit implementation of the same Bosch API, used
 // as a second compensation implementation cross-checking lib/core/src/BaroBosch.h on the same
@@ -44,6 +46,14 @@
 // the native test suite exercises (AGENTS.md 11, M1 gate: "sim profile runs headless"); it is
 // pure C++ and touches no pin.
 #include "SimRunner.h"
+
+// The M7 template engine + field registry + LiveState live in lib/core (pure C++, host-tested;
+// decision 28's pattern again). The panel driver only ever receives a finished Framebuf, and
+// bench 'o' + the 5 Hz live service below are thin ESP wrappers over the same code test_display
+// pins — parse, SAFETY validator, fit report, render, all host-verifiable without hardware.
+#include "LiveState.h"
+#include "Template.h"
+#include "TemplateBundles.h"
 
 namespace {
 
@@ -101,6 +111,24 @@ sensors::Ms5837 g_ms5837(Wire, ms5837::kAddr7);   // 7-bit form straight from th
 // the MS5837 side. Address resolves to the strap that ACKs (0x5C/0x5D, SA0 jumper) at check time.
 sensors::Lps28dfw g_lps28(Wire, lps28::kAddr7);
 sensors::Ina219 g_ina219(Wire, pwr::kAddr7);
+
+// M7 display pipeline. One panel driver over I2C0 (Wire is owned by the boot probe; the
+// driver passes sda/scl = -1 so it never re-begins the bus — decision 26). The Framebuf
+// storage is static: no allocation in the display path (§17), and it lives here rather
+// than in the driver class only because C++ member init order makes a self-referential
+// buffer cleaner this way.
+ui::Ssd1306I2C g_display(0x3C);
+uint8_t g_dispBuf[ui::Ssd1306I2C::kCols * ui::Ssd1306I2C::kRows / 8];
+disp::Framebuf g_dispFb(g_dispBuf, ui::Ssd1306I2C::kCols, ui::Ssd1306I2C::kRows);
+ui::ButtonScan g_buttons;
+uint8_t g_dispPage = 0;  // page button cycles template pages (§12 @page)
+// One shared parse scratch. disp::tmpl::Template is ~18 KB (footprint-pinned in
+// test/test_display/): per-call locals smashed the 8 KB loopTask (2026-11-20
+// TG1WDT boot-loop, the M1 SimRunner class), and per-callsite statics overflowed
+// dram0_0_seg by 35 KB. Every user — displayService, bench 'o' — runs serially on
+// loopTask, so ONE static instance serves all of them; parse() re-initialises it
+// on entry, so there is no stale state between users.
+disp::tmpl::Template g_tmpl;
 
 // Which barometer the dive path will actually use, established by ACTIVE checks at boot and on
 // presence transitions — never by which address ACKed (0x76/0x77 are shared with BMP280/BME280,
@@ -264,6 +292,26 @@ void probeDevices() {
     // The else matters: without it the detail on an absent display is "0x3D err 2" — the strap that
     // happened to be probed last — which reads like a strap-configuration problem and sends someone
     // looking for an address jumper on a unit with no display wired at all.
+}
+
+// M7: a panel that is present gets initialised, and an init that fails (geometry mismatch,
+// dead controller) is a REPORTED fault — the screen is required for arming (§13) but its
+// failure never crashes the bench and never mutes alarms. Runs at boot and on an OLED
+// presence transition only: init() resets the controller and sends init commands.
+void checkDisplay() {
+    bool oled = false;
+    for (const DevSpec& d : g_devices)
+        if (d.code == FaultCode::OLED && d.present) oled = true;
+    if (!oled) return;  // the presence path already carries the OLED ERROR
+    if (g_display.init()) {
+        g_buttons.begin();  // BTN_PAGE cycles template pages (§12 @page)
+        Serial.println(F("[oled] SSD1306 up @0x3C — bench 'o' runs the template gate "
+                         "(validate/rejections/fit report) + demo render"));
+    } else {
+        g_faults.raise(FaultCode::OLED, Severity::ERROR, millis(), "0x3C ACKs, init failed");
+        Serial.println(F("[oled] ** panel ACKs at 0x3C but the driver's init failed — ACKs, "
+                         "not a working panel (same rule as every sensor here) **"));
+    }
 }
 
 // Presence is not identity. This checks, for every converter that ACKs, that it actually converts
@@ -1185,6 +1233,237 @@ void benchRunSim(Stream& out) {
                   "unmeasured defaults; this tunes the control law, it does not validate the loop"));
 }
 
+// ---------------------------------------------------------------- M7 display pipeline
+
+// Build a demo LiveState for the render demo. Deliberately SIM-stamped (simFlag=1): fabricated
+// numbers on any output must always say so (risk 11 — source stamping is not decoration). The
+// fault banner is the REAL bench summary string, so the mixed real/fake frame is legible as such.
+disp::LiveState demoLiveState() {
+    disp::LiveState s;
+    s.simFlag = 1;
+    s.ppo2Used = 1.30f; s.ppo2Cell[0] = 1.31f; s.ppo2Cell[1] = 1.30f; s.ppo2Cell[2] = 1.29f;
+    s.cellMv[0] = 1050; s.cellMv[1] = 1042; s.cellMv[2] = 1035;
+    s.votingPass = true;
+    s.depthM = 30.1f; s.ambBar = 3.98f; s.ndlMin = 8; s.ttsMin = 12; s.ceilingM = 6.0f;
+    s.lastStopM = 6; s.gfNow = 45.0f; std::strcpy(s.controllingComp, "7 N2");
+    s.cnsPct = 12; s.otu = 180; s.modM = 66; s.hypoxicModM = 8; s.endM = 30;
+    s.gasDensityGL = 5.2f;
+    std::strcpy(s.mode, "CCR"); std::strcpy(s.gas, "AIR");
+    s.fo2 = 0.21f; s.fHe = 0.0f; s.ppN2 = 2.62f; s.ppHe = 0.0f; s.setpoint = 1.30f;
+    s.pulsesPerMin = 4; s.injectedL = 20.4f; std::strcpy(s.solenoidState, "idle");
+    s.vBat = 3.87f; s.v3v3 = 3.31f; s.batteryPct = 78; s.tempC = 25.2f; s.calAgeH = 1.5f;
+    s.diveTimeSec = 720; s.surfaceIntervalMin = 0; s.ascRateMMin = 8.0f;
+    std::strcpy(s.bestMix, "EAN32"); s.dguMin = 9;
+    g_faults.summaryLine(s.faultBanner, sizeof(s.faultBanner));
+    return s;
+}
+
+// The live bench frame: built ONLY from parts that passed their identity chains, and every
+// unavailable one reads as an explicit zero in a field the operator knows the unit of — there
+// is no simulation in this path, so simFlag stays 0 (REAL). ppo2_used is 0.00 until M2 wires
+// cal+vote: printing a fake ppO2 here is exactly the silent-fallback class this project bans.
+void buildBenchLiveState(disp::LiveState& s) {
+    s.clear();
+    std::strcpy(s.mode, "BENCH");
+    std::strcpy(s.solenoidState, HAVE_SOLENOID ? "off" : "disabled");
+
+    // Cells: raw counts from the pair walkers x the design-config LSB. Counts are stored
+    // UN-inverted (per-channel invert is a CellArray concern, M2), so what the panel shows is
+    // exactly what the converter put on the bus. Cell inputs float on this bench — plausible-
+    // looking nonsense is expected here (as 't' says); staleness is flagged with a '*'.
+    static const int kCellSlot[3][2] = {{0, 1}, {0, -1}, {-1, -1}};  // c1/c2 on U1, c3 on U2
+    for (int c = 0; c < 3; c++) {
+        for (int w = 0; w < 2; w++) {
+            const int slot = kCellSlot[c][w];
+            if (slot < 0) continue;
+            sensors::AdcPairWalker* walk = g_walkers[w];
+            if (!walk->slotValid(slot)) continue;
+            if (walk->slotAgeMs(slot, millis()) > 2000) { s.cellMv[c] = 0; continue; }
+            s.cellMv[c] = static_cast<int32_t>(
+                walk->slotRaw(slot) * sensors::Ads1115::kLsbVoltsDesign * 1000.0f);
+            break;
+        }
+    }
+
+    // Depth: real baro read (blocking T+P cycle, ~17 ms at oss=2) — only once Psurf is locked,
+    // because a depth with no learned surface reference is a wrong number, not a missing one.
+    if (g_activeBaro && g_psurfBar > 0.0f) {
+        float ambBar = 0.0f, tempC = 0.0f;
+        if (g_activeBaro->read(&ambBar, &tempC)) {
+            s.ambBar = ambBar;
+            s.depthM = (ambBar - g_psurfBar) * depth::metersPerBar(g_salinity);
+            if (s.depthM < 0.0f) s.depthM = 0.0f;  // baro drift below the learned surface
+            s.tempC = tempC;
+        }
+    }
+    if (busUp(&Wire) && sensors::probeAddress(Wire, pwr::kAddr7).ok) {
+        float v = 0.0f, a = 0.0f;
+        if (g_ina219.read(&v, &a)) s.vBat = v;
+    }
+    g_faults.summaryLine(s.faultBanner, sizeof(s.faultBanner));
+}
+
+// Bench 'o' — M7's gate demonstrated on the target: validator accept/reject over every bundled
+// template, the §12 fit report, then a SIM-stamped demo render through the full pipeline onto
+// the fitted panel, with an ASCII preview so software faults (layout) are distinguishable from
+// controller faults (garbled/offset paint — an SH1106-clone signature) before anyone touches
+// wiring. With no panel fitted the pipeline + preview still run and the panel status is printed.
+void benchDisplay(Print& out) {
+    const bool panel = g_display.init();
+    out.printf("  panel init %s @0x3C (driver init: geometry+init-commands+reset, 400kHz on I2C0)\n",
+               panel ? "OK" : "FAILED — pipeline still exercised, nothing painted");
+
+    struct Bundle { const char* name; const char* text; };
+    static const Bundle kBundles[] = {
+        {"default_128x64", disp::bundles::default_128x64()},
+        {"compact_128x32", disp::bundles::compact_128x32()},
+        {"bench_128x64", disp::bundles::bench_128x64()},
+        {"fitdemo_9on8", disp::bundles::fitdemo_9on8()},
+    };
+    for (const Bundle& b : kBundles) {
+        disp::tmpl::ParseResult pr;
+        if (!disp::tmpl::parse(b.text, g_tmpl, pr)) {
+            out.printf("  PARSE REJECT %-14s line %u: %s\n", b.name, pr.lineNo, pr.msg);
+            continue;
+        }
+        disp::tmpl::ValidationResult vr;
+        if (!disp::tmpl::validate(g_tmpl, vr)) {
+            out.printf("  VALIDATOR REJECT %-11s: %s\n", b.name, vr.msg);
+            continue;
+        }
+        out.printf("  parse+validate OK: %-14s @size %ux%u, %u page(s)\n",
+                   b.name, g_tmpl.w, g_tmpl.h, g_tmpl.pageCount);
+    }
+
+    // The rejection evidence the gate asks for: a template that hides depth_m inside @if and
+    // omits the other SAFETY fields must be refused, and the refusal must say which rule.
+    {
+        disp::tmpl::ParseResult pr;
+        if (disp::tmpl::parse(disp::bundles::invalid_missing_safety(), g_tmpl, pr)) {
+            disp::tmpl::ValidationResult vr;
+            if (disp::tmpl::validate(g_tmpl, vr)) out.println(F("  invalid_missing_safety ACCEPTED — validator broken"));
+            else out.printf("  validator rejected invalid_missing_safety: %s\n", vr.msg);
+        } else {
+            out.printf("  invalid_missing_safety failed PARSE (line %u: %s) — expected\n",
+                       pr.lineNo, pr.msg);
+        }
+    }
+
+    // Fit report: the §12 nine-lines-on-an-eight-line-panel case, message verbatim.
+    {
+        disp::tmpl::ParseResult pr;
+        disp::tmpl::Layout lay;
+        if (disp::tmpl::parse(disp::bundles::fitdemo_9on8(), g_tmpl, pr)) {
+            disp::DisplaySize sz = g_display.size();
+            disp::tmpl::layoutPage(g_tmpl, 0, sz.w, sz.h, lay);
+            out.printf("  fit report: %s\n", lay.fit.fits ? lay.fit.message : "does not fit even after drops");
+        }
+    }
+
+    // Full-pipeline render, timed. The render path is pure C++ — the µs figure covers
+    // parse+validate+layout+render natively; the I2C frame (~25 ms at 400 kHz, §12) is
+    // measured separately below it so the two costs stay separable (risk 19: cost is a
+    // measured quantity on the target, never assumed).
+    disp::LiveState s = demoLiveState();
+    disp::tmpl::ParseResult pr; disp::tmpl::ValidationResult vr;
+    disp::tmpl::Layout lay; disp::tmpl::RenderStats st;
+    const uint32_t t0 = micros();
+    const bool ok = disp::tmpl::renderTemplate(disp::bundles::bench_128x64(), g_tmpl, g_dispPage,
+                                               g_display.size().w, g_display.size().h,
+                                               s, g_dispFb, pr, vr, lay, st);
+    const uint32_t renderUs = micros() - t0;
+    if (!ok) { out.printf("  demo render REJECTED: %s\n", vr.msg); return; }
+    out.printf("  rendered bench_128x64: lines=%u truncated=%u fieldErrors=%u, cost %lu us\n",
+               st.linesDrawn, st.truncated, st.fieldErrors, (unsigned long)renderUs);
+    if (renderUs > 50000) {  // §12 50 ms budget: abandoned, reported, last good frame kept
+        g_faults.raise(FaultCode::DISPLAY_RENDER_SLOW, Severity::WARN, millis(), "bench o render");
+        out.println(F("  ** render over 50 ms budget — NOT presented, fault raised **"));
+        return;
+    }
+
+    // ASCII preview: only the rows that actually carry ink (the demo paints linesDrawn rows).
+    char ln[129];
+    for (uint16_t y = 0; y < st.linesDrawn * 8; y++) {
+        for (uint16_t x = 0; x < g_display.size().w; x++)
+            ln[x] = g_dispFb.getPixel(x, y) ? '#' : '.';
+        ln[g_display.size().w] = '\0';
+        out.println(ln);
+    }
+
+    if (panel) {
+        const uint32_t p0 = micros();
+        g_display.present(g_dispFb);
+        out.printf("  frame pushed to the panel in %lu ms (1024 B at 400 kHz; §12 budgets ~25 ms) — "
+                   "if the panel shows GARBLED or OFFSET pixels rather than this pattern, it is an "
+                   "SH1106-class controller, not the pipeline: compare the ASCII above first\n",
+                   (unsigned long)((micros() - p0) / 1000));
+    }
+}
+
+// 5 Hz live bench display service, ticked from the service windows so it shares the loop with
+// the ADC walkers instead of delaying them. §12: renderer runs at 5 Hz, and a render over the
+// 50 ms budget is ABANDONED (last good frame stays on the panel) with DISPLAY_RENDER_SLOW —
+// WARN, deliberately not an arming blocker: a screen failure never mutes alarms (§13).
+void displayService() {
+    static uint32_t lastTick = 0;
+    static uint32_t lastSlowLog = 0;
+    static uint8_t lastTruncReport = 0;
+    const uint32_t now = millis();
+
+    if (const auto b = g_buttons.poll(); b == ui::Button::Page) {
+        // page cycle over the live template's pages; the bundled single-page templates have
+        // one page, so this currently re-asserts page 0 — the wiring, not the showcase.
+        g_dispPage = static_cast<uint8_t>((g_dispPage + 1) % 4);
+        Serial.printf("[oled] page -> %u\n", g_dispPage + 1);
+    }
+
+    if (now - lastTick < 200) return;
+    lastTick = now;
+    if (!busUp(&Wire)) return;  // no bus: never touch the pad (decision 26)
+
+    disp::LiveState s;
+    buildBenchLiveState(s);
+
+    // Parse per tick into the shared scratch g_tmpl (see its declaration: one static
+    // instance for every serial display path). Re-parsing rather than caching keeps
+    // bench 'o' — which uses the same scratch — from leaving a stale parse behind,
+    // and is what the M6 web editor will need anyway. Cost: one 18 KB clear + an
+    // 8-line parse at 5 Hz, microseconds next to the ~25 ms frame push.
+    disp::tmpl::Template& t = g_tmpl;
+    disp::tmpl::ParseResult pr;
+    if (!disp::tmpl::parse(disp::bundles::bench_128x64(), t, pr)) {
+        if (now - lastSlowLog > 5000) {
+            lastSlowLog = now;
+            Serial.printf("[oled] bundled bench template failed to parse (line %u: %s) — display "
+                          "stale, dive loop unaffected\n", pr.lineNo, pr.msg);
+        }
+        return;
+    }
+    disp::tmpl::Layout lay;
+    disp::tmpl::layoutPage(t, 0, g_display.size().w, g_display.size().h, lay);
+    const uint8_t page = g_dispPage < t.pageCount ? g_dispPage : 0;
+    disp::tmpl::RenderStats st;
+    const uint32_t t0 = micros();
+    disp::tmpl::renderPage(t, lay, page, s, g_dispFb, st);
+    const uint32_t renderUs = micros() - t0;
+    if (renderUs > 50000) {  // abandon: the new frame was never presented (risk 19's cap + report)
+        g_faults.raise(FaultCode::DISPLAY_RENDER_SLOW, Severity::WARN, millis(), "render >50ms abandoned");
+        lastSlowLog = now;
+        Serial.printf("[oled] render cost %lu us over the 50 ms budget — frame abandoned, "
+                      "last good frame kept\n", (unsigned long)renderUs);
+        return;
+    }
+    g_display.present(g_dispFb);
+    // A bundled template whose banner truncates at the panel edge is a fit-report case in
+    // waiting (§12): count it once per change rather than spamming the console.
+    if (st.truncated != lastTruncReport) {
+        lastTruncReport = st.truncated;
+        Serial.printf("[oled] bench frame clipped %u segment(s) at the panel edge — banner is "
+                      "longer than one line; the fit report is the tool for that (§12)\n",
+                      st.truncated);
+    }
+}
+
 void handleCommand(char c) {
     switch (c) {
         case 's':
@@ -1282,6 +1561,13 @@ void handleCommand(char c) {
         case 'v':
             benchRunSim(Serial);
             break;
+        case 'o':
+            Serial.println(F("[disp] M7 template gate: parse + SAFETY validator over every bundled "
+                             "template, a validator rejection demo, the §12 fit report, then a "
+                             "SIM-stamped demo render + ASCII preview + one real panel frame "
+                             "(touches only the OLED, bench only):"));
+            benchDisplay(Serial);
+            break;
         case 'h':
         default:
             Serial.println(F("bench commands: s=full bus scan  p=probe table + report  "
@@ -1289,7 +1575,8 @@ void handleCommand(char c) {
                              "a=ADC self-test  d=ADC rate characterisation  t=pair-walker rate + "
                              "interlock window  b=baro identity + live mbar/C reading  w=INA219 "
                              "battery rail + raw registers  g=pad map + pad test  "
-                             "v=headless sim profile (SIM-stamped, touches no hardware)"));
+                             "v=headless sim profile (SIM-stamped, touches no hardware)  "
+                             "o=display: validator rejections + fit report + demo render"));
             break;
     }
 }
@@ -1303,6 +1590,7 @@ void serviceWindow(uint32_t ms) {
     const uint32_t end = millis() + ms;
     for (;;) {
         for (sensors::AdcPairWalker* w : g_walkers) w->tick();
+        displayService();  // self-throttled to 5 Hz (§12); I2C0 frame, walkers ride I2C1
         while (Serial.available()) handleCommand(static_cast<char>(Serial.read()));
         if (millis() >= end) return;
         delay(2);
@@ -1342,6 +1630,7 @@ void setup() {
     checkAdcs();
     checkBaro();
     checkPower();
+    checkDisplay();  // M7: panel present -> init + page button; absent -> stays the OLED ERROR
     // Psurf is learned from the barometer that just passed its identity chain — never from a
     // reference pressure looked up for some city (risk 21, item 18: a reference is a measurement
     // with a place, an hour and a source; here the source is the fitted part, at this bench, now).
@@ -1375,6 +1664,7 @@ void loop() {
         bool adcChanged = false;
         bool baroChanged = false;
         bool powerChanged = false;
+        bool oledChanged = false;
         for (DevSpec& d : g_devices) {
             if (!busUp(d.bus)) continue;
             const bool was = d.present;
@@ -1385,6 +1675,7 @@ void loop() {
                 if (d.bus == &Wire1) adcChanged = true;
                 if (d.code == FaultCode::BARO) baroChanged = true;
                 if (d.code == FaultCode::INA219) powerChanged = true;
+                if (d.code == FaultCode::OLED) oledChanged = true;
             } else if (!d.present && was) {
                 Serial.printf("ERROR: %s OFFLINE\n", d.label);
                 if (d.bus == &Wire1) adcChanged = true;
@@ -1405,6 +1696,9 @@ void loop() {
         if (baroChanged) checkBaro();
         // And the same rule again for the rail monitor: plenty of parts ACK at 0x40.
         if (powerChanged) checkPower();
+        // And once more for the screen: an OLED that just appeared gets initialised, not
+        // assumed (ACKs at 0x3C is not the same as paints).
+        if (oledChanged) checkDisplay();
     }
 
     // External watchdog heartbeat: HIGH 20 ms, LOW 30 ms, same shape as before. The delays are
